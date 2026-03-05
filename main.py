@@ -1,306 +1,236 @@
 import os
 import time
 import requests
+from collections import deque
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 20))
 
-MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", 50000))
+MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", 40000))
+MAX_LIQUIDITY = int(os.getenv("MAX_LIQUIDITY", 500000))
+
 MIN_VOLUME_5M = int(os.getenv("MIN_VOLUME_5M", 25000))
 
-MIN_PRICE_CHANGE_5M = float(os.getenv("MIN_PRICE_CHANGE_5M", 6))
 MIN_PRICE_CHANGE_1M = float(os.getenv("MIN_PRICE_CHANGE_1M", 2))
+MIN_PRICE_CHANGE_5M = float(os.getenv("MIN_PRICE_CHANGE_5M", 6))
 
-MIN_TRADES_5M = int(os.getenv("MIN_TRADES_5M", 20))
-MIN_BUY_RATIO = float(os.getenv("MIN_BUY_RATIO", 0.6))
+MIN_TRADES_5M = int(os.getenv("MIN_TRADES_5M", 25))
+
+MIN_BUY_RATIO = float(os.getenv("MIN_BUY_RATIO", 0.60))
 
 MIN_FDV = int(os.getenv("MIN_FDV", 200000))
 MAX_FDV = int(os.getenv("MAX_FDV", 20000000))
 
-MIN_VOL_LIQ_RATIO = float(os.getenv("MIN_VOL_LIQ_RATIO", 0.5))
+MAX_PAIR_AGE = int(os.getenv("MAX_PAIR_AGE", 86400))
 
-MAX_PAIR_AGE_MINUTES = int(os.getenv("MAX_PAIR_AGE_MINUTES", 180))
+queries = [
+    "usd","sol","eth","bnb","usdc",
+    "pepe","doge","inu","ai","cat",
+    "elon","moon","pump","rocket"
+]
 
-MIN_SCORE = int(os.getenv("MIN_SCORE", 6))
+watchlist = deque(maxlen=5)
 
-ALERTED = set()
-last_status = 0
-
-WATCHLIST = []
-WATCHLIST_SIZE = 5
+alerts_sent = 0
+pairs_scanned = 0
+pairs_passed = 0
 
 
 def send_telegram(msg):
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(msg)
         return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
-    try:
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg
-        })
-    except:
-        pass
-
-
-def update_watchlist(symbol):
-
-    global WATCHLIST
-
-    WATCHLIST.append(symbol)
-
-    if len(WATCHLIST) > WATCHLIST_SIZE:
-        WATCHLIST.pop(0)
+    requests.post(url, json={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg
+    })
 
 
 def get_pairs():
 
-    queries = [
-        "usd",
-        "usdt",
-        "eth",
-        "sol",
-        "bnb",
-        "base",
-        "arb",
-        "doge",
-        "pepe",
-        "ai",
-        "swap",
-        "finance"
-    ]
-
-    pairs = []
+    all_pairs = []
     seen = set()
 
     for q in queries:
 
-        url = f"https://api.dexscreener.com/latest/dex/search/?q={q}"
-
         try:
-
+            url = f"https://api.dexscreener.com/latest/dex/search/?q={q}"
             r = requests.get(url, timeout=10)
-
-            if r.status_code != 200:
-                continue
-
             data = r.json()
 
             for p in data.get("pairs", []):
 
-                addr = p.get("pairAddress")
+                pair_id = p.get("pairAddress")
 
-                if addr and addr not in seen:
-                    pairs.append(p)
-                    seen.add(addr)
+                if pair_id in seen:
+                    continue
+
+                seen.add(pair_id)
+                all_pairs.append(p)
 
         except:
-            continue
+            pass
 
-    return pairs
+    return all_pairs
 
 
-def calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio, accumulation):
+def score_pair(pair):
 
     score = 0
 
-    if change1m > 3:
+    change1 = pair.get("priceChange", {}).get("m1", 0)
+    change5 = pair.get("priceChange", {}).get("m5", 0)
+
+    vol5 = pair.get("volume", {}).get("m5", 0)
+
+    liq = pair.get("liquidity", {}).get("usd", 0)
+
+    buys = pair.get("txns", {}).get("m5", {}).get("buys", 0)
+    sells = pair.get("txns", {}).get("m5", {}).get("sells", 0)
+
+    if change1 > 3:
         score += 2
 
-    if change5m > 8:
+    if change5 > 10:
+        score += 3
+
+    if vol5 > liq * 0.4:
         score += 2
 
-    if buy_ratio > 0.7:
+    if buys > sells * 1.5:
         score += 2
 
-    if vol_liq_ratio > 0.7:
-        score += 2
-
-    if accumulation:
-        score += 2
+    if vol5 > MIN_VOLUME_5M * 2:
+        score += 1
 
     return score
 
 
-def scan():
+def passes_filters(pair):
 
-    pairs = get_pairs()
+    global pairs_passed
 
-    print(f"Pairs fetched: {len(pairs)}")
+    liq = pair.get("liquidity", {}).get("usd", 0)
+    vol5 = pair.get("volume", {}).get("m5", 0)
 
-    scanned = 0
-    passed = 0
-    alerts = 0
+    change1 = pair.get("priceChange", {}).get("m1", 0)
+    change5 = pair.get("priceChange", {}).get("m5", 0)
 
-    for p in pairs:
+    fdv = pair.get("fdv", 0)
 
-        scanned += 1
+    buys = pair.get("txns", {}).get("m5", {}).get("buys", 0)
+    sells = pair.get("txns", {}).get("m5", {}).get("sells", 0)
 
-        pair = p.get("pairAddress")
+    trades = buys + sells
 
-        if pair in ALERTED:
-            continue
+    if liq < MIN_LIQUIDITY or liq > MAX_LIQUIDITY:
+        return False
 
-        price = float(p.get("priceUsd", 0))
-        liquidity = p.get("liquidity", {}).get("usd", 0)
+    if vol5 < MIN_VOLUME_5M:
+        return False
 
-        volume5m = p.get("volume", {}).get("m5", 0)
+    if change1 < MIN_PRICE_CHANGE_1M:
+        return False
 
-        change5m = p.get("priceChange", {}).get("m5", 0)
-        change1m = p.get("priceChange", {}).get("m1", 0)
+    if change5 < MIN_PRICE_CHANGE_5M:
+        return False
 
-        buys = p.get("txns", {}).get("m5", {}).get("buys", 0)
-        sells = p.get("txns", {}).get("m5", {}).get("sells", 0)
+    if trades < MIN_TRADES_5M:
+        return False
 
-        trades5m = buys + sells
+    if buys / max(sells,1) < MIN_BUY_RATIO:
+        return False
 
-        fdv = p.get("fdv", 0)
+    if fdv < MIN_FDV or fdv > MAX_FDV:
+        return False
 
-        pair_created = p.get("pairCreatedAt", 0)
-
-        if price == 0:
-            continue
-
-        if liquidity < MIN_LIQUIDITY:
-            continue
-
-        if volume5m < MIN_VOLUME_5M:
-            continue
-
-        if change1m < MIN_PRICE_CHANGE_1M:
-            continue
-
-        if trades5m < MIN_TRADES_5M:
-            continue
-
-        if fdv < MIN_FDV or fdv > MAX_FDV:
-            continue
-
-        if liquidity == 0:
-            continue
-
-        vol_liq_ratio = volume5m / liquidity
-
-        if vol_liq_ratio < MIN_VOL_LIQ_RATIO:
-            continue
-
-        if trades5m == 0:
-            continue
-
-        buy_ratio = buys / trades5m
-
-        if buy_ratio < MIN_BUY_RATIO:
-            continue
-
-        if pair_created:
-
-            age_minutes = (time.time()*1000 - pair_created) / 60000
-
-            if age_minutes > MAX_PAIR_AGE_MINUTES:
-                continue
-
-        accumulation = False
-
-        if change5m < 3 and buy_ratio > 0.65 and volume5m > MIN_VOLUME_5M:
-            accumulation = True
-
-        score = calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio, accumulation)
-
-        if score < MIN_SCORE:
-            continue
-
-        passed += 1
-
-        token = p.get("baseToken", {}).get("symbol", "UNKNOWN")
-        chain = p.get("chainId")
-        dex = p.get("dexId")
-
-        update_watchlist(token)
-
-        msg = f"""
-🚀 MICRO CAP RUNNER
-
-Token: {token}
-Score: {score}/10
-
-1m Change: {round(change1m,2)}%
-5m Change: {round(change5m,2)}%
-
-5m Volume: ${volume5m}
-Liquidity: ${liquidity}
-
-Volume/Liquidity: {round(vol_liq_ratio,2)}
-Buy Pressure: {round(buy_ratio*100,1)}%
-
-FDV: ${fdv}
-
-Chain: {chain}
-DEX: {dex}
-"""
-
-        print(msg)
-
-        send_telegram(msg)
-
-        ALERTED.add(pair)
-
-        alerts += 1
-
-    return scanned, passed, alerts
+    pairs_passed += 1
+    return True
 
 
-def status(scanned, passed, alerts):
+def format_watchlist():
 
-    global last_status
+    if not watchlist:
+        return "None"
 
-    now = time.time()
-
-    if now - last_status > 60:
-
-        watch_text = "\n".join([f"{i+1}. {t}" for i, t in enumerate(WATCHLIST)])
-
-        msg = f"""
-📊 SCANNER STATUS
-
-Pairs scanned: {scanned}
-Passed filters: {passed}
-Alerts sent: {alerts}
-
-Recent Runner Candidates
-{watch_text if watch_text else "None yet"}
-
-Scanner running normally
-"""
-
-        send_telegram(msg)
-
-        last_status = now
+    return "\n".join(watchlist)
 
 
-def main():
+def run():
 
-    send_telegram("🚀 Micro Cap Runner Bot Started")
+    global alerts_sent, pairs_scanned, pairs_passed
+
+    last_report = time.time()
 
     while True:
 
-        try:
+        pairs = get_pairs()
 
-            scanned, passed, alerts = scan()
+        pairs_scanned = len(pairs)
+        pairs_passed = 0
 
-            status(scanned, passed, alerts)
+        for pair in pairs:
 
-        except Exception as e:
+            if not passes_filters(pair):
+                continue
 
-            print("Error:", e)
+            score = score_pair(pair)
+
+            if score < 6:
+                continue
+
+            symbol = pair.get("baseToken", {}).get("symbol", "UNK")
+
+            price = pair.get("priceUsd", "?")
+
+            change5 = pair.get("priceChange", {}).get("m5", 0)
+
+            vol5 = pair.get("volume", {}).get("m5", 0)
+
+            liq = pair.get("liquidity", {}).get("usd", 0)
+
+            entry = f"{symbol}  |  {change5}%  |  Vol ${int(vol5)}"
+
+            watchlist.appendleft(entry)
+
+            msg = f"""
+🚀 MICROCAP RUNNER DETECTED
+
+Token: {symbol}
+Price: ${price}
+
+5m Change: {change5}%
+5m Volume: ${int(vol5)}
+Liquidity: ${int(liq)}
+
+Momentum Score: {score}/10
+"""
+
+            send_telegram(msg)
+
+            alerts_sent += 1
+
+        if time.time() - last_report > 60:
+
+            status = f"""
+📊 SCANNER STATUS
+
+Pairs scanned: {pairs_scanned}
+Passed filters: {pairs_passed}
+Alerts sent: {alerts_sent}
+
+🔥 Recent Runner Candidates
+{format_watchlist()}
+"""
+
+            send_telegram(status)
+
+            last_report = time.time()
 
         time.sleep(SCAN_INTERVAL)
 
 
 if __name__ == "__main__":
-    main()
+    run()
