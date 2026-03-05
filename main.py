@@ -28,6 +28,9 @@ MIN_SCORE = int(os.getenv("MIN_SCORE", 6))
 ALERTED = set()
 last_status = 0
 
+WATCHLIST = []
+WATCHLIST_SIZE = 5
+
 
 def send_telegram(msg):
 
@@ -46,21 +49,39 @@ def send_telegram(msg):
         pass
 
 
+def update_watchlist(symbol):
+
+    global WATCHLIST
+
+    WATCHLIST.append(symbol)
+
+    if len(WATCHLIST) > WATCHLIST_SIZE:
+        WATCHLIST.pop(0)
+
+
 def get_pairs():
 
-    chains = [
-        "solana",
-        "ethereum",
-        "bsc",
+    queries = [
+        "usd",
+        "usdt",
+        "eth",
+        "sol",
+        "bnb",
         "base",
-        "arbitrum"
+        "arb",
+        "doge",
+        "pepe",
+        "ai",
+        "swap",
+        "finance"
     ]
 
     pairs = []
+    seen = set()
 
-    for chain in chains:
+    for q in queries:
 
-        url = f"https://api.dexscreener.com/latest/dex/search/?q={chain}"
+        url = f"https://api.dexscreener.com/latest/dex/search/?q={q}"
 
         try:
 
@@ -71,7 +92,13 @@ def get_pairs():
 
             data = r.json()
 
-            pairs.extend(data.get("pairs", []))
+            for p in data.get("pairs", []):
+
+                addr = p.get("pairAddress")
+
+                if addr and addr not in seen:
+                    pairs.append(p)
+                    seen.add(addr)
 
         except:
             continue
@@ -194,8 +221,10 @@ def scan():
         chain = p.get("chainId")
         dex = p.get("dexId")
 
+        update_watchlist(token)
+
         msg = f"""
-ð MICRO CAP RUNNER
+🚀 MICRO CAP RUNNER
 
 Token: {token}
 Score: {score}/10
@@ -234,12 +263,17 @@ def status(scanned, passed, alerts):
 
     if now - last_status > 60:
 
+        watch_text = "\n".join([f"{i+1}. {t}" for i, t in enumerate(WATCHLIST)])
+
         msg = f"""
-ð SCANNER STATUS
+📊 SCANNER STATUS
 
 Pairs scanned: {scanned}
 Passed filters: {passed}
 Alerts sent: {alerts}
+
+Recent Runner Candidates
+{watch_text if watch_text else "None yet"}
 
 Scanner running normally
 """
@@ -251,7 +285,7 @@ Scanner running normally
 
 def main():
 
-    send_telegram("ð Micro Cap Runner Bot Started")
+    send_telegram("🚀 Micro Cap Runner Bot Started")
 
     while True:
 
