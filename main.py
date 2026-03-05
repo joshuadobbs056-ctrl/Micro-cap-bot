@@ -16,24 +16,29 @@ MIN_VOLUME_5M = int(os.getenv("MIN_VOLUME_5M", 25000))
 MIN_PRICE_CHANGE_1M = float(os.getenv("MIN_PRICE_CHANGE_1M", 2.0))
 MIN_PRICE_CHANGE_5M = float(os.getenv("MIN_PRICE_CHANGE_5M", 6.0))
 MIN_TRADES_5M = int(os.getenv("MIN_TRADES_5M", 25))
-MIN_BUY_RATIO = float(os.getenv("MIN_BUY_RATIO", 0.60)) # 60% of txns must be buys
+MIN_BUY_RATIO = float(os.getenv("MIN_BUY_RATIO", 0.60)) 
 MIN_FDV = int(os.getenv("MIN_FDV", 200000))
 MAX_FDV = int(os.getenv("MAX_FDV", 20000000))
 
 # Anti-Spam / Tracking
-alerted_tokens = {} # Stores {address: last_alert_price}
+alerted_tokens = {} 
 watchlist = deque(maxlen=5)
 
-# Search Keywords
-queries = ["usd","sol","eth","bnb","pepe","doge","ai","elon","pump","rocket"]
+# Search Keywords (Expanded for more "Heads")
+queries = ["usd","sol","eth","bnb","pepe","doge","ai","elon","pump","rocket", "moon", "inu", "cat", "base"]
 
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"Telegram not configured. Log: {msg[:50]}...")
+        print(f"Log: {msg[:50]}...")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        # Using disable_web_page_preview to keep the chat clean
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID, 
+            "text": msg,
+            "disable_web_page_preview": True
+        }, timeout=10)
     except Exception as e:
         print(f"Telegram Error: {e}")
 
@@ -42,7 +47,6 @@ def get_pairs():
     seen = set()
     for q in queries:
         try:
-            # Note: Search endpoint is often cached/delayed
             url = f"https://api.dexscreener.com/latest/dex/search/?q={q}"
             r = requests.get(url, timeout=10)
             if r.status_code == 200:
@@ -52,7 +56,7 @@ def get_pairs():
                     if addr and addr not in seen:
                         seen.add(addr)
                         all_pairs.append(p)
-            time.sleep(0.5) # Avoid hitting rate limits
+            time.sleep(0.3) 
         except:
             continue
     return all_pairs
@@ -69,14 +73,12 @@ def passes_filters(pair):
     sells = txns.get("sells", 0)
     total_trades = buys + sells
 
-    # Basic threshold checks
     if not (MIN_LIQUIDITY <= liq <= MAX_LIQUIDITY): return False
     if vol5 < MIN_VOLUME_5M: return False
     if change1 < MIN_PRICE_CHANGE_1M: return False
     if change5 < MIN_PRICE_CHANGE_5M: return False
     if total_trades < MIN_TRADES_5M: return False
     
-    # Corrected Buy Ratio: Buys should be > 60% of total 5m trades
     if total_trades > 0:
         if (buys / total_trades) < MIN_BUY_RATIO: return False
     
@@ -91,23 +93,22 @@ def score_pair(pair):
     vol5 = pair.get("volume", {}).get("m5", 0)
     liq = pair.get("liquidity", {}).get("usd", 0)
     
-    # Momentum Velocity: Is it accelerating right now?
     if change1 > (change5 * 0.5): score += 3 
-    elif change1 > 3: score += 1
-    
-    # Volume/Liquidity Intensity
-    if vol5 > liq: score += 4 # Massive relative volume
+    if vol5 > liq: score += 4 
     elif vol5 > (liq * 0.5): score += 2
     
     return score
 
 def run():
-    print("Scanner started... looking for runners.")
-    last_report = time.time()
+    print("Scanner active. Sending heartbeats to Telegram...")
     
     while True:
+        start_time = time.time()
         pairs = get_pairs()
-        found_this_run = 0
+        
+        heads_scanned = len(pairs)
+        potential_runners = 0
+        run_alerts = []
 
         for pair in pairs:
             if not passes_filters(pair):
@@ -117,7 +118,7 @@ def run():
             symbol = pair.get("baseToken", {}).get("symbol", "UNK")
             price = float(pair.get("priceUsd", 0))
             
-            # Anti-Spam: Only alert if new or if price rose 10% since last alert
+            # Tracking and Anti-Spam
             last_p = alerted_tokens.get(addr, 0)
             if last_p > 0 and price < (last_p * 1.10):
                 continue
@@ -125,32 +126,41 @@ def run():
             score = score_pair(pair)
             if score < 5: continue
 
+            # If it passes everything, it's a potential runner
+            potential_runners += 1
             alerted_tokens[addr] = price
-            found_this_run += 1
             
-            # Formatting Alert
             change5 = pair.get("priceChange", {}).get("m5", 0)
             vol5 = pair.get("volume", {}).get("m5", 0)
             liq = pair.get("liquidity", {}).get("usd", 0)
             
-            msg = (f"🚀 EXPLOSIVE RUNNER: {symbol}\n"
-                   f"Price: ${price:.10f}\n"
-                   f"5m Change: {change5}%\n"
-                   f"5m Vol: ${int(vol5):,}\n"
-                   f"Liq: ${int(liq):,}\n"
-                   f"Score: {score}/10\n"
-                   f"Link: https://dexscreener.com/search?q={addr}")
+            alert_msg = (f"🔥 RUNNER: {symbol}\n"
+                         f"Price: ${price:.10f}\n"
+                         f"5m: {change5}% | Vol: ${int(vol5):,}\n"
+                         f"Score: {score}/10\n"
+                         f"https://dexscreener.com/search?q={addr}")
             
-            send_telegram(msg)
-            watchlist.appendleft(f"{symbol} | {change5}% | ${int(vol5)}")
+            run_alerts.append(alert_msg)
+            watchlist.appendleft(f"{symbol} ({change5}%)")
 
-        # Hourly status update or summary
-        if time.time() - last_report > 3600:
-            summary = "📊 1H Watchlist Summary:\n" + "\n".join(watchlist)
-            send_telegram(summary)
-            last_report = time.time()
+        # --- THE HEARTBEAT REPORT ---
+        # Sent every scan cycle
+        scan_report = (f"🔍 SCAN COMPLETE\n"
+                       f"━━━━━━━━━━━━━━\n"
+                       f"Heads Scanned: {heads_scanned}\n"
+                       f"Runners Found: {potential_runners}\n"
+                       f"Status: Healthy ✅")
+        
+        send_telegram(scan_report)
 
-        time.sleep(SCAN_INTERVAL)
+        # Send individual alerts for runners if any were found
+        for alert in run_alerts:
+            send_telegram(alert)
+
+        # Calculate sleep time to maintain interval
+        elapsed = time.time() - start_time
+        sleep_time = max(0, SCAN_INTERVAL - elapsed)
+        time.sleep(sleep_time)
 
 if __name__ == "__main__":
     run()
