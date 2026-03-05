@@ -21,9 +21,13 @@ MAX_FDV = int(os.getenv("MAX_FDV", 20000000))
 
 MIN_VOL_LIQ_RATIO = float(os.getenv("MIN_VOL_LIQ_RATIO", 0.5))
 
+MAX_PAIR_AGE_MINUTES = int(os.getenv("MAX_PAIR_AGE_MINUTES", 180))
+
+MIN_SCORE = int(os.getenv("MIN_SCORE", 6))
+
 ALERTED = set()
 
-last_heartbeat = 0
+last_status = 0
 
 
 def send_telegram(msg):
@@ -49,6 +53,7 @@ def get_pairs():
 
     try:
         r = requests.get(url)
+
         if r.status_code != 200:
             return []
 
@@ -58,7 +63,7 @@ def get_pairs():
         return []
 
 
-def calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio):
+def calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio, accumulation):
 
     score = 0
 
@@ -66,7 +71,7 @@ def calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio):
         score += 2
 
     if change5m > 8:
-        score += 3
+        score += 2
 
     if buy_ratio > 0.7:
         score += 2
@@ -74,8 +79,8 @@ def calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio):
     if vol_liq_ratio > 0.7:
         score += 2
 
-    if change1m > change5m * 0.4:
-        score += 1
+    if accumulation:
+        score += 2
 
     return score
 
@@ -84,7 +89,13 @@ def scan():
 
     pairs = get_pairs()
 
+    scanned = 0
+    passed = 0
+    alerts = 0
+
     for p in pairs:
+
+        scanned += 1
 
         pair = p.get("pairAddress")
 
@@ -106,6 +117,8 @@ def scan():
 
         fdv = p.get("fdv", 0)
 
+        pair_created = p.get("pairCreatedAt", 0)
+
         if price == 0:
             continue
 
@@ -113,9 +126,6 @@ def scan():
             continue
 
         if volume5m < MIN_VOLUME_5M:
-            continue
-
-        if change5m < MIN_PRICE_CHANGE_5M:
             continue
 
         if change1m < MIN_PRICE_CHANGE_1M:
@@ -143,7 +153,24 @@ def scan():
         if buy_ratio < MIN_BUY_RATIO:
             continue
 
-        score = calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio)
+        if pair_created:
+
+            age_minutes = (time.time()*1000 - pair_created) / 60000
+
+            if age_minutes > MAX_PAIR_AGE_MINUTES:
+                continue
+
+        accumulation = False
+
+        if change5m < 3 and buy_ratio > 0.65 and volume5m > MIN_VOLUME_5M:
+            accumulation = True
+
+        score = calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio, accumulation)
+
+        if score < MIN_SCORE:
+            continue
+
+        passed += 1
 
         token = p.get("baseToken", {}).get("symbol", "UNKNOWN")
         chain = p.get("chainId")
@@ -153,9 +180,7 @@ def scan():
 🚀 MICRO CAP RUNNER
 
 Token: {token}
-Price: ${price}
-
-Momentum Score: {score}/10
+Score: {score}/10
 
 1m Change: {round(change1m,2)}%
 5m Change: {round(change5m,2)}%
@@ -178,18 +203,32 @@ DEX: {dex}
 
         ALERTED.add(pair)
 
+        alerts += 1
 
-def heartbeat():
+    return scanned, passed, alerts
 
-    global last_heartbeat
+
+def status(scanned, passed, alerts):
+
+    global last_status
 
     now = time.time()
 
-    if now - last_heartbeat > 60:
+    if now - last_status > 60:
 
-        send_telegram("Scanner heartbeat: scans running normally")
+        msg = f"""
+📊 SCANNER STATUS
 
-        last_heartbeat = now
+Pairs scanned: {scanned}
+Passed filters: {passed}
+Alerts sent: {alerts}
+
+Scanner running normally
+"""
+
+        send_telegram(msg)
+
+        last_status = now
 
 
 def main():
@@ -200,8 +239,9 @@ def main():
 
         try:
 
-            scan()
-            heartbeat()
+            scanned, passed, alerts = scan()
+
+            status(scanned, passed, alerts)
 
         except Exception as e:
 
