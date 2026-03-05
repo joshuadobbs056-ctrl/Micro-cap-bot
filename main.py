@@ -26,7 +26,6 @@ MAX_PAIR_AGE_MINUTES = int(os.getenv("MAX_PAIR_AGE_MINUTES", 180))
 MIN_SCORE = int(os.getenv("MIN_SCORE", 6))
 
 ALERTED = set()
-
 last_status = 0
 
 
@@ -38,28 +37,32 @@ def send_telegram(msg):
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-    requests.post(
-        url,
-        json={
+    try:
+        requests.post(url, json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": msg
-        }
-    )
+        })
+    except:
+        pass
 
 
+# FIXED MARKET FETCH FUNCTION
 def get_pairs():
 
-    url = "https://api.dexscreener.com/latest/dex/pairs"
+    url = "https://api.dexscreener.com/latest/dex/search/?q=usd"
 
     try:
-        r = requests.get(url)
+        r = requests.get(url, timeout=10)
 
         if r.status_code != 200:
             return []
 
-        return r.json().get("pairs", [])
+        data = r.json()
 
-    except:
+        return data.get("pairs", [])
+
+    except Exception as e:
+        print("Dexscreener fetch error:", e)
         return []
 
 
@@ -88,6 +91,8 @@ def calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio, accumulation):
 def scan():
 
     pairs = get_pairs()
+
+    print(f"Pairs fetched: {len(pairs)}")
 
     scanned = 0
     passed = 0
@@ -251,5 +256,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
