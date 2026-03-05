@@ -46,24 +46,37 @@ def send_telegram(msg):
         pass
 
 
-# FIXED MARKET FETCH FUNCTION
 def get_pairs():
 
-    url = "https://api.dexscreener.com/latest/dex/search/?q=usd"
+    chains = [
+        "solana",
+        "ethereum",
+        "bsc",
+        "base",
+        "arbitrum"
+    ]
 
-    try:
-        r = requests.get(url, timeout=10)
+    pairs = []
 
-        if r.status_code != 200:
-            return []
+    for chain in chains:
 
-        data = r.json()
+        url = f"https://api.dexscreener.com/latest/dex/search/?q={chain}"
 
-        return data.get("pairs", [])
+        try:
 
-    except Exception as e:
-        print("Dexscreener fetch error:", e)
-        return []
+            r = requests.get(url, timeout=10)
+
+            if r.status_code != 200:
+                continue
+
+            data = r.json()
+
+            pairs.extend(data.get("pairs", []))
+
+        except:
+            continue
+
+    return pairs
 
 
 def calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio, accumulation):
@@ -182,7 +195,7 @@ def scan():
         dex = p.get("dexId")
 
         msg = f"""
-🚀 MICRO CAP RUNNER
+ð MICRO CAP RUNNER
 
 Token: {token}
 Score: {score}/10
@@ -222,7 +235,7 @@ def status(scanned, passed, alerts):
     if now - last_status > 60:
 
         msg = f"""
-📊 SCANNER STATUS
+ð SCANNER STATUS
 
 Pairs scanned: {scanned}
 Passed filters: {passed}
@@ -238,7 +251,7 @@ Scanner running normally
 
 def main():
 
-    send_telegram("🚀 Micro Cap Runner Bot Started")
+    send_telegram("ð Micro Cap Runner Bot Started")
 
     while True:
 
