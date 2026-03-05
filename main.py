@@ -5,21 +5,25 @@ import requests
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SCAN_INTERVAL = 15
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
 
-MIN_LIQUIDITY = 50000
-MIN_VOLUME_5M = 25000
-MIN_PRICE_CHANGE_5M = 6
-MIN_PRICE_CHANGE_1M = 2
-MIN_TRADES_5M = 20
-MIN_BUY_RATIO = 0.6
+MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", 50000))
+MIN_VOLUME_5M = int(os.getenv("MIN_VOLUME_5M", 25000))
 
-MIN_FDV = 200000
-MAX_FDV = 20000000
+MIN_PRICE_CHANGE_5M = float(os.getenv("MIN_PRICE_CHANGE_5M", 6))
+MIN_PRICE_CHANGE_1M = float(os.getenv("MIN_PRICE_CHANGE_1M", 2))
 
-MIN_VOL_LIQ_RATIO = 0.5
+MIN_TRADES_5M = int(os.getenv("MIN_TRADES_5M", 20))
+MIN_BUY_RATIO = float(os.getenv("MIN_BUY_RATIO", 0.6))
+
+MIN_FDV = int(os.getenv("MIN_FDV", 200000))
+MAX_FDV = int(os.getenv("MAX_FDV", 20000000))
+
+MIN_VOL_LIQ_RATIO = float(os.getenv("MIN_VOL_LIQ_RATIO", 0.5))
 
 ALERTED = set()
+
+last_heartbeat = 0
 
 
 def send_telegram(msg):
@@ -43,12 +47,37 @@ def get_pairs():
 
     url = "https://api.dexscreener.com/latest/dex/pairs"
 
-    r = requests.get(url)
+    try:
+        r = requests.get(url)
+        if r.status_code != 200:
+            return []
 
-    if r.status_code != 200:
+        return r.json().get("pairs", [])
+
+    except:
         return []
 
-    return r.json().get("pairs", [])
+
+def calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio):
+
+    score = 0
+
+    if change1m > 3:
+        score += 2
+
+    if change5m > 8:
+        score += 3
+
+    if buy_ratio > 0.7:
+        score += 2
+
+    if vol_liq_ratio > 0.7:
+        score += 2
+
+    if change1m > change5m * 0.4:
+        score += 1
+
+    return score
 
 
 def scan():
@@ -114,6 +143,8 @@ def scan():
         if buy_ratio < MIN_BUY_RATIO:
             continue
 
+        score = calculate_score(change1m, change5m, buy_ratio, vol_liq_ratio)
+
         token = p.get("baseToken", {}).get("symbol", "UNKNOWN")
         chain = p.get("chainId")
         dex = p.get("dexId")
@@ -124,6 +155,8 @@ def scan():
 Token: {token}
 Price: ${price}
 
+Momentum Score: {score}/10
+
 1m Change: {round(change1m,2)}%
 5m Change: {round(change5m,2)}%
 
@@ -131,15 +164,12 @@ Price: ${price}
 Liquidity: ${liquidity}
 
 Volume/Liquidity: {round(vol_liq_ratio,2)}
-
 Buy Pressure: {round(buy_ratio*100,1)}%
 
 FDV: ${fdv}
 
 Chain: {chain}
 DEX: {dex}
-
-Potential explosive momentum
 """
 
         print(msg)
@@ -147,6 +177,19 @@ Potential explosive momentum
         send_telegram(msg)
 
         ALERTED.add(pair)
+
+
+def heartbeat():
+
+    global last_heartbeat
+
+    now = time.time()
+
+    if now - last_heartbeat > 60:
+
+        send_telegram("Scanner heartbeat: scans running normally")
+
+        last_heartbeat = now
 
 
 def main():
@@ -158,6 +201,7 @@ def main():
         try:
 
             scan()
+            heartbeat()
 
         except Exception as e:
 
