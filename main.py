@@ -1,9 +1,9 @@
-# Coin Sniper — Savage ELITE (PAPER) — FLASH CRASH HUNTER (FULL VERSION)
+# Coin Sniper — Savage ELITE (PAPER) — FLASH CRASH HUNTER (DEBUG HARDENED)
 # 🎯 Goal: Catch 10%+ "Flash Crashes" and sell the bounce.
-# ✅ Full Telegram Updates (Wins, Losses, Realized PnL)
-# ✅ Exact Status Formatting (W/L, Equity, Open trades)
-# ✅ High-Speed Scan (2-second interval)
-# ✅ Persistent State Saving
+# ✅ Wins/Losses/PnL Tracking
+# ✅ Hardened Telegram Notify (No more silent failures)
+# ✅ Exact Status Formatting
+# ✅ Startup Connection Test
 
 import os, time, json, csv, traceback
 from dataclasses import dataclass, asdict
@@ -12,19 +12,17 @@ import requests
 import numpy as np
 
 # =========================
-# CONFIG (PRIMED FOR VOLATILITY)
+# CONFIG
 # =========================
 START_BALANCE = float(os.getenv("START_BALANCE", "2000"))
 SCAN_INTERVAL = 2  
 STATUS_INTERVAL = 60
 
-# --- THE "MASSIVE MOVEMENT" TRIGGERS ---
 CRASH_THRESHOLD_PCT = 8.0     
 VOL_SPIKE_RATIO = 4.0         
 RSI_BUY_LEVEL = 15            
 RECOVERY_TARGET_PCT = 3.5     
 
-# --- RISK LIMITS ---
 MAX_OPEN_TRADES = 5           
 STOP_LOSS_PCT = 5.0           
 MAX_SYMBOL_AGE_MINS = 30      
@@ -35,7 +33,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 COINBASE_API = "https://api.exchange.coinbase.com"
 
 # =========================
-# MODELS & NOTIFICATIONS
+# HARDENED NOTIFICATIONS
 # =========================
 @dataclass
 class Position:
@@ -48,12 +46,22 @@ class Position:
     is_flash_trade: bool = True
 
 def notify(msg: str):
-    print(msg, flush=True)
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
-        except: pass
+    """Sends Telegram update with explicit error logging in Railway."""
+    print(f"[LOG] {msg}", flush=True)
+    
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ TELEGRAM_TOKEN or CHAT_ID is missing in Railway Variables!")
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+        r = requests.post(url, json=payload, timeout=10)
+        
+        if r.status_code != 200:
+            print(f"❌ Telegram API Error ({r.status_code}): {r.text}")
+    except Exception as e:
+        print(f"📡 Connection Error: {e}")
 
 # =========================
 # MATH & API
@@ -62,6 +70,7 @@ def get_candles(product_id: str, granularity: int = 60) -> List[list]:
     try:
         r = requests.get(f"{COINBASE_API}/products/{product_id}/candles", 
                          params={"granularity": granularity}, timeout=10)
+        if r.status_code != 200: return []
         return r.json()[:60]
     except: return []
 
@@ -97,7 +106,12 @@ def detect_flash_crash(sym: str, candles: List[list]) -> Tuple[bool, str]:
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, "r") as f: return json.load(f)
+            with open(STATE_FILE, "r") as f: 
+                data = json.load(f)
+                # Ensure keys exist
+                for key in ["wins", "losses", "realized_pnl"]:
+                    if key not in data: data[key] = 0
+                return data
         except: pass
     return {"cash": START_BALANCE, "wins": 0, "losses": 0, "realized_pnl": 0.0, "positions": {}}
 
@@ -109,7 +123,7 @@ def save_state(state, positions):
 # REPORTING
 # =========================
 def status_report(state, positions, last_prices):
-    cash = float(state["cash"])
+    cash = float(state.get("cash", START_BALANCE))
     wins = int(state.get("wins", 0))
     losses = int(state.get("losses", 0))
     realized = float(state.get("realized_pnl", 0.0))
@@ -122,7 +136,7 @@ def status_report(state, positions, last_prices):
         px = last_prices.get(sym, pos.entry_price)
         equity += (px * pos.qty)
         pnl_p = (px / pos.entry_price - 1) * 100
-        pos_lines.append(f" - {sym}: qty={pos.qty:.6f} entry={pos.entry_price:.6f} now={px:.6f} pnl%={pnl_p:.2f} high={pos.high_water:.6f}")
+        pos_lines.append(f" - {sym}: qty={pos.qty:.4f} entry={pos.entry_price:.4f} now={px:.4f} pnl%={pnl_p:.2f}")
 
     report = (
         f"📊 Coin Sniper FLASH HUNTER\n"
@@ -140,39 +154,51 @@ def main():
     positions = {k: Position(**v) for k, v in state.get("positions", {}).items()}
     last_status = 0
     
-    products = requests.get(f"{COINBASE_API}/products").json()
-    universe = [p['id'] for p in products if p['quote_currency'] == 'USD' and p['status'] == 'online']
-    
-    notify("🌪 FLASH HUNTER ONLINE. Scanning for massive movements...")
+    # Startup Test
+    notify(f"🌪 FLASH HUNTER ONLINE [{INSTANCE_ID if 'INSTANCE_ID' in globals() else 'CORE'}]\nMonitoring for massive movements...")
+
+    try:
+        products = requests.get(f"{COINBASE_API}/products").json()
+        universe = [p['id'] for p in products if p['quote_currency'] == 'USD' and p['status'] == 'online']
+    except:
+        universe = []
+        print("Failed to fetch product list.")
 
     while True:
         try:
             last_prices = {}
+            # 1. Check existing positions
             for sym, pos in list(positions.items()):
                 candles = get_candles(sym)
-                if not candles: continue
-                px = float(candles[0][4])
-                last_prices[sym] = px
-                
-                pnl_pct = (px / pos.entry_price - 1) * 100
-                if pnl_pct >= RECOVERY_TARGET_PCT:
-                    exit_trade(state, positions, sym, px, f"BOUNCE ({pnl_pct:.2f}%)")
-                elif pnl_pct <= -STOP_LOSS_PCT:
-                    exit_trade(state, positions, sym, px, "STOP LOSS")
+                if candles:
+                    px = float(candles[0][4])
+                    last_prices[sym] = px
+                    
+                    pnl_pct = (px / pos.entry_price - 1) * 100
+                    if pnl_pct >= RECOVERY_TARGET_PCT:
+                        exit_trade(state, positions, sym, px, f"BOUNCE ({pnl_pct:.2f}%)")
+                    elif pnl_pct <= -STOP_LOSS_PCT:
+                        exit_trade(state, positions, sym, px, "STOP LOSS")
 
+            # 2. Scan for new crashes
             if len(positions) < MAX_OPEN_TRADES:
                 for sym in universe:
                     if sym in positions: continue
                     candles = get_candles(sym)
+                    if not candles: continue
+                    
                     is_crash, reason = detect_flash_crash(sym, candles)
                     if is_crash:
                         px = float(candles[0][4])
                         buy_size = state['cash'] / (MAX_OPEN_TRADES - len(positions))
-                        qty = buy_size / px
-                        positions[sym] = Position(sym, qty, px, time.time(), px, px*(1-STOP_LOSS_PCT/100))
-                        state['cash'] -= buy_size
-                        notify(f"🚨 SNIPED {sym} @ {px:.6f} | {reason}")
+                        if buy_size > 10: # Ensure trade is worth it
+                            qty = buy_size / px
+                            positions[sym] = Position(sym, qty, px, time.time(), px, px*(1-STOP_LOSS_PCT/100))
+                            state['cash'] -= buy_size
+                            notify(f"🚨 SNIPED {sym} @ {px:.6f} | {reason}")
+                            save_state(state, positions)
 
+            # 3. Handle Status Interval
             now = time.time()
             if (now - last_status) >= STATUS_INTERVAL:
                 status_report(state, positions, last_prices)
@@ -181,6 +207,7 @@ def main():
 
             time.sleep(SCAN_INTERVAL)
         except Exception as e:
+            print(f"Loop Error: {e}")
             time.sleep(5)
 
 def exit_trade(state, positions, sym, px, reason):
@@ -191,6 +218,7 @@ def exit_trade(state, positions, sym, px, reason):
     if pnl > 0: state['wins'] += 1
     else: state['losses'] += 1
     notify(f"💰 EXIT {sym} @ {px:.6f} | PnL: ${pnl:.2f} | {reason}")
+    save_state(state, positions)
 
 if __name__ == "__main__":
     main()
