@@ -1,239 +1,176 @@
-import os
-import time
+# Coin Sniper — Savage ELITE (PAPER) — FLASH CRASH HUNTER
+# 🎯 Goal: Catch 10%+ "Flash Crashes" and sell the immediate 2-5% bounce.
+# 🛠 Strategy: High-speed RSI oversold + Volume Spike detection.
+
+import os, time, json, csv, traceback
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, List, Optional, Tuple
 import requests
-from collections import deque, defaultdict
+import numpy as np
 
-# --- Configuration ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# =========================
+# CONFIG (PRIMED FOR VOLATILITY)
+# =========================
+START_BALANCE = float(os.getenv("START_BALANCE", "2000"))
+SCAN_INTERVAL = 2  # Faster scanning for rapid movements
+STATUS_INTERVAL = 60
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 20))
+# --- THE "MASSIVE MOVEMENT" TRIGGERS ---
+CRASH_THRESHOLD_PCT = 8.0     # Minimum drop in 5 minutes to trigger a buy
+VOL_SPIKE_RATIO = 4.0         # Volume must be 4x the recent average
+RSI_BUY_LEVEL = 15            # Extreme oversold condition
+RECOVERY_TARGET_PCT = 3.5     # Sell quickly on the bounce
 
-# Microcap Filters
-MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", 15000))
-MAX_LIQUIDITY = int(os.getenv("MAX_LIQUIDITY", 600000))
+# --- RISK LIMITS ---
+MAX_OPEN_TRADES = 5           # Concentrating capital for "thousands" goal
+STOP_LOSS_PCT = 5.0           # Exit if the "bounce" fails and it keeps dipping
+MAX_SYMBOL_AGE_MINS = 30      # Don't hold "crash" coins for more than 30 mins
 
-MIN_VOLUME_5M = int(os.getenv("MIN_VOLUME_5M", 8000))
+# =========================
+# DATA MODELS & HELPERS
+# =========================
+@dataclass
+class Position:
+    symbol: str
+    qty: float
+    entry_price: float
+    entry_time: float
+    high_water: float
+    stop_price: float
+    is_flash_trade: bool
 
-MIN_TRADES_5M = int(os.getenv("MIN_TRADES_5M", 10))
-MIN_BUY_RATIO = float(os.getenv("MIN_BUY_RATIO", 0.55))
-
-MIN_FDV = int(os.getenv("MIN_FDV", 60000))
-MAX_FDV = int(os.getenv("MAX_FDV", 15000000))
-
-# --- Consolidation Detection ---
-CONSOLIDATION_DAYS = 14
-MAX_RANGE_PERCENT = 12
-MIN_HISTORY_POINTS = 120
-
-# --- MACD Approximation ---
-MACD_LOOKBACK = 30
-MACD_THRESHOLD = 0.003
-
-# --- Tracking ---
-alerted_tokens = {}
-watchlist = deque(maxlen=5)
-price_history = defaultdict(lambda: deque(maxlen=2000))
-
-queries = [
-"usd","sol","eth","bnb","base",
-"pepe","doge","inu","cat","mog",
-"ai","elon","pump","rocket","moon",
-"wojak","chad","based","meme"
-]
-
-scan_count = 0
-
-
-def send_telegram(msg):
-
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(msg)
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
-    try:
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "disable_web_page_preview": True
-        }, timeout=10)
-
-    except:
-        pass
-
-
-def get_pairs():
-
-    all_pairs = []
-    seen = set()
-
-    for q in queries:
-
+def notify(msg: str):
+    print(msg, flush=True)
+    if os.getenv("TELEGRAM_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
         try:
+            requests.post(f"https://api.telegram.org/bot{os.getenv('TELEGRAM_TOKEN')}/sendMessage",
+                          json={"chat_id": os.getenv("TELEGRAM_CHAT_ID"), "text": msg}, timeout=5)
+        except: pass
 
-            url = f"https://api.dexscreener.com/latest/dex/search/?q={q}"
+COINBASE_API = "https://api.exchange.coinbase.com"
 
-            r = requests.get(url, timeout=10)
+def get_candles(product_id: str, granularity: int = 60) -> List[list]:
+    try:
+        r = requests.get(f"{COINBASE_API}/products/{product_id}/candles", 
+                         params={"granularity": granularity}, timeout=10)
+        return r.json()[:60] # Last hour of data
+    except: return []
 
-            if r.status_code == 200:
+# =========================
+# MATH: RSI & CRASH DETECT
+# =========================
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1: return 50
+    deltas = np.diff(prices)
+    seed = deltas[:period+1]
+    up = seed[seed >= 0].sum() / period
+    down = -seed[seed < 0].sum() / period
+    rs = up / down if down != 0 else 0
+    rsi = np.zeros_like(prices)
+    rsi[:period] = 100. - 100. / (1. + rs)
 
-                data = r.json()
+    for i in range(period, len(prices)):
+        delta = deltas[i - 1]
+        if delta > 0:
+            upval, downval = delta, 0.
+        else:
+            upval, downval = 0., -delta
+        up = (up * (period - 1) + upval) / period
+        down = (down * (period - 1) + downval) / period
+        rs = up / down if down != 0 else 0
+        rsi[i] = 100. - 100. / (1. + rs)
+    return rsi[-1]
 
-                for p in data.get("pairs", []):
+def detect_flash_crash(sym: str, candles: List[list]) -> Tuple[bool, str]:
+    """Checks for sudden massive price drops + volume confirmation."""
+    if len(candles) < 10: return False, ""
+    
+    # [0]time, [1]low, [2]high, [3]open, [4]close, [5]volume
+    closes = [float(c[4]) for c in reversed(candles)]
+    vols = [float(c[5]) for c in reversed(candles)]
+    
+    current_price = closes[-1]
+    prev_price_5m = closes[-6] if len(closes) >= 6 else closes[0]
+    
+    drop_pct = ((prev_price_5m - current_price) / prev_price_5m) * 100
+    avg_vol = np.mean(vols[-15:-1])
+    current_vol = vols[-1]
+    
+    rsi = calculate_rsi(closes)
+    
+    if drop_pct >= CRASH_THRESHOLD_PCT and current_vol > (avg_vol * VOL_SPIKE_RATIO):
+        if rsi <= RSI_BUY_LEVEL:
+            return True, f"CRASH! Drop:{drop_pct:.1f}% VolRatio:{current_vol/avg_vol:.1f} RSI:{rsi:.1f}"
+    
+    return False, ""
 
-                    addr = p.get("pairAddress")
-
-                    if addr and addr not in seen:
-
-                        seen.add(addr)
-                        all_pairs.append(p)
-
-            time.sleep(0.25)
-
-        except:
-            continue
-
-    return all_pairs
-
-
-def passes_filters(pair):
-
-    liq = pair.get("liquidity", {}).get("usd", 0)
-    vol5 = pair.get("volume", {}).get("m5", 0)
-    fdv = pair.get("fdv", 0)
-
-    txns = pair.get("txns", {}).get("m5", {})
-    buys = txns.get("buys", 0)
-    sells = txns.get("sells", 0)
-
-    trades = buys + sells
-
-    if not (MIN_LIQUIDITY <= liq <= MAX_LIQUIDITY):
-        return False
-
-    if vol5 < MIN_VOLUME_5M:
-        return False
-
-    if trades < MIN_TRADES_5M:
-        return False
-
-    if trades > 0 and (buys / trades) < MIN_BUY_RATIO:
-        return False
-
-    if not (MIN_FDV <= fdv <= MAX_FDV):
-        return False
-
-    return True
-
-
-def detect_consolidation(addr):
-
-    prices = price_history[addr]
-
-    if len(prices) < MIN_HISTORY_POINTS:
-        return False
-
-    high = max(prices)
-    low = min(prices)
-
-    if low == 0:
-        return False
-
-    range_pct = ((high - low) / low) * 100
-
-    return range_pct <= MAX_RANGE_PERCENT
-
-
-def macd_near_cross(addr):
-
-    prices = list(price_history[addr])
-
-    if len(prices) < MACD_LOOKBACK:
-        return False
-
-    short_avg = sum(prices[-12:]) / 12
-    long_avg = sum(prices[-26:]) / 26
-
-    diff = short_avg - long_avg
-
-    return abs(diff) < MACD_THRESHOLD
-
-
-def run():
-
-    global scan_count
-
-    print("Microcap consolidation scanner active...")
+# =========================
+# CORE EXECUTION
+# =========================
+def main():
+    state = {"cash": START_BALANCE, "wins": 0, "losses": 0, "pnl": 0.0, "positions": {}}
+    positions: Dict[str, Position] = {}
+    
+    # Get universe of USD pairs
+    products = requests.get(f"{COINBASE_API}/products").json()
+    universe = [p['id'] for p in products if p['quote_currency'] == 'USD' and p['status'] == 'online']
+    
+    notify("🌪 FLASH CRASH HUNTER ONLINE. Monitoring for massive movements...")
 
     while True:
+        try:
+            # 1. Manage Active Trades
+            for sym, pos in list(positions.items()):
+                candles = get_candles(sym)
+                if not candles: continue
+                px = float(candles[0][4])
+                
+                pnl_pct = (px / pos.entry_price - 1) * 100
+                
+                # Exit Logic: Take Profit or Stop Loss
+                if pnl_pct >= RECOVERY_TARGET_PCT:
+                    reason = f"BOUNCE REACHED ({pnl_pct:.2f}%)"
+                    exit_trade(state, positions, sym, px, reason)
+                elif pnl_pct <= -STOP_LOSS_PCT:
+                    exit_trade(state, positions, sym, px, "STOP LOSS")
+                elif (time.time() - pos.entry_time) > (MAX_SYMBOL_AGE_MINS * 60):
+                    exit_trade(state, positions, sym, px, "TIME EXPIRED")
 
-        start = time.time()
+            # 2. Scan for New Crashes
+            if len(positions) < MAX_OPEN_TRADES:
+                for sym in universe:
+                    if sym in positions: continue
+                    
+                    candles = get_candles(sym)
+                    is_crash, reason = detect_flash_crash(sym, candles)
+                    
+                    if is_crash:
+                        px = float(candles[0][4])
+                        buy_size = state['cash'] / (MAX_OPEN_TRADES - len(positions))
+                        qty = buy_size / px
+                        
+                        positions[sym] = Position(
+                            symbol=sym, qty=qty, entry_price=px, entry_time=time.time(),
+                            high_water=px, stop_price=px*(1-STOP_LOSS_PCT/100), is_flash_trade=True
+                        )
+                        state['cash'] -= buy_size
+                        notify(f"🚨 SNIPED {sym} @ {px:.6f} | {reason}")
 
-        pairs = get_pairs()
+            time.sleep(SCAN_INTERVAL)
+        except Exception as e:
+            print(f"Loop Error: {e}")
+            time.sleep(5)
 
-        heads = len(pairs)
-        setups = []
-
-        for pair in pairs:
-
-            if not passes_filters(pair):
-                continue
-
-            addr = pair.get("pairAddress")
-
-            symbol = pair.get("baseToken", {}).get("symbol", "UNK")
-
-            price = float(pair.get("priceUsd", 0))
-
-            price_history[addr].append(price)
-
-            if not detect_consolidation(addr):
-                continue
-
-            if not macd_near_cross(addr):
-                continue
-
-            last = alerted_tokens.get(addr, 0)
-
-            if last and price < last * 1.05:
-                continue
-
-            alerted_tokens[addr] = price
-
-            liq = pair.get("liquidity", {}).get("usd", 0)
-
-            msg = (
-                f"📈 CONSOLIDATION BREAKOUT SETUP\n"
-                f"{symbol}\n"
-                f"Price: ${price:.10f}\n"
-                f"Liq: ${int(liq):,}\n"
-                f"14D Range: Tight\n"
-                f"MACD: Near Cross\n"
-                f"https://dexscreener.com/search?q={addr}"
-            )
-
-            setups.append(msg)
-
-        scan_count += 1
-
-        if scan_count % 10 == 0:
-
-            send_telegram(
-                f"🔎 CONSOLIDATION SCAN\n"
-                f"Pairs scanned: {heads}\n"
-                f"Setups: {len(setups)}\n"
-                f"Scanner healthy ✅"
-            )
-
-        for m in setups:
-            send_telegram(m)
-
-        elapsed = time.time() - start
-
-        time.sleep(max(0, SCAN_INTERVAL - elapsed))
-
+def exit_trade(state, positions, sym, px, reason):
+    pos = positions.pop(sym)
+    trade_value = pos.qty * px
+    pnl = trade_value - (pos.qty * pos.entry_price)
+    state['cash'] += trade_value
+    state['pnl'] += pnl
+    if pnl > 0: state['wins'] += 1
+    else: state['losses'] += 1
+    
+    notify(f"✅ EXIT {sym} @ {px:.6f} | PnL: ${pnl:.2f} | {reason}")
 
 if __name__ == "__main__":
-    run()
+    main()
