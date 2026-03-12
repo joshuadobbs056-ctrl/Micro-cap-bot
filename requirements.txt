@@ -1,4 +1,3 @@
-ccxt
 requests
-numpy
-pandas
+feedparser
+beautifulsoup4
