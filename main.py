@@ -8,9 +8,8 @@ import eth_utils
 # CONFIG (Set these in Railway -> Variables)
 # ---------------------------
 
-NODE = os.getenv("NODE", "YOUR_ETH_NODE_WSS_URL")
+NODE = os.getenv("NODE", "wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "0x000")
-# Using Web3.to_checksum_address directly to ensure it's formatted correctly
 WALLET_ADDRESS = Web3.to_checksum_address(os.getenv("WALLET_ADDRESS", "0x000"))
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -29,12 +28,12 @@ FACTORY = Web3.to_checksum_address(
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 
 # ---------------------------
-# CONNECT WEB3 (v6+)
+# CONNECT WEB3 (WebSocket)
 # ---------------------------
 
 w3 = Web3(Web3.LegacyWebSocketProvider(NODE))
 
-# Robust private key handling
+# Private key handling
 try:
     clean_key = PRIVATE_KEY if PRIVATE_KEY.startswith("0x") else "0x" + PRIVATE_KEY
     account = w3.eth.account.from_key(clean_key)
@@ -66,9 +65,9 @@ def honeypot_check(token):
     try:
         r = requests.get(url).json()
         result = r.get("result", {}).get(token.lower(), {})
-        # Safety check: returns True only if it's explicitly NOT a honeypot
         return result.get("is_honeypot") == "0"
-    except:
+    except Exception as e:
+        print(f"Honeypot check error: {e}")
         return False
 
 # ---------------------------
@@ -77,7 +76,7 @@ def honeypot_check(token):
 
 def buy_token(token):
     amount = w3.to_wei(BUY_AMOUNT_ETH, 'ether')
-    
+
     router = w3.eth.contract(
         address=UNISWAP_ROUTER,
         abi=[{
@@ -96,7 +95,7 @@ def buy_token(token):
 
     try:
         tx = router.functions.swapExactETHForTokens(
-            0, # amountOutMin (slippage not handled for simplicity)
+            0,
             [WETH, Web3.to_checksum_address(token)],
             WALLET_ADDRESS,
             int(time.time()) + 600
@@ -115,7 +114,7 @@ def buy_token(token):
         send(f"❌ Buy Error: {str(e)[:100]}")
 
 # ---------------------------
-# MAIN LOOP
+# EVENT HANDLER
 # ---------------------------
 
 factory_abi = [{
@@ -132,30 +131,39 @@ factory_abi = [{
 
 factory_contract = w3.eth.contract(address=FACTORY, abi=factory_abi)
 
-send("🚀 Bot Started & Monitoring...")
+def handle_event(event):
+    t0 = event["args"]["token0"]
+    t1 = event["args"]["token1"]
+    token = t1 if t0.lower() == WETH.lower() else t0
 
+    send(f"🆕 New Pair Detected: {token}")
+
+    if honeypot_check(token):
+        send("✅ Security Check Passed - Executing Buy...")
+        buy_token(token)
+    else:
+        send("⚠️ Security Warning: Potential Honeypot - Skipping")
+
+def subscribe_to_pairs():
+    while True:
+        try:
+            subscription = factory_contract.events.PairCreated.subscribe()
+            subscription.on("data", handle_event)
+            subscription.on("error", lambda e: print(f"WS Error: {e}"))
+            print("✅ Subscription active: Listening for new pairs...")
+            break  # Exit while-loop if successful
+        except Exception as e:
+            print(f"Subscription failed: {e}. Retrying in 5s...")
+            time.sleep(5)
+    return subscription
+
+# ---------------------------
+# START BOT
+# ---------------------------
+
+send("🚀 Bot Started & Monitoring via WebSocket...")
+subscribe_to_pairs()
+
+# Keep script running
 while True:
-    try:
-        # FIXED: changed fromBlock to from_block for Web3 v6
-        event_filter = factory_contract.events.PairCreated.create_filter(from_block='latest')
-        
-        while True:
-            for event in event_filter.get_new_entries():
-                t0 = event["args"]["token0"]
-                t1 = event["args"]["token1"]
-                
-                # Identify which one is the new token vs WETH
-                token = t1 if t0.lower() == WETH.lower() else t0
-
-                send(f"🆕 New Pair Detected: {token}")
-                
-                if honeypot_check(token):
-                    send("✅ Security Check Passed - Executing Buy...")
-                    buy_token(token)
-                else:
-                    send("⚠️ Security Warning: Potential Honeypot - Skipping")
-            
-            time.sleep(2)
-    except Exception as e:
-        print(f"Connection error, restarting filter: {e}")
-        time.sleep(5)
+    time.sleep(10)
