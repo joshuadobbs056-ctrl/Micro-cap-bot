@@ -1,125 +1,168 @@
-import requests
 import time
-import feedparser
-from bs4 import BeautifulSoup
+import requests
+from web3 import Web3
 
-# ==============================
+# ---------------------------
 # CONFIG
-# ==============================
+# ---------------------------
 
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+NODE = "YOUR_ETH_NODE"
+PRIVATE_KEY = "YOUR_PRIVATE_KEY"
+WALLET_ADDRESS = "YOUR_WALLET"
 
-CHECK_INTERVAL = 300   # seconds (5 minutes)
+TELEGRAM_TOKEN = "BOT_TOKEN"
+CHAT_ID = "CHAT_ID"
 
-NEWS_FEED = "https://news.google.com/rss/search?q=SpaceX+IPO"
+BUY_AMOUNT_ETH = 0.02
+MIN_LIQUIDITY_USD = 50000
 
-SEC_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company=Space+Exploration+Technologies&owner=exclude&count=40"
+UNISWAP_ROUTER = Web3.to_checksum_address(
+"0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
+)
 
-sent_links = set()
+FACTORY = Web3.to_checksum_address(
+"0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+)
 
-# ==============================
-# TELEGRAM FUNCTION
-# ==============================
+# ---------------------------
+# CONNECT WEB3
+# ---------------------------
 
-def send_telegram(msg):
+w3 = Web3(Web3.WebsocketProvider(NODE))
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+account = w3.eth.account.from_key(PRIVATE_KEY)
 
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg,
-        "parse_mode": "Markdown"
+# ---------------------------
+# TELEGRAM ALERT
+# ---------------------------
+
+def send(msg):
+
+    url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    data={
+        "chat_id":CHAT_ID,
+        "text":msg
     }
 
-    requests.post(url, data=payload)
+    requests.post(url,data=data)
 
+# ---------------------------
+# HONEYPOT CHECK
+# ---------------------------
 
-# ==============================
-# CHECK NEWS
-# ==============================
+def honeypot_check(token):
 
-def check_news():
+    url=f"https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses={token}"
 
-    feed = feedparser.parse(NEWS_FEED)
+    r=requests.get(url).json()
 
-    for entry in feed.entries:
+    try:
 
-        if entry.link not in sent_links:
+        honeypot=r["result"][token]["is_honeypot"]
 
-            sent_links.add(entry.link)
+        if honeypot=="1":
+            return False
 
-            msg = f"""
-🚨 *SpaceX IPO News Detected*
+    except:
+        pass
 
-Title: {entry.title}
+    return True
 
-Link:
-{entry.link}
-"""
+# ---------------------------
+# BUY TOKEN
+# ---------------------------
 
-            send_telegram(msg)
+def buy_token(token):
 
+    amount = w3.to_wei(BUY_AMOUNT_ETH,'ether')
 
-# ==============================
-# CHECK SEC FILINGS
-# ==============================
+    router = w3.eth.contract(
+        address=UNISWAP_ROUTER,
+        abi=[{
+            "name":"swapExactETHForTokens",
+            "type":"function",
+            "inputs":[
+                {"name":"amountOutMin","type":"uint256"},
+                {"name":"path","type":"address[]"},
+                {"name":"to","type":"address"},
+                {"name":"deadline","type":"uint256"}
+            ]
+        }]
+    )
 
-def check_sec():
+    tx = router.functions.swapExactETHForTokens(
+        0,
+        [
+            w3.to_checksum_address(
+            "0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2"
+            ),
+            token
+        ],
+        WALLET_ADDRESS,
+        int(time.time())+600
+    ).build_transaction({
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+        "from": WALLET_ADDRESS,
+        "value": amount,
+        "gas":300000,
+        "gasPrice":w3.to_wei("30","gwei"),
+        "nonce":w3.eth.get_transaction_count(WALLET_ADDRESS)
 
-    r = requests.get(SEC_URL, headers=headers)
+    })
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    signed = w3.eth.account.sign_transaction(tx,PRIVATE_KEY)
 
-    rows = soup.find_all("tr")
+    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
 
-    for row in rows:
+    send(f"🚀 Bought token\n{token}\nTx:{tx_hash.hex()}")
 
-        text = row.get_text()
+# ---------------------------
+# LISTEN FOR NEW PAIRS
+# ---------------------------
 
-        if "S-1" in text or "IPO" in text:
+factory_abi=[{
+ "anonymous":False,
+ "inputs":[
+  {"indexed":True,"name":"token0","type":"address"},
+  {"indexed":True,"name":"token1","type":"address"},
+  {"indexed":False,"name":"pair","type":"address"}
+ ],
+ "name":"PairCreated",
+ "type":"event"
+}]
 
-            if text not in sent_links:
+factory = w3.eth.contract(address=FACTORY,abi=factory_abi)
 
-                sent_links.add(text)
+pair_filter = factory.events.PairCreated.create_filter(fromBlock="latest")
 
-                msg = f"""
-🚨 *POSSIBLE SPACEX IPO SEC FILING*
-
-{text}
-
-Check immediately:
-https://www.sec.gov
-"""
-
-                send_telegram(msg)
-
-
-# ==============================
+# ---------------------------
 # MAIN LOOP
-# ==============================
+# ---------------------------
 
-def main():
+send("🚀 Meme Sniper Bot Started")
 
-    send_telegram("🚀 SpaceX IPO Alert Bot Started")
+while True:
 
-    while True:
+    events = pair_filter.get_new_entries()
 
-        try:
+    for e in events:
 
-            check_news()
-            check_sec()
+        token0 = e["args"]["token0"]
+        token1 = e["args"]["token1"]
 
-        except Exception as e:
+        token = token0
 
-            send_telegram(f"Bot error: {e}")
+        send(f"🆕 New Pair Detected\nToken:{token}")
 
-        time.sleep(CHECK_INTERVAL)
+        if honeypot_check(token):
 
+            send("✅ Passed Honeypot Check")
 
-if __name__ == "__main__":
-    main()
+            buy_token(token)
+
+        else:
+
+            send("❌ Honeypot Detected")
+
+    time.sleep(5)
