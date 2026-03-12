@@ -7,7 +7,7 @@ from web3 import Web3
 # CONFIG
 # ---------------------------
 
-NODE = os.getenv("NODE", "wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY")
+NODE = os.getenv("NODE")  # Your WSS URL from Railway
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
@@ -19,13 +19,16 @@ FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
 # ---------------------------
 
 w3 = Web3(Web3.LegacyWebSocketProvider(NODE))
+if w3.is_connected():
+    print("✅ Connected to Ethereum WebSocket node")
+else:
+    print("❌ Failed to connect — check NODE variable")
 
 # ---------------------------
 # TELEGRAM ALERT
 # ---------------------------
 
 def send(msg):
-    """Send Telegram alert (or print if no credentials)."""
     if TELEGRAM_TOKEN and CHAT_ID:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         try:
@@ -73,7 +76,8 @@ factory_contract = w3.eth.contract(address=FACTORY, abi=factory_abi)
 
 def main_loop():
     event_filter = factory_contract.events.PairCreated.create_filter(from_block="latest")
-    send("🚀 Alert Bot Started: Monitoring new pairs...")
+    send("🚀 Alert Bot Started: Monitoring new WETH pairs...")
+    
     while True:
         try:
             for event in event_filter.get_new_entries():
@@ -84,12 +88,12 @@ def main_loop():
                 if honeypot_check(token):
                     send(f"✅ New Pair Passed Security Check: {token}")
                 else:
-                    send(f"⚠️ New Pair Failed Security Check: {token}")
+                    send(f"⚠️ New Pair Failed Security Check (Potential Honeypot): {token}")
             
             time.sleep(2)
 
         except Exception as e:
-            print(f"Error, restarting filter: {e}")
+            print(f"Connection error, restarting filter: {e}")
             time.sleep(5)
             event_filter = factory_contract.events.PairCreated.create_filter(from_block="latest")
 
