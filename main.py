@@ -10,7 +10,8 @@ import eth_utils
 
 NODE = os.getenv("NODE", "YOUR_ETH_NODE_WSS_URL")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "0x000")
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "0x000")
+# Using Web3.to_checksum_address directly to ensure it's formatted correctly
+WALLET_ADDRESS = Web3.to_checksum_address(os.getenv("WALLET_ADDRESS", "0x000"))
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -25,13 +26,15 @@ FACTORY = Web3.to_checksum_address(
     "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
 )
 
+WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
+
 # ---------------------------
-# CONNECT WEB3 (Updated for v6+)
+# CONNECT WEB3 (v6+)
 # ---------------------------
 
 w3 = Web3(Web3.LegacyWebSocketProvider(NODE))
 
-# Robust private key handling to prevent "Odd-length string" errors
+# Robust private key handling
 try:
     clean_key = PRIVATE_KEY if PRIVATE_KEY.startswith("0x") else "0x" + PRIVATE_KEY
     account = w3.eth.account.from_key(clean_key)
@@ -63,7 +66,8 @@ def honeypot_check(token):
     try:
         r = requests.get(url).json()
         result = r.get("result", {}).get(token.lower(), {})
-        return result.get("is_honeypot") != "1"
+        # Safety check: returns True only if it's explicitly NOT a honeypot
+        return result.get("is_honeypot") == "0"
     except:
         return False
 
@@ -92,8 +96,8 @@ def buy_token(token):
 
     try:
         tx = router.functions.swapExactETHForTokens(
-            0,
-            [w3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2"), w3.to_checksum_address(token)],
+            0, # amountOutMin (slippage not handled for simplicity)
+            [WETH, Web3.to_checksum_address(token)],
             WALLET_ADDRESS,
             int(time.time()) + 600
         ).build_transaction({
@@ -132,23 +136,26 @@ send("🚀 Bot Started & Monitoring...")
 
 while True:
     try:
-        event_filter = factory_contract.events.PairCreated.create_filter(fromBlock='latest')
+        # FIXED: changed fromBlock to from_block for Web3 v6
+        event_filter = factory_contract.events.PairCreated.create_filter(from_block='latest')
+        
         while True:
             for event in event_filter.get_new_entries():
                 t0 = event["args"]["token0"]
                 t1 = event["args"]["token1"]
-                weth = "0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2"
-                token = t1 if t0.lower() == weth.lower() else t0
+                
+                # Identify which one is the new token vs WETH
+                token = t1 if t0.lower() == WETH.lower() else t0
 
-                send(f"🆕 New Pair: {token}")
+                send(f"🆕 New Pair Detected: {token}")
                 
                 if honeypot_check(token):
-                    send("✅ Safe - Buying...")
+                    send("✅ Security Check Passed - Executing Buy...")
                     buy_token(token)
                 else:
-                    send("⚠️ Honeypot - Skipping")
+                    send("⚠️ Security Warning: Potential Honeypot - Skipping")
             
             time.sleep(2)
     except Exception as e:
-        print(f"Restarting loop due to error: {e}")
+        print(f"Connection error, restarting filter: {e}")
         time.sleep(5)
