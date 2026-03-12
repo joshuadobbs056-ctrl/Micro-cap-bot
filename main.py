@@ -134,7 +134,19 @@ def main_loop():
                     continue  # skip low liquidity
 
                 name, symbol = get_token_info(token)
-                send(f"✅ High-Potential Token Detected: {name} ({symbol})\nAddress: {token}\nWETH Liquidity: {liquidity:.2f} ETH")
+
+                # Optional: Add website/social links if known
+                website = f"https://etherscan.io/token/{token}"  # default to Etherscan token page
+                social = f"https://t.me/{symbol}"  # placeholder Telegram link
+
+                msg = (
+                    f"✅ High-Potential Token Detected: {name} ({symbol})\n\n"
+                    f"🔗 Website: {website}\n"
+                    f"📱 Social: {social}\n"
+                    f"💰 WETH Liquidity: {liquidity:.2f} ETH\n\n"
+                    f"🏦 Contract Address:\n{token}"
+                )
+                send(msg)
 
             time.sleep(2)
         except Exception as e:
