@@ -2,7 +2,6 @@ import time
 import os
 import requests
 from web3 import Web3
-import eth_utils
 
 # ---------------------------
 # CONFIG (Set these in Railway -> Variables)
@@ -114,7 +113,7 @@ def buy_token(token):
         send(f"❌ Buy Error: {str(e)[:100]}")
 
 # ---------------------------
-# EVENT HANDLER
+# FACTORY EVENT FILTER
 # ---------------------------
 
 factory_abi = [{
@@ -131,39 +130,36 @@ factory_abi = [{
 
 factory_contract = w3.eth.contract(address=FACTORY, abi=factory_abi)
 
-def handle_event(event):
-    t0 = event["args"]["token0"]
-    t1 = event["args"]["token1"]
-    token = t1 if t0.lower() == WETH.lower() else t0
-
-    send(f"🆕 New Pair Detected: {token}")
-
-    if honeypot_check(token):
-        send("✅ Security Check Passed - Executing Buy...")
-        buy_token(token)
-    else:
-        send("⚠️ Security Warning: Potential Honeypot - Skipping")
-
-def subscribe_to_pairs():
-    while True:
-        try:
-            subscription = factory_contract.events.PairCreated.subscribe()
-            subscription.on("data", handle_event)
-            subscription.on("error", lambda e: print(f"WS Error: {e}"))
-            print("✅ Subscription active: Listening for new pairs...")
-            break  # Exit while-loop if successful
-        except Exception as e:
-            print(f"Subscription failed: {e}. Retrying in 5s...")
-            time.sleep(5)
-    return subscription
-
 # ---------------------------
-# START BOT
+# MAIN LOOP
 # ---------------------------
 
 send("🚀 Bot Started & Monitoring via WebSocket...")
-subscribe_to_pairs()
 
-# Keep script running
-while True:
-    time.sleep(10)
+def main_loop():
+    event_filter = factory_contract.events.PairCreated.create_filter(from_block="latest")
+    while True:
+        try:
+            for event in event_filter.get_new_entries():
+                t0 = event["args"]["token0"]
+                t1 = event["args"]["token1"]
+                token = t1 if t0.lower() == WETH.lower() else t0
+
+                send(f"🆕 New Pair Detected: {token}")
+
+                if honeypot_check(token):
+                    send("✅ Security Check Passed - Executing Buy...")
+                    buy_token(token)
+                else:
+                    send("⚠️ Security Warning: Potential Honeypot - Skipping")
+            
+            time.sleep(2)
+
+        except Exception as e:
+            print(f"Connection error, restarting filter: {e}")
+            time.sleep(5)
+            # Recreate filter on error
+            event_filter = factory_contract.events.PairCreated.create_filter(from_block="latest")
+
+if __name__ == "__main__":
+    main_loop()
