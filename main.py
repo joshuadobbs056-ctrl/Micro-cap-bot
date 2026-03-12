@@ -94,7 +94,7 @@ factory_contract = w3.eth.contract(address=FACTORY, abi=factory_abi)
 
 def main_loop():
     event_filter = factory_contract.events.PairCreated.create_filter(from_block="latest")
-    send("🚀 Alert Bot Started: Monitoring new WETH pairs...")
+    send("🚀 Alert Bot Started: Monitoring new WETH pairs (alerts only for safe tokens)...")
     
     while True:
         try:
@@ -103,12 +103,10 @@ def main_loop():
                 t1 = event["args"]["token1"]
                 token = t1 if t0.lower() == WETH.lower() else t0
 
-                name, symbol = get_token_info(token)
-
                 if honeypot_check(token):
-                    send(f"✅ New Pair Passed Security Check: {name} ({symbol})\nAddress: {token}")
-                else:
-                    send(f"⚠️ New Pair Failed Security Check (Potential Honeypot): {name} ({symbol})\nAddress: {token}")
+                    name, symbol = get_token_info(token)
+                    send(f"✅ New Safe Token Detected: {name} ({symbol})\nAddress: {token}")
+                # else: do nothing, no alert for unsafe token
             
             time.sleep(2)
 
