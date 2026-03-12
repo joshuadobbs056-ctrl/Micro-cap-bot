@@ -7,7 +7,7 @@ from web3 import Web3
 # CONFIG
 # ---------------------------
 
-NODE = os.getenv("NODE")  # Your WSS URL from Railway
+NODE = os.getenv("NODE")  # Your WSS URL
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
@@ -53,6 +53,24 @@ def honeypot_check(token):
         return False
 
 # ---------------------------
+# GET TOKEN METADATA
+# ---------------------------
+
+ERC20_ABI = [
+    {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
+    {"constant":True,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function"},
+]
+
+def get_token_info(token):
+    try:
+        token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
+        name = token_contract.functions.name().call()
+        symbol = token_contract.functions.symbol().call()
+        return name, symbol
+    except Exception:
+        return "Unknown", "Unknown"
+
+# ---------------------------
 # FACTORY CONTRACT
 # ---------------------------
 
@@ -85,10 +103,12 @@ def main_loop():
                 t1 = event["args"]["token1"]
                 token = t1 if t0.lower() == WETH.lower() else t0
 
+                name, symbol = get_token_info(token)
+
                 if honeypot_check(token):
-                    send(f"✅ New Pair Passed Security Check: {token}")
+                    send(f"✅ New Pair Passed Security Check: {name} ({symbol})\nAddress: {token}")
                 else:
-                    send(f"⚠️ New Pair Failed Security Check (Potential Honeypot): {token}")
+                    send(f"⚠️ New Pair Failed Security Check (Potential Honeypot): {name} ({symbol})\nAddress: {token}")
             
             time.sleep(2)
 
