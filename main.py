@@ -9,6 +9,7 @@ from web3 import Web3
 NODE = os.getenv("NODE")  # Your WSS URL
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")  # Needed for metadata
 
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
@@ -65,6 +66,25 @@ def get_token_info(token):
         return "Unknown", "Unknown"
 
 # ---------------------------
+# FETCH VERIFIED / METADATA
+# ---------------------------
+def get_token_links(token, symbol):
+    # Defaults
+    website = f"https://etherscan.io/token/{token}"
+    social = f"https://t.me/{symbol}"  # placeholder
+    verified = False
+    try:
+        url = f"https://api.etherscan.io/api?module=token&action=getTokenInfo&contractaddress={token}&apikey={ETHERSCAN_API_KEY}"
+        r = requests.get(url).json()
+        result = r.get('result', {})
+        website = result.get('website', website)
+        social = result.get('telegram', social)
+        verified = result.get('is_verified', '0') == '1'
+    except:
+        pass
+    return website, social, verified
+
+# ---------------------------
 # GET PAIR LIQUIDITY
 # ---------------------------
 PAIR_ABI = [
@@ -83,14 +103,12 @@ def check_liquidity(pair_address):
         reserves = pair_contract.functions.getReserves().call()
         token0 = pair_contract.functions.token0().call()
         token1 = pair_contract.functions.token1().call()
-        # WETH is token0 or token1
         if token0.lower() == WETH.lower():
             weth_reserve = reserves[0]
         elif token1.lower() == WETH.lower():
             weth_reserve = reserves[1]
         else:
             return 0
-        # Convert to ETH
         return w3.from_wei(weth_reserve, 'ether')
     except:
         return 0
@@ -126,25 +144,28 @@ def main_loop():
                 pair_address = event["args"]["pair"]
                 token = t1 if t0.lower() == WETH.lower() else t0
 
+                # Skip unsafe tokens
                 if not honeypot_check(token):
-                    continue  # skip unsafe token
+                    continue
 
+                # Skip low liquidity
                 liquidity = check_liquidity(pair_address)
                 if liquidity < MIN_LIQUIDITY_ETH:
-                    continue  # skip low liquidity
+                    continue
 
+                # Token info
                 name, symbol = get_token_info(token)
+                website, social, verified = get_token_links(token, symbol)
+                status_tag = "[Verified]" if verified else "[Unverified]"
 
-                # Optional: Add website/social links if known
-                website = f"https://etherscan.io/token/{token}"  # default to Etherscan token page
-                social = f"https://t.me/{symbol}"  # placeholder Telegram link
-
+                # Compose Telegram message
                 msg = (
-                    f"✅ High-Potential Token Detected: {name} ({symbol})\n\n"
+                    f"{status_tag} ✅ High-Potential Token Detected: {name} ({symbol})\n\n"
                     f"🔗 Website: {website}\n"
                     f"📱 Social: {social}\n"
                     f"💰 WETH Liquidity: {liquidity:.2f} ETH\n\n"
-                    f"🏦 Contract Address:\n{token}"
+                    f"🏦 Contract Address:\n{token}\n"
+                    f"🏦 Pair Address:\n{pair_address}"
                 )
                 send(msg)
 
