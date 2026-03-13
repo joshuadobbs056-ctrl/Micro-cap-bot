@@ -1,6 +1,6 @@
+web3>=6
 requests
-feedparser
 beautifulsoup4
-web3
 spacy
 aiohttp
+en-core-web-sm
