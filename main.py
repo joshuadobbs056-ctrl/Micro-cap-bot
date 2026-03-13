@@ -23,12 +23,11 @@ WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
 MIN_LIQUIDITY_ETH = 10
 MIN_FIRST_SWAP_VOLUME = 0.05
-POLL_INTERVAL = 1  # fast polling
 
 # ---------------------------
 # WEB3 CONNECTION
 # ---------------------------
-w3 = Web3(Web3.LegacyWebSocketProvider(NODE))
+w3 = Web3(Web3.WebsocketProvider(NODE))
 
 # --- Manual PoA Middleware (for BSC/PoA chains) ---
 def poa_middleware(make_request, w3):
@@ -210,7 +209,7 @@ factory_abi = [
 factory_contract = w3.eth.contract(address=FACTORY, abi=factory_abi)
 
 # ---------------------------
-# PROCESS NEW TOKEN IN THREAD
+# PROCESS NEW TOKEN
 # ---------------------------
 def process_new_token(token, pair_address):
     def worker():
@@ -218,7 +217,7 @@ def process_new_token(token, pair_address):
             return
         liquidity = check_liquidity(pair_address)
         while liquidity < MIN_LIQUIDITY_ETH or not is_tradable(token, pair_address):
-            time.sleep(POLL_INTERVAL)
+            time.sleep(1)
             liquidity = check_liquidity(pair_address)
 
         name, symbol = get_token_info(token)
@@ -257,22 +256,21 @@ def process_new_token(token, pair_address):
 # ---------------------------
 def main_loop():
     send("🚀 Real-Time High-Potential Alert Bot Started")
-    event_filter = factory_contract.events.PairCreated.create_filter(fromBlock='latest')
 
+    # WebSocket subscription style
+    factory_contract.events.PairCreated().on("data", lambda event: handle_event(event))
+    factory_contract.events.PairCreated().on("error", lambda err: print(f"Event error: {err}"))
+
+    # Keep the script alive
     while True:
-        try:
-            for event in event_filter.get_new_entries():
-                t0 = event['args']['token0']
-                t1 = event['args']['token1']
-                pair_address = event['args']['pair']
-                token = t1 if t0.lower() == WETH.lower() else t0
-                threading.Thread(target=process_new_token, args=(token, pair_address)).start()
+        time.sleep(1)
 
-            time.sleep(POLL_INTERVAL)
-        except Exception as e:
-            print(f"Error fetching events: {e}")
-            time.sleep(5)
-            event_filter = factory_contract.events.PairCreated.create_filter(fromBlock='latest')
+def handle_event(event):
+    t0 = event['args']['token0']
+    t1 = event['args']['token1']
+    pair_address = event['args']['pair']
+    token = t1 if t0.lower() == WETH.lower() else t0
+    threading.Thread(target=process_new_token, args=(token, pair_address)).start()
 
 if __name__ == "__main__":
     main_loop()
