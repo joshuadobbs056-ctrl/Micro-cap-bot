@@ -10,7 +10,6 @@ import subprocess
 import threading
 import asyncio
 import aiohttp
-from web3.middleware import geth_poa  # Corrected import for Web3.py v6+
 
 # ---------------------------
 # CONFIG
@@ -24,13 +23,25 @@ WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
 MIN_LIQUIDITY_ETH = 10
 MIN_FIRST_SWAP_VOLUME = 0.05
-POLL_INTERVAL = 1  # Fast polling
+POLL_INTERVAL = 1  # fast polling
 
 # ---------------------------
 # WEB3 CONNECTION
 # ---------------------------
 w3 = Web3(Web3.LegacyWebSocketProvider(NODE))
-w3.middleware_onion.inject(geth_poa, layer=0)  # For PoA chains or BSC
+
+# --- Manual PoA Middleware (for BSC/PoA chains) ---
+def poa_middleware(make_request, w3):
+    def middleware(method, params):
+        response = make_request(method, params)
+        if method == "eth_getBlockByNumber" and response.get("result"):
+            block = response["result"]
+            if "extraData" in block and len(block["extraData"]) > 66:
+                block["extraData"] = block["extraData"][:66]
+        return response
+    return middleware
+
+w3.middleware_onion.add(poa_middleware)
 
 if not w3.is_connected():
     print("❌ Failed to connect — check NODE variable")
@@ -70,9 +81,6 @@ ERC20_ABI = [
     {"constant": True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
 ]
 
-# ---------------------------
-# GET TOKEN INFO
-# ---------------------------
 def get_token_info(token):
     try:
         token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
@@ -82,9 +90,6 @@ def get_token_info(token):
     except:
         return "Unknown", "Unknown"
 
-# ---------------------------
-# FETCH VERIFIED / METADATA
-# ---------------------------
 def get_token_links(token, symbol):
     website = f"https://etherscan.io/token/{token}"
     social = f"https://t.me/{symbol}"
@@ -221,7 +226,6 @@ def process_new_token(token, pair_address):
         status_tag = "✅ *Verified*" if verified else "⚠️ *Unverified*"
         dextools = f"https://www.dextools.io/app/en/ether/pair-explorer/{pair_address}"
 
-        # Async fetch website/social text
         async def fetch_all_text():
             async with aiohttp.ClientSession() as session:
                 texts = await asyncio.gather(*[fetch_text_from_url(session, url) for url in [website, social]])
