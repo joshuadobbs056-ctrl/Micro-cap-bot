@@ -3,7 +3,6 @@ import os
 import requests
 from web3 import Web3
 import spacy
-from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 import json
 import subprocess
@@ -14,10 +13,10 @@ import aiohttp
 # ---------------------------
 # CONFIG
 # ---------------------------
-NODE = os.getenv("NODE")  # Your WSS URL
+NODE = os.getenv("NODE")  # WSS URL
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")  # Optional metadata
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")  # optional
 
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
@@ -29,7 +28,7 @@ MIN_FIRST_SWAP_VOLUME = 0.05
 # ---------------------------
 w3 = Web3(Web3.WebsocketProvider(NODE))
 
-# --- Manual PoA Middleware (for BSC/PoA chains) ---
+# PoA Middleware
 def poa_middleware(make_request, w3):
     def middleware(method, params):
         response = make_request(method, params)
@@ -43,7 +42,7 @@ def poa_middleware(make_request, w3):
 w3.middleware_onion.add(poa_middleware)
 
 if not w3.is_connected():
-    print("❌ Failed to connect — check NODE variable")
+    print("❌ Failed to connect — check NODE")
 else:
     print("✅ Connected to Ethereum WebSocket node")
 
@@ -83,9 +82,7 @@ ERC20_ABI = [
 def get_token_info(token):
     try:
         token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
-        name = token_contract.functions.name().call()
-        symbol = token_contract.functions.symbol().call()
-        return name, symbol
+        return token_contract.functions.name().call(), token_contract.functions.symbol().call()
     except:
         return "Unknown", "Unknown"
 
@@ -110,7 +107,6 @@ def get_token_links(token, symbol):
 try:
     nlp = spacy.load("en_core_web_sm")
 except OSError:
-    print("Downloading spaCy en_core_web_sm model...")
     subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
     nlp = spacy.load("en_core_web_sm")
 
@@ -136,7 +132,7 @@ def scan_entities(text, token_address):
     return alerts
 
 # ---------------------------
-# ASYNC WEBSITE / SOCIAL SCRAPING
+# ASYNC WEBSITE/SOCIAL SCRAPING
 # ---------------------------
 async def fetch_text_from_url(session, url):
     try:
@@ -245,7 +241,7 @@ def process_new_token(token, pair_address):
             f"🌐 *Website*\n{website}\n\n"
             f"📱 *Social*\n{social}\n\n"
             f"📊 *DexTools*\n{dextools}\n\n"
-            f"📋 *Token Address (Tap to Copy)*\n```{token}```\n\n"
+            f"📋 *Token Address*\n```{token}```\n\n"
             f"📋 *Pair Address*\n```{pair_address}```"
         )
         send(msg)
@@ -254,23 +250,20 @@ def process_new_token(token, pair_address):
 # ---------------------------
 # MAIN LOOP
 # ---------------------------
-def main_loop():
-    send("🚀 Real-Time High-Potential Alert Bot Started")
-
-    # WebSocket subscription style
-    factory_contract.events.PairCreated().on("data", lambda event: handle_event(event))
-    factory_contract.events.PairCreated().on("error", lambda err: print(f"Event error: {err}"))
-
-    # Keep the script alive
-    while True:
-        time.sleep(1)
-
 def handle_event(event):
     t0 = event['args']['token0']
     t1 = event['args']['token1']
     pair_address = event['args']['pair']
     token = t1 if t0.lower() == WETH.lower() else t0
     threading.Thread(target=process_new_token, args=(token, pair_address)).start()
+
+def main_loop():
+    send("🚀 Real-Time High-Potential Alert Bot Started")
+    # WebSocket subscription
+    factory_contract.events.PairCreated().on("data", handle_event)
+    factory_contract.events.PairCreated().on("error", lambda err: print(f"Event error: {err}"))
+    while True:
+        time.sleep(1)
 
 if __name__ == "__main__":
     main_loop()
