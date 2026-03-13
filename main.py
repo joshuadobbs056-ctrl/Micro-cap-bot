@@ -2,17 +2,36 @@ import time
 import os
 import requests
 from web3 import Web3
-import spacy
-from urllib.parse import urlparse
 from bs4 import BeautifulSoup
+import subprocess
+import sys
+
+# ---------------------------
+# SPAСY MODEL LOADER
+# ---------------------------
+def load_spacy_model(model_name="en_core_web_sm"):
+    try:
+        import spacy
+        nlp = spacy.load(model_name)
+        print(f"✅ spaCy model '{model_name}' loaded successfully")
+        return nlp
+    except (OSError, ImportError):
+        print(f"⚠️ spaCy model '{model_name}' not found. Installing now...")
+        subprocess.check_call([sys.executable, "-m", "spacy", "download", model_name])
+        import spacy
+        nlp = spacy.load(model_name)
+        print(f"✅ spaCy model '{model_name}' installed and loaded successfully")
+        return nlp
+
+nlp = load_spacy_model()
 
 # ---------------------------
 # CONFIG
 # ---------------------------
-NODE = os.getenv("NODE")  # Your WSS URL
+NODE = os.getenv("NODE")  # WSS URL
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")  # Optional metadata
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")  # Optional
 
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
@@ -82,12 +101,13 @@ def get_token_links(token, symbol):
     social = f"https://t.me/{symbol}"
     verified = False
     try:
-        url = f"https://api.etherscan.io/api?module=token&action=getTokenInfo&contractaddress={token}&apikey={ETHERSCAN_API_KEY}"
-        r = requests.get(url).json()
-        result = r.get("result", {})
-        website = result.get("website", website)
-        social = result.get("telegram", social)
-        verified = result.get("is_verified", "0") == "1"
+        if ETHERSCAN_API_KEY:
+            url = f"https://api.etherscan.io/api?module=token&action=getTokenInfo&contractaddress={token}&apikey={ETHERSCAN_API_KEY}"
+            r = requests.get(url).json()
+            result = r.get("result", {})
+            website = result.get("website", website)
+            social = result.get("telegram", social)
+            verified = result.get("is_verified", "0") == "1"
     except:
         pass
     return website, social, verified
@@ -95,8 +115,6 @@ def get_token_links(token, symbol):
 # ---------------------------
 # AI ENTITY DETECTION
 # ---------------------------
-nlp = spacy.load("en_core_web_sm")
-
 def scan_entities(text, token_address):
     alerts = []
     doc = nlp(text)
@@ -110,7 +128,7 @@ def scan_entities(text, token_address):
     return alerts
 
 # ---------------------------
-# FETCH WEBSITE OR README TEXT
+# FETCH WEBSITE / README TEXT
 # ---------------------------
 def fetch_text_from_url(url):
     try:
@@ -234,7 +252,7 @@ def main_loop():
                 status_tag = "✅ *Verified*" if verified else "⚠️ *Unverified*"
                 dextools = f"https://www.dextools.io/app/en/ether/pair-explorer/{pair_address}"
 
-                # --- FETCH WEBSITE / README TEXT ---
+                # --- FETCH WEBSITE / SOCIAL TEXT ---
                 extra_text = ""
                 for url in [website, social]:
                     if url:
