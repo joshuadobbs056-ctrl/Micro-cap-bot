@@ -2,36 +2,18 @@ import time
 import os
 import requests
 from web3 import Web3
+import spacy
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
-import subprocess
-import sys
-
-# ---------------------------
-# SPAСY MODEL LOADER
-# ---------------------------
-def load_spacy_model(model_name="en_core_web_sm"):
-    try:
-        import spacy
-        nlp = spacy.load(model_name)
-        print(f"✅ spaCy model '{model_name}' loaded successfully")
-        return nlp
-    except (OSError, ImportError):
-        print(f"⚠️ spaCy model '{model_name}' not found. Installing now...")
-        subprocess.check_call([sys.executable, "-m", "spacy", "download", model_name])
-        import spacy
-        nlp = spacy.load(model_name)
-        print(f"✅ spaCy model '{model_name}' installed and loaded successfully")
-        return nlp
-
-nlp = load_spacy_model()
+import json
 
 # ---------------------------
 # CONFIG
 # ---------------------------
-NODE = os.getenv("NODE")  # WSS URL
+NODE = os.getenv("NODE")  # Your WSS URL
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")  # Optional
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")  # Optional metadata
 
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
@@ -40,7 +22,7 @@ MIN_FIRST_SWAP_VOLUME = 0.05
 POLL_INTERVAL = 2
 
 # ---------------------------
-# CONNECT WEB3
+# WEB3 CONNECTION
 # ---------------------------
 w3 = Web3(Web3.LegacyWebSocketProvider(NODE))
 if not w3.is_connected():
@@ -73,7 +55,7 @@ def honeypot_check(token):
         return False
 
 # ---------------------------
-# TOKEN ABI
+# ERC20 ABI
 # ---------------------------
 ERC20_ABI = [
     {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
@@ -101,34 +83,47 @@ def get_token_links(token, symbol):
     social = f"https://t.me/{symbol}"
     verified = False
     try:
-        if ETHERSCAN_API_KEY:
-            url = f"https://api.etherscan.io/api?module=token&action=getTokenInfo&contractaddress={token}&apikey={ETHERSCAN_API_KEY}"
-            r = requests.get(url).json()
-            result = r.get("result", {})
-            website = result.get("website", website)
-            social = result.get("telegram", social)
-            verified = result.get("is_verified", "0") == "1"
+        url = f"https://api.etherscan.io/api?module=token&action=getTokenInfo&contractaddress={token}&apikey={ETHERSCAN_API_KEY}"
+        r = requests.get(url).json()
+        result = r.get("result", {})
+        website = result.get("website", website)
+        social = result.get("telegram", social)
+        verified = result.get("is_verified", "0") == "1"
     except:
         pass
     return website, social, verified
 
 # ---------------------------
-# AI ENTITY DETECTION
+# SPACY NLP FOR ENTITY DETECTION
 # ---------------------------
+nlp = spacy.load("en_core_web_sm")
+
+# Load Top 500 companies and high-profile individuals from JSON
+with open("big_names.json") as f:
+    BIG_NAMES = json.load(f)
+
+KEYWORDS = ["token", "coin", "crypto", "project", "launch", "swap"]
+
 def scan_entities(text, token_address):
     alerts = []
     doc = nlp(text)
     for ent in doc.ents:
-        if ent.label_ in ["ORG", "PERSON"]:
-            alerts.append({
-                "address": token_address,
-                "name": ent.text,
-                "indicator": "🔵"
-            })
+        if ent.text in BIG_NAMES:
+            # Grab surrounding context
+            start = max(ent.start_char - 50, 0)
+            end = min(ent.end_char + 50, len(text))
+            context = text[start:end].lower()
+            # Only alert if context mentions crypto keywords
+            if any(k in context for k in KEYWORDS):
+                alerts.append({
+                    "address": token_address,
+                    "name": ent.text,
+                    "indicator": "🔵"
+                })
     return alerts
 
 # ---------------------------
-# FETCH WEBSITE / README TEXT
+# FETCH WEBSITE OR README TEXT
 # ---------------------------
 def fetch_text_from_url(url):
     try:
@@ -183,14 +178,9 @@ def is_tradable(token, pair):
         balance = token_contract.functions.balanceOf(pair).call()
         if balance <= 0:
             return False
+        # Tiny simulated sell check
         ROUTER_ADDRESS = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
-        ROUTER_ABI = [
-            {"constant":True,"inputs":[
-                {"name":"amountIn","type":"uint256"},
-                {"name":"path","type":"address[]"}],
-             "name":"getAmountsOut","outputs":[{"name":"amounts","type":"uint256[]"}],
-             "type":"function"}
-        ]
+        ROUTER_ABI = [{"constant":True,"inputs":[{"name":"amountIn","type":"uint256"},{"name":"path","type":"address[]"}],"name":"getAmountsOut","outputs":[{"name":"amounts","type":"uint256[]"}],"type":"function"}]
         router = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
         path = [token, WETH] if token != WETH else [WETH, token]
         small_amount = 10 ** 12
@@ -239,14 +229,17 @@ def main_loop():
                 pair_address = event["args"]["pair"]
                 token = t1 if t0.lower() == WETH.lower() else t0
 
+                # --- HONEYPOT CHECK ---
                 if not honeypot_check(token):
                     continue
 
+                # --- LIQUIDITY & TRADABILITY CHECK ---
                 liquidity = check_liquidity(pair_address)
                 while liquidity < MIN_LIQUIDITY_ETH or not is_tradable(token, pair_address):
                     time.sleep(POLL_INTERVAL)
                     liquidity = check_liquidity(pair_address)
 
+                # --- TOKEN INFO ---
                 name, symbol = get_token_info(token)
                 website, social, verified = get_token_links(token, symbol)
                 status_tag = "✅ *Verified*" if verified else "⚠️ *Unverified*"
@@ -258,17 +251,17 @@ def main_loop():
                     if url:
                         extra_text += " " + fetch_text_from_url(url)
 
-                # --- AI ENTITY DETECTION ---
+                # --- AI ENTITY DETECTION (Big Names) ---
                 text_to_scan = f"{name} {symbol} {website} {social} {extra_text}"
                 entity_alerts = scan_entities(text_to_scan, token)
                 for alert in entity_alerts:
                     alert_msg = f"{alert['indicator']} *Entity Detected*\nToken: {alert['address']}\nMention: {alert['name']}"
                     send(alert_msg)
 
-                # Monitor first buy
+                # --- MONITOR FIRST BUY ---
                 monitor_first_buy(token, pair_address)
 
-                # Compose main Telegram message
+                # --- MAIN TELEGRAM ALERT ---
                 msg = (
                     f"🚨 *HIGH-POTENTIAL TOKEN DETECTED / FIRST BUY*\n\n"
                     f"{status_tag}\n"
