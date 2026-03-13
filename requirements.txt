@@ -1,6 +1,5 @@
 web3>=6
 requests
 beautifulsoup4
-spacy
+spacy>=3.8
 aiohttp
-en-core-web-sm
