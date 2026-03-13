@@ -9,12 +9,13 @@ from web3 import Web3
 NODE = os.getenv("NODE")  # Your WSS URL
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")  # Optional metadata
 
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-MIN_LIQUIDITY_ETH = 10  # minimum WETH liquidity
-MIN_FIRST_SWAP_VOLUME = 0.05  # minimum ETH volume in first swaps
+MIN_LIQUIDITY_ETH = 10  # minimum WETH liquidity for alert
+MIN_FIRST_SWAP_VOLUME = 0.05  # ETH equivalent for first swap detection
+POLL_INTERVAL = 2  # seconds between liquidity/swap checks
 
 # ---------------------------
 # CONNECT WEB3
@@ -109,11 +110,7 @@ def check_liquidity(pair_address):
         reserves = pair_contract.functions.getReserves().call()
         token0 = pair_contract.functions.token0().call()
         token1 = pair_contract.functions.token1().call()
-        weth_reserve = 0
-        if token0.lower() == WETH.lower():
-            weth_reserve = reserves[0]
-        elif token1.lower() == WETH.lower():
-            weth_reserve = reserves[1]
+        weth_reserve = reserves[0] if token0.lower() == WETH.lower() else reserves[1] if token1.lower() == WETH.lower() else 0
         return w3.from_wei(weth_reserve, "ether")
     except:
         return 0
@@ -125,18 +122,35 @@ def is_tradable(token, pair):
     try:
         pair_contract = w3.eth.contract(address=pair, abi=PAIR_ABI)
         token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
-        # Check first swap volume
+
+        # Check liquidity / first swap
         reserves = pair_contract.functions.getReserves().call()
         token0 = pair_contract.functions.token0().call()
         token1 = pair_contract.functions.token1().call()
-        weth_reserve = reserves[0] if token0.lower() == WETH.lower() else reserves[1]
+        weth_reserve = reserves[0] if token0.lower() == WETH.lower() else reserves[1] if token1.lower() == WETH.lower() else 0
         if w3.from_wei(weth_reserve, "ether") < MIN_FIRST_SWAP_VOLUME:
             return False
-        # Attempt tiny sell simulation (transfer 1 token to pair)
+
+        # Check token balance on pair for sellability
         balance = token_contract.functions.balanceOf(pair).call()
         if balance <= 0:
             return False
+
+        # --- Simulated tiny sell check ---
+        ROUTER_ADDRESS = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
+        ROUTER_ABI = [
+            {"constant":True,"inputs":[
+                {"name":"amountIn","type":"uint256"},
+                {"name":"path","type":"address[]"}],
+             "name":"getAmountsOut","outputs":[{"name":"amounts","type":"uint256[]"}],
+             "type":"function"}
+        ]
+        router = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
+        path = [token, WETH] if token != WETH else [WETH, token]
+        small_amount = 10 ** 12  # tiny sell amount
+        router.functions.getAmountsOut(small_amount, path).call()
         return True
+
     except:
         return False
 
@@ -154,12 +168,24 @@ factory_abi = [
 factory_contract = w3.eth.contract(address=FACTORY, abi=factory_abi)
 
 # ---------------------------
+# MONITOR FIRST BUYS
+# ---------------------------
+def monitor_first_buy(token, pair):
+    token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
+    initial_balance = token_contract.functions.balanceOf(pair).call()
+    while True:
+        time.sleep(POLL_INTERVAL)
+        current_balance = token_contract.functions.balanceOf(pair).call()
+        if current_balance < initial_balance:  # someone bought
+            return True
+
+# ---------------------------
 # MAIN LOOP
 # ---------------------------
 def main_loop():
     event_filter = factory_contract.events.PairCreated.create_filter(from_block="latest")
-    send("🚀 Upgraded High-Potential Alert Bot Started")
-    
+    send("🚀 Real-Time High-Potential Alert Bot Started")
+
     while True:
         try:
             for event in event_filter.get_new_entries():
@@ -172,14 +198,11 @@ def main_loop():
                 if not honeypot_check(token):
                     continue
 
-                # Liquidity check
+                # Wait until liquidity, first swap, and simulated sell
                 liquidity = check_liquidity(pair_address)
-                if liquidity < MIN_LIQUIDITY_ETH:
-                    continue
-
-                # Check first swaps & sellability
-                if not is_tradable(token, pair_address):
-                    continue
+                while liquidity < MIN_LIQUIDITY_ETH or not is_tradable(token, pair_address):
+                    time.sleep(POLL_INTERVAL)
+                    liquidity = check_liquidity(pair_address)
 
                 # Token info
                 name, symbol = get_token_info(token)
@@ -187,9 +210,12 @@ def main_loop():
                 status_tag = "✅ *Verified*" if verified else "⚠️ *Unverified*"
                 dextools = f"https://www.dextools.io/app/en/ether/pair-explorer/{pair_address}"
 
+                # Monitor first buy
+                monitor_first_buy(token, pair_address)
+
                 # Compose Telegram message
                 msg = (
-                    f"🚨 *HIGH-POTENTIAL TOKEN DETECTED*\n\n"
+                    f"🚨 *HIGH-POTENTIAL TOKEN DETECTED / FIRST BUY*\n\n"
                     f"{status_tag}\n"
                     f"*{name} ({symbol})*\n\n"
                     f"💰 *Liquidity:* {liquidity:.2f} ETH\n\n"
@@ -201,7 +227,8 @@ def main_loop():
                 )
                 send(msg)
 
-            time.sleep(2)
+            time.sleep(POLL_INTERVAL)
+
         except Exception as e:
             print(f"Connection error, restarting filter: {e}")
             time.sleep(5)
