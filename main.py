@@ -26,25 +26,7 @@ MIN_FIRST_SWAP_VOLUME = 0.05
 # ---------------------------
 # WEB3 CONNECTION
 # ---------------------------
-w3 = Web3(Web3.WebsocketProvider(NODE))
-
-# PoA Middleware
-def poa_middleware(make_request, w3):
-    def middleware(method, params):
-        response = make_request(method, params)
-        if method == "eth_getBlockByNumber" and response.get("result"):
-            block = response["result"]
-            if "extraData" in block and len(block["extraData"]) > 66:
-                block["extraData"] = block["extraData"][:66]
-        return response
-    return middleware
-
-w3.middleware_onion.add(poa_middleware)
-
-if not w3.is_connected():
-    print("❌ Failed to connect — check NODE")
-else:
-    print("✅ Connected to Ethereum WebSocket node")
+w3 = Web3(Web3.LegacyWebSocketProvider(NODE))
 
 # ---------------------------
 # TELEGRAM ALERT
@@ -228,10 +210,8 @@ def process_new_token(token, pair_address):
 
         extra_text = asyncio.run(fetch_all_text())
         text_to_scan = f"{name} {symbol} {website} {social} {extra_text}"
-        entity_alerts = scan_entities(text_to_scan, token)
-        for alert in entity_alerts:
-            alert_msg = f"{alert['indicator']} *Entity Detected*\nToken: {alert['address']}\nMention: {alert['name']}"
-            send(alert_msg)
+        for alert in scan_entities(text_to_scan, token):
+            send(f"{alert['indicator']} *Entity Detected*\nToken: {alert['address']}\nMention: {alert['name']}")
 
         msg = (
             f"🚨 *HIGH-POTENTIAL TOKEN DETECTED / FIRST BUY*\n\n"
@@ -248,7 +228,7 @@ def process_new_token(token, pair_address):
     threading.Thread(target=worker).start()
 
 # ---------------------------
-# MAIN LOOP
+# EVENT HANDLER
 # ---------------------------
 def handle_event(event):
     t0 = event['args']['token0']
@@ -257,9 +237,11 @@ def handle_event(event):
     token = t1 if t0.lower() == WETH.lower() else t0
     threading.Thread(target=process_new_token, args=(token, pair_address)).start()
 
+# ---------------------------
+# MAIN LOOP
+# ---------------------------
 def main_loop():
     send("🚀 Real-Time High-Potential Alert Bot Started")
-    # WebSocket subscription
     factory_contract.events.PairCreated().on("data", handle_event)
     factory_contract.events.PairCreated().on("error", lambda err: print(f"Event error: {err}"))
     while True:
