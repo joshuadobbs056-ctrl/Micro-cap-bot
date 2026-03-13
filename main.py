@@ -10,7 +10,7 @@ import subprocess
 import threading
 import asyncio
 import aiohttp
-from web3.middleware import geth_poa_middleware
+from web3.middleware import geth_poa  # Corrected import for Web3.py v6+
 
 # ---------------------------
 # CONFIG
@@ -24,14 +24,13 @@ WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
 MIN_LIQUIDITY_ETH = 10
 MIN_FIRST_SWAP_VOLUME = 0.05
-POLL_INTERVAL = 1  # Fast polling for near-instant alerts
+POLL_INTERVAL = 1  # Fast polling
 
 # ---------------------------
 # WEB3 CONNECTION
 # ---------------------------
 w3 = Web3(Web3.LegacyWebSocketProvider(NODE))
-# Needed for BSC / testnets (optional)
-w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+w3.middleware_onion.inject(geth_poa, layer=0)  # For PoA chains or BSC
 
 if not w3.is_connected():
     print("❌ Failed to connect — check NODE variable")
@@ -102,7 +101,7 @@ def get_token_links(token, symbol):
     return website, social, verified
 
 # ---------------------------
-# SPACY NLP FOR ENTITY DETECTION
+# SPACY NLP
 # ---------------------------
 try:
     nlp = spacy.load("en_core_web_sm")
@@ -111,7 +110,6 @@ except OSError:
     subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
     nlp = spacy.load("en_core_web_sm")
 
-# Load Top 500 companies + high-profile individuals
 with open("big_names.json") as f:
     BIG_NAMES = json.load(f)
 
@@ -236,7 +234,6 @@ def process_new_token(token, pair_address):
             alert_msg = f"{alert['indicator']} *Entity Detected*\nToken: {alert['address']}\nMention: {alert['name']}"
             send(alert_msg)
 
-        # Main Telegram alert
         msg = (
             f"🚨 *HIGH-POTENTIAL TOKEN DETECTED / FIRST BUY*\n\n"
             f"{status_tag}\n"
@@ -252,11 +249,10 @@ def process_new_token(token, pair_address):
     threading.Thread(target=worker).start()
 
 # ---------------------------
-# MAIN LOOP (Python Web3.py)
+# MAIN LOOP
 # ---------------------------
 def main_loop():
     send("🚀 Real-Time High-Potential Alert Bot Started")
-
     event_filter = factory_contract.events.PairCreated.create_filter(fromBlock='latest')
 
     while True:
