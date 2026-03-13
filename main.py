@@ -6,6 +6,7 @@ import spacy
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 import json
+import subprocess
 
 # ---------------------------
 # CONFIG
@@ -96,9 +97,14 @@ def get_token_links(token, symbol):
 # ---------------------------
 # SPACY NLP FOR ENTITY DETECTION
 # ---------------------------
-nlp = spacy.load("en_core_web_sm")
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    print("Downloading spaCy en_core_web_sm model...")
+    subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
+    nlp = spacy.load("en_core_web_sm")
 
-# Load Top 500 companies and high-profile individuals from JSON
+# Load Top 500 companies + high-profile individuals
 with open("big_names.json") as f:
     BIG_NAMES = json.load(f)
 
@@ -178,7 +184,6 @@ def is_tradable(token, pair):
         balance = token_contract.functions.balanceOf(pair).call()
         if balance <= 0:
             return False
-        # Tiny simulated sell check
         ROUTER_ADDRESS = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
         ROUTER_ABI = [{"constant":True,"inputs":[{"name":"amountIn","type":"uint256"},{"name":"path","type":"address[]"}],"name":"getAmountsOut","outputs":[{"name":"amounts","type":"uint256[]"}],"type":"function"}]
         router = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
@@ -229,39 +234,35 @@ def main_loop():
                 pair_address = event["args"]["pair"]
                 token = t1 if t0.lower() == WETH.lower() else t0
 
-                # --- HONEYPOT CHECK ---
                 if not honeypot_check(token):
                     continue
 
-                # --- LIQUIDITY & TRADABILITY CHECK ---
                 liquidity = check_liquidity(pair_address)
                 while liquidity < MIN_LIQUIDITY_ETH or not is_tradable(token, pair_address):
                     time.sleep(POLL_INTERVAL)
                     liquidity = check_liquidity(pair_address)
 
-                # --- TOKEN INFO ---
                 name, symbol = get_token_info(token)
                 website, social, verified = get_token_links(token, symbol)
                 status_tag = "✅ *Verified*" if verified else "⚠️ *Unverified*"
                 dextools = f"https://www.dextools.io/app/en/ether/pair-explorer/{pair_address}"
 
-                # --- FETCH WEBSITE / SOCIAL TEXT ---
+                # Fetch website / social text
                 extra_text = ""
                 for url in [website, social]:
                     if url:
                         extra_text += " " + fetch_text_from_url(url)
 
-                # --- AI ENTITY DETECTION (Big Names) ---
+                # Entity detection
                 text_to_scan = f"{name} {symbol} {website} {social} {extra_text}"
                 entity_alerts = scan_entities(text_to_scan, token)
                 for alert in entity_alerts:
                     alert_msg = f"{alert['indicator']} *Entity Detected*\nToken: {alert['address']}\nMention: {alert['name']}"
                     send(alert_msg)
 
-                # --- MONITOR FIRST BUY ---
                 monitor_first_buy(token, pair_address)
 
-                # --- MAIN TELEGRAM ALERT ---
+                # Main Telegram alert
                 msg = (
                     f"🚨 *HIGH-POTENTIAL TOKEN DETECTED / FIRST BUY*\n\n"
                     f"{status_tag}\n"
