@@ -27,6 +27,10 @@ MIN_FIRST_SWAP_VOLUME = 0.05
 # WEB3 CONNECTION
 # ---------------------------
 w3 = Web3(Web3.LegacyWebSocketProvider(NODE))
+if not w3.is_connected():
+    print("❌ Failed to connect")
+else:
+    print("✅ Connected to Ethereum WebSocket node")
 
 # ---------------------------
 # TELEGRAM ALERT
@@ -235,17 +239,25 @@ def handle_event(event):
     t1 = event['args']['token1']
     pair_address = event['args']['pair']
     token = t1 if t0.lower() == WETH.lower() else t0
-    threading.Thread(target=process_new_token, args=(token, pair_address)).start()
+    process_new_token(token, pair_address)
 
 # ---------------------------
-# MAIN LOOP
+# MAIN LOOP (polling)
 # ---------------------------
 def main_loop():
     send("🚀 Real-Time High-Potential Alert Bot Started")
-    factory_contract.events.PairCreated().on("data", handle_event)
-    factory_contract.events.PairCreated().on("error", lambda err: print(f"Event error: {err}"))
+
+    event_filter = factory_contract.events.PairCreated.create_filter(from_block='latest')
+
     while True:
-        time.sleep(1)
+        try:
+            for event in event_filter.get_new_entries():
+                handle_event(event)
+            time.sleep(1)
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+            time.sleep(5)
+            event_filter = factory_contract.events.PairCreated.create_filter(from_block='latest')
 
 if __name__ == "__main__":
     main_loop()
