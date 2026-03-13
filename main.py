@@ -7,6 +7,9 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 import json
 import subprocess
+import threading
+import asyncio
+import aiohttp
 
 # ---------------------------
 # CONFIG
@@ -20,7 +23,7 @@ WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
 MIN_LIQUIDITY_ETH = 10
 MIN_FIRST_SWAP_VOLUME = 0.05
-POLL_INTERVAL = 2
+POLL_INTERVAL = 1  # Reduced interval for faster first detection
 
 # ---------------------------
 # WEB3 CONNECTION
@@ -115,11 +118,9 @@ def scan_entities(text, token_address):
     doc = nlp(text)
     for ent in doc.ents:
         if ent.text in BIG_NAMES:
-            # Grab surrounding context
             start = max(ent.start_char - 50, 0)
             end = min(ent.end_char + 50, len(text))
             context = text[start:end].lower()
-            # Only alert if context mentions crypto keywords
             if any(k in context for k in KEYWORDS):
                 alerts.append({
                     "address": token_address,
@@ -129,21 +130,21 @@ def scan_entities(text, token_address):
     return alerts
 
 # ---------------------------
-# FETCH WEBSITE OR README TEXT
+# FETCH WEBSITE OR README TEXT (ASYNC)
 # ---------------------------
-def fetch_text_from_url(url):
+async def fetch_text_from_url(session, url):
     try:
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            text = soup.get_text(separator=" ", strip=True)
-            return text
+        async with session.get(url, timeout=5) as resp:
+            if resp.status == 200:
+                html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+                return soup.get_text(separator=" ", strip=True)
     except:
         pass
     return ""
 
 # ---------------------------
-# PAIR ABI
+# PAIR ABI & LIQUIDITY
 # ---------------------------
 PAIR_ABI = [
     {"constant": True,"inputs":[],"name":"getReserves","outputs":[
@@ -154,9 +155,6 @@ PAIR_ABI = [
     {"constant": True,"inputs":[],"name":"token1","outputs":[{"name":"","type":"address"}],"type":"function"},
 ]
 
-# ---------------------------
-# CHECK LIQUIDITY
-# ---------------------------
 def check_liquidity(pair_address):
     try:
         pair_contract = w3.eth.contract(address=pair_address, abi=PAIR_ABI)
@@ -208,80 +206,69 @@ factory_abi = [
 factory_contract = w3.eth.contract(address=FACTORY, abi=factory_abi)
 
 # ---------------------------
-# MONITOR FIRST BUYS
+# PROCESS NEW TOKEN IN THREAD
 # ---------------------------
-def monitor_first_buy(token, pair):
-    token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
-    initial_balance = token_contract.functions.balanceOf(pair).call()
-    while True:
-        time.sleep(POLL_INTERVAL)
-        current_balance = token_contract.functions.balanceOf(pair).call()
-        if current_balance < initial_balance:
-            return True
+def process_new_token(token, pair_address):
+    def worker():
+        if not honeypot_check(token):
+            return
+        liquidity = check_liquidity(pair_address)
+        while liquidity < MIN_LIQUIDITY_ETH or not is_tradable(token, pair_address):
+            time.sleep(POLL_INTERVAL)
+            liquidity = check_liquidity(pair_address)
+
+        name, symbol = get_token_info(token)
+        website, social, verified = get_token_links(token, symbol)
+        status_tag = "✅ *Verified*" if verified else "⚠️ *Unverified*"
+        dextools = f"https://www.dextools.io/app/en/ether/pair-explorer/{pair_address}"
+
+        # Async fetch website/social text
+        async def fetch_all_text():
+            async with aiohttp.ClientSession() as session:
+                texts = await asyncio.gather(*[fetch_text_from_url(session, url) for url in [website, social]])
+                return " ".join(texts)
+
+        extra_text = asyncio.run(fetch_all_text())
+        text_to_scan = f"{name} {symbol} {website} {social} {extra_text}"
+        entity_alerts = scan_entities(text_to_scan, token)
+        for alert in entity_alerts:
+            alert_msg = f"{alert['indicator']} *Entity Detected*\nToken: {alert['address']}\nMention: {alert['name']}"
+            send(alert_msg)
+
+        # Main Telegram alert
+        msg = (
+            f"🚨 *HIGH-POTENTIAL TOKEN DETECTED / FIRST BUY*\n\n"
+            f"{status_tag}\n"
+            f"*{name} ({symbol})*\n\n"
+            f"💰 *Liquidity:* {liquidity:.2f} ETH\n\n"
+            f"🌐 *Website*\n{website}\n\n"
+            f"📱 *Social*\n{social}\n\n"
+            f"📊 *DexTools*\n{dextools}\n\n"
+            f"📋 *Token Address (Tap to Copy)*\n```{token}```\n\n"
+            f"📋 *Pair Address*\n```{pair_address}```"
+        )
+        send(msg)
+    threading.Thread(target=worker).start()
 
 # ---------------------------
-# MAIN LOOP
+# MAIN LOOP USING WS EVENTS
 # ---------------------------
 def main_loop():
-    event_filter = factory_contract.events.PairCreated.create_filter(from_block="latest")
-    send("🚀 Real-Time High-Potential Alert Bot Started")
+    send("🚀 Real-Time High-Potential Alert Bot Started (WebSocket Mode)")
 
+    def handle_event(event):
+        t0 = event["args"]["token0"]
+        t1 = event["args"]["token1"]
+        pair_address = event["args"]["pair"]
+        token = t1 if t0.lower() == WETH.lower() else t0
+        process_new_token(token, pair_address)
+
+    # Subscribe to PairCreated events via WebSocket
+    factory_contract.events.PairCreated().on("data", handle_event)
+
+    # Keep the script running
     while True:
-        try:
-            for event in event_filter.get_new_entries():
-                t0 = event["args"]["token0"]
-                t1 = event["args"]["token1"]
-                pair_address = event["args"]["pair"]
-                token = t1 if t0.lower() == WETH.lower() else t0
-
-                if not honeypot_check(token):
-                    continue
-
-                liquidity = check_liquidity(pair_address)
-                while liquidity < MIN_LIQUIDITY_ETH or not is_tradable(token, pair_address):
-                    time.sleep(POLL_INTERVAL)
-                    liquidity = check_liquidity(pair_address)
-
-                name, symbol = get_token_info(token)
-                website, social, verified = get_token_links(token, symbol)
-                status_tag = "✅ *Verified*" if verified else "⚠️ *Unverified*"
-                dextools = f"https://www.dextools.io/app/en/ether/pair-explorer/{pair_address}"
-
-                # Fetch website / social text
-                extra_text = ""
-                for url in [website, social]:
-                    if url:
-                        extra_text += " " + fetch_text_from_url(url)
-
-                # Entity detection
-                text_to_scan = f"{name} {symbol} {website} {social} {extra_text}"
-                entity_alerts = scan_entities(text_to_scan, token)
-                for alert in entity_alerts:
-                    alert_msg = f"{alert['indicator']} *Entity Detected*\nToken: {alert['address']}\nMention: {alert['name']}"
-                    send(alert_msg)
-
-                monitor_first_buy(token, pair_address)
-
-                # Main Telegram alert
-                msg = (
-                    f"🚨 *HIGH-POTENTIAL TOKEN DETECTED / FIRST BUY*\n\n"
-                    f"{status_tag}\n"
-                    f"*{name} ({symbol})*\n\n"
-                    f"💰 *Liquidity:* {liquidity:.2f} ETH\n\n"
-                    f"🌐 *Website*\n{website}\n\n"
-                    f"📱 *Social*\n{social}\n\n"
-                    f"📊 *DexTools*\n{dextools}\n\n"
-                    f"📋 *Token Address (Tap to Copy)*\n```{token}```\n\n"
-                    f"📋 *Pair Address*\n```{pair_address}```"
-                )
-                send(msg)
-
-            time.sleep(POLL_INTERVAL)
-
-        except Exception as e:
-            print(f"Connection error, restarting filter: {e}")
-            time.sleep(5)
-            event_filter = factory_contract.events.PairCreated.create_filter(from_block="latest")
+        time.sleep(1)
 
 if __name__ == "__main__":
     main_loop()
