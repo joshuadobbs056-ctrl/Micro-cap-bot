@@ -2,6 +2,9 @@ import time
 import os
 import requests
 from web3 import Web3
+import spacy
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
 
 # ---------------------------
 # CONFIG
@@ -13,9 +16,9 @@ ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")  # Optional metadata
 
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
-MIN_LIQUIDITY_ETH = 10  # minimum WETH liquidity for alert
-MIN_FIRST_SWAP_VOLUME = 0.05  # ETH equivalent for first swap detection
-POLL_INTERVAL = 2  # seconds between liquidity/swap checks
+MIN_LIQUIDITY_ETH = 10
+MIN_FIRST_SWAP_VOLUME = 0.05
+POLL_INTERVAL = 2
 
 # ---------------------------
 # CONNECT WEB3
@@ -56,7 +59,7 @@ def honeypot_check(token):
 ERC20_ABI = [
     {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
     {"constant": True, "inputs": [], "name": "name", "outputs": [{"name": "", "type": "string"}], "type": "function"},
-    {"constant": True, "inputs": [{"name": "_owner","type":"address"}], "name": "balanceOf", "outputs": [{"name":"balance","type":"uint256"}], "type":"function"},
+    {"constant": True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
 ]
 
 # ---------------------------
@@ -88,6 +91,37 @@ def get_token_links(token, symbol):
     except:
         pass
     return website, social, verified
+
+# ---------------------------
+# AI ENTITY DETECTION
+# ---------------------------
+nlp = spacy.load("en_core_web_sm")
+
+def scan_entities(text, token_address):
+    alerts = []
+    doc = nlp(text)
+    for ent in doc.ents:
+        if ent.label_ in ["ORG", "PERSON"]:
+            alerts.append({
+                "address": token_address,
+                "name": ent.text,
+                "indicator": "🔵"
+            })
+    return alerts
+
+# ---------------------------
+# FETCH WEBSITE OR README TEXT
+# ---------------------------
+def fetch_text_from_url(url):
+    try:
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            text = soup.get_text(separator=" ", strip=True)
+            return text
+    except:
+        pass
+    return ""
 
 # ---------------------------
 # PAIR ABI
@@ -122,21 +156,15 @@ def is_tradable(token, pair):
     try:
         pair_contract = w3.eth.contract(address=pair, abi=PAIR_ABI)
         token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
-
-        # Check liquidity / first swap
         reserves = pair_contract.functions.getReserves().call()
         token0 = pair_contract.functions.token0().call()
         token1 = pair_contract.functions.token1().call()
         weth_reserve = reserves[0] if token0.lower() == WETH.lower() else reserves[1] if token1.lower() == WETH.lower() else 0
         if w3.from_wei(weth_reserve, "ether") < MIN_FIRST_SWAP_VOLUME:
             return False
-
-        # Check token balance on pair for sellability
         balance = token_contract.functions.balanceOf(pair).call()
         if balance <= 0:
             return False
-
-        # --- Simulated tiny sell check ---
         ROUTER_ADDRESS = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
         ROUTER_ABI = [
             {"constant":True,"inputs":[
@@ -147,10 +175,9 @@ def is_tradable(token, pair):
         ]
         router = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
         path = [token, WETH] if token != WETH else [WETH, token]
-        small_amount = 10 ** 12  # tiny sell amount
+        small_amount = 10 ** 12
         router.functions.getAmountsOut(small_amount, path).call()
         return True
-
     except:
         return False
 
@@ -163,7 +190,7 @@ factory_abi = [
         {"indexed": True, "name": "token1", "type": "address"},
         {"indexed": False, "name": "pair", "type": "address"},
         {"indexed": False, "name": "", "type": "uint256"}],
-     "name": "PairCreated","type": "event"}
+     "name": "PairCreated","type":"event"}
 ]
 factory_contract = w3.eth.contract(address=FACTORY, abi=factory_abi)
 
@@ -176,7 +203,7 @@ def monitor_first_buy(token, pair):
     while True:
         time.sleep(POLL_INTERVAL)
         current_balance = token_contract.functions.balanceOf(pair).call()
-        if current_balance < initial_balance:  # someone bought
+        if current_balance < initial_balance:
             return True
 
 # ---------------------------
@@ -194,26 +221,36 @@ def main_loop():
                 pair_address = event["args"]["pair"]
                 token = t1 if t0.lower() == WETH.lower() else t0
 
-                # Honeypot protection
                 if not honeypot_check(token):
                     continue
 
-                # Wait until liquidity, first swap, and simulated sell
                 liquidity = check_liquidity(pair_address)
                 while liquidity < MIN_LIQUIDITY_ETH or not is_tradable(token, pair_address):
                     time.sleep(POLL_INTERVAL)
                     liquidity = check_liquidity(pair_address)
 
-                # Token info
                 name, symbol = get_token_info(token)
                 website, social, verified = get_token_links(token, symbol)
                 status_tag = "✅ *Verified*" if verified else "⚠️ *Unverified*"
                 dextools = f"https://www.dextools.io/app/en/ether/pair-explorer/{pair_address}"
 
+                # --- FETCH WEBSITE / README TEXT ---
+                extra_text = ""
+                for url in [website, social]:
+                    if url:
+                        extra_text += " " + fetch_text_from_url(url)
+
+                # --- AI ENTITY DETECTION ---
+                text_to_scan = f"{name} {symbol} {website} {social} {extra_text}"
+                entity_alerts = scan_entities(text_to_scan, token)
+                for alert in entity_alerts:
+                    alert_msg = f"{alert['indicator']} *Entity Detected*\nToken: {alert['address']}\nMention: {alert['name']}"
+                    send(alert_msg)
+
                 # Monitor first buy
                 monitor_first_buy(token, pair_address)
 
-                # Compose Telegram message
+                # Compose main Telegram message
                 msg = (
                     f"🚨 *HIGH-POTENTIAL TOKEN DETECTED / FIRST BUY*\n\n"
                     f"{status_tag}\n"
