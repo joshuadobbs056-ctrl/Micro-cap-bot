@@ -2,5 +2,5 @@ requests
 feedparser
 beautifulsoup4
 web3
-requests
+spacy
 
