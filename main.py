@@ -21,7 +21,7 @@ except ImportError:
 import os
 import time
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 
 # ---------------------------
 # CONFIG
@@ -36,7 +36,10 @@ RUN_PURCHASE = os.getenv("RUN_PURCHASE", "off").strip().lower()  # on / off
 PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD", "50"))
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "1500"))  # 1500 = 15%
 GAS_LIMIT_BUY = int(os.getenv("GAS_LIMIT_BUY", "450000"))
+GAS_LIMIT_APPROVE = int(os.getenv("GAS_LIMIT_APPROVE", "120000"))
+GAS_LIMIT_SELL = int(os.getenv("GAS_LIMIT_SELL", "450000"))
 BUY_DEADLINE_SECONDS = int(os.getenv("BUY_DEADLINE_SECONDS", "180"))
+SELL_DEADLINE_SECONDS = int(os.getenv("SELL_DEADLINE_SECONDS", "180"))
 
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
@@ -44,7 +47,7 @@ UNISWAP_V2_ROUTER = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c6
 CHAINLINK_ETH_USD = Web3.to_checksum_address("0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419")
 
 # Binary-style early runner filters
-MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY", "1.5"))
+MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY", "3.0"))
 MAX_ETH_LIQUIDITY = float(os.getenv("MAX_ETH_LIQUIDITY", "25"))
 
 LIQUIDITY_WAIT_SECONDS = int(os.getenv("LIQUIDITY_WAIT_SECONDS", "120"))
@@ -61,6 +64,31 @@ MAX_TOP_BUYER_SHARE = float(os.getenv("MAX_TOP_BUYER_SHARE", "0.45"))
 
 BLOCK_POLL_SECONDS = float(os.getenv("BLOCK_POLL_SECONDS", "2"))
 PAIR_POLL_SECONDS = float(os.getenv("PAIR_POLL_SECONDS", "1.5"))
+
+# ---------------------------
+# AUTO-SELL / DEFENSE CONFIG
+# ---------------------------
+ENABLE_POSITION_MONITOR = os.getenv("ENABLE_POSITION_MONITOR", "true").lower() == "true"
+POSITION_CHECK_SECONDS = float(os.getenv("POSITION_CHECK_SECONDS", "3"))
+
+# Liquidity-based exits
+LIQUIDITY_EXIT_DROP_PCT = float(os.getenv("LIQUIDITY_EXIT_DROP_PCT", "0.25"))  # 25% below entry liquidity
+EMERGENCY_LIQUIDITY_DROP_PCT = float(os.getenv("EMERGENCY_LIQUIDITY_DROP_PCT", "0.35"))  # 35% one-shot danger level
+
+# Momentum collapse exits
+VELOCITY_EXIT_RATIO = float(os.getenv("VELOCITY_EXIT_RATIO", "0.35"))  # current velocity < 35% of entry velocity
+VELOCITY_MIN_ABS = float(os.getenv("VELOCITY_MIN_ABS", "2.0"))  # or absolute floor
+NEG_FLOW_WINDOW_SECONDS = int(os.getenv("NEG_FLOW_WINDOW_SECONDS", "120"))
+SELL_PRESSURE_REQUIRED_CHECKS = int(os.getenv("SELL_PRESSURE_REQUIRED_CHECKS", "2"))
+MOMENTUM_FAIL_REQUIRED_CHECKS = int(os.getenv("MOMENTUM_FAIL_REQUIRED_CHECKS", "2"))
+
+# Trailing stop
+ENABLE_TRAILING_STOP = os.getenv("ENABLE_TRAILING_STOP", "true").lower() == "true"
+TRAILING_ACTIVATE_PCT = float(os.getenv("TRAILING_ACTIVATE_PCT", "0.20"))  # +20%
+TRAILING_DISTANCE_PCT = float(os.getenv("TRAILING_DISTANCE_PCT", "0.10"))  # 10%
+
+# Partial / full exit
+SELL_PERCENT = float(os.getenv("SELL_PERCENT", "1.0"))  # 1.0 = 100%, 0.5 = 50%
 
 # ---------------------------
 # WEB3
@@ -149,12 +177,39 @@ def purchases_enabled() -> bool:
     return RUN_PURCHASE == "on" and ACCOUNT is not None
 
 
+def build_tx_params(wallet_address: str, nonce: int, gas: int, value: int = 0) -> dict:
+    return {
+        "from": wallet_address,
+        "value": value,
+        "nonce": nonce,
+        "chainId": w3.eth.chain_id,
+        "gas": gas,
+        "gasPrice": w3.eth.gas_price,
+    }
+
+
 # ---------------------------
 # ABIS
 # ---------------------------
 ERC20_ABI = [
     {"constant": True, "inputs": [], "name": "name", "outputs": [{"name": "", "type": "string"}], "type": "function"},
     {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
+    {"constant": True, "inputs": [{"name": "owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
+    {
+        "constant": True,
+        "inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}],
+        "name": "allowance",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    },
+    {
+        "constant": False,
+        "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}],
+        "name": "approve",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function",
+    },
 ]
 
 PAIR_ABI = [
@@ -223,6 +278,19 @@ ROUTER_ABI = [
         "stateMutability": "payable",
         "type": "function",
     },
+    {
+        "name": "swapExactTokensForETHSupportingFeeOnTransferTokens",
+        "outputs": [],
+        "inputs": [
+            {"name": "amountIn", "type": "uint256"},
+            {"name": "amountOutMin", "type": "uint256"},
+            {"name": "path", "type": "address[]"},
+            {"name": "to", "type": "address"},
+            {"name": "deadline", "type": "uint256"},
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
 ]
 
 CHAINLINK_ETH_USD_ABI = [
@@ -248,14 +316,26 @@ eth_usd_contract = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=CHAINLINK_ETH_
 # ---------------------------
 # TOKEN / RISK
 # ---------------------------
+def get_token_contract(token: str):
+    return w3.eth.contract(address=token, abi=ERC20_ABI)
+
+
 def get_token_info(token: str) -> tuple[str, str]:
     try:
-        token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
+        token_contract = get_token_contract(token)
         name = safe_call(lambda: token_contract.functions.name().call(), "Unknown")
         symbol = safe_call(lambda: token_contract.functions.symbol().call(), "Unknown")
         return str(name), str(symbol)
     except Exception:
         return "Unknown", "Unknown"
+
+
+def get_token_decimals(token: str) -> int:
+    try:
+        token_contract = get_token_contract(token)
+        return int(safe_call(lambda: token_contract.functions.decimals().call(), 18))
+    except Exception:
+        return 18
 
 
 def honeypot_check(token: str) -> tuple[bool, str]:
@@ -309,6 +389,20 @@ def usd_to_eth(usd_amount: float) -> float:
     return usd_amount / eth_usd
 
 
+def token_amount_to_human(raw_amount: int, decimals: int) -> float:
+    return raw_amount / (10 ** decimals)
+
+
+def estimate_eth_out_for_tokens(token: str, amount_in_raw: int) -> float:
+    try:
+        path = [token, WETH]
+        amounts = router_contract.functions.getAmountsOut(int(amount_in_raw), path).call()
+        eth_out_wei = int(amounts[-1])
+        return float(w3.from_wei(eth_out_wei, "ether"))
+    except Exception:
+        return 0.0
+
+
 # ---------------------------
 # BUY / SELL PARSING
 # ---------------------------
@@ -342,13 +436,120 @@ def parse_swap_direction(args: dict, token0: str, token1: str):
 
 
 # ---------------------------
-# AUTO BUY
+# POSITION STATE
 # ---------------------------
 PURCHASED_TOKENS = set()
 PURCHASE_LOCK = threading.Lock()
+ACTIVE_PAIRS = set()
+ACTIVE_POSITIONS = {}
+POSITION_LOCK = threading.Lock()
 
 
-def execute_purchase(token: str, pair: str, name: str, symbol: str) -> None:
+class Position:
+    def __init__(
+        self,
+        token: str,
+        pair: str,
+        name: str,
+        symbol: str,
+        decimals: int,
+        entry_liquidity: float,
+        entry_velocity: float,
+        entry_buy_eth: float,
+        entry_sell_eth: float,
+        purchased_eth: float,
+        token_balance_raw: int,
+        tx_hash: str,
+    ):
+        self.token = token
+        self.pair = pair
+        self.name = name
+        self.symbol = symbol
+        self.decimals = decimals
+        self.entry_liquidity = entry_liquidity
+        self.entry_velocity = entry_velocity
+        self.entry_buy_eth = entry_buy_eth
+        self.entry_sell_eth = entry_sell_eth
+        self.purchased_eth = purchased_eth
+        self.token_balance_raw = token_balance_raw
+        self.buy_tx_hash = tx_hash
+        self.opened_ts = now_ts()
+        self.last_block = w3.eth.block_number
+        self.trailing_active = False
+        self.peak_estimated_eth = purchased_eth
+        self.fail_checks_sell_pressure = 0
+        self.fail_checks_velocity = 0
+        self.closed = False
+
+
+# ---------------------------
+# AUTO BUY / APPROVE / SELL
+# ---------------------------
+def approve_token_if_needed(token: str, amount_raw: int, name: str, symbol: str) -> bool:
+    token_contract = get_token_contract(token)
+    wallet_address = ACCOUNT.address
+
+    try:
+        allowance = int(token_contract.functions.allowance(wallet_address, UNISWAP_V2_ROUTER).call())
+        if allowance >= amount_raw:
+            return True
+
+        nonce = w3.eth.get_transaction_count(wallet_address, "pending")
+        tx = token_contract.functions.approve(
+            UNISWAP_V2_ROUTER,
+            2**256 - 1,
+        ).build_transaction(
+            build_tx_params(wallet_address, nonce, GAS_LIMIT_APPROVE)
+        )
+
+        signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hex = tx_hash.hex()
+
+        send(
+            "🟡 APPROVE SUBMITTED\n\n"
+            f"{name} ({symbol})\n"
+            f"Wallet: {wallet_address}\n"
+            f"Tx\n{tx_hex}"
+        )
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+        if receipt.status == 1:
+            send(
+                "✅ APPROVE COMPLETED\n\n"
+                f"{name} ({symbol})\n"
+                f"Wallet: {wallet_address}\n"
+                f"Tx\n{tx_hex}"
+            )
+            return True
+
+        send(
+            "❌ APPROVE FAILED\n\n"
+            f"{name} ({symbol})\n"
+            f"Wallet: {wallet_address}\n"
+            f"Tx\n{tx_hex}"
+        )
+        return False
+
+    except Exception as e:
+        send(
+            "❌ APPROVE ERROR\n\n"
+            f"{name} ({symbol})\n"
+            f"Reason: {e}"
+        )
+        return False
+
+
+def execute_purchase(
+    token: str,
+    pair: str,
+    name: str,
+    symbol: str,
+    entry_liquidity: float,
+    entry_velocity: float,
+    entry_buy_eth: float,
+    entry_sell_eth: float,
+) -> None:
     if not purchases_enabled():
         return
 
@@ -363,6 +564,10 @@ def execute_purchase(token: str, pair: str, name: str, symbol: str) -> None:
         path = [WETH, token]
 
         wallet_address = ACCOUNT.address
+        decimals = get_token_decimals(token)
+
+        balance_before = int(get_token_contract(token).functions.balanceOf(wallet_address).call())
+
         nonce = w3.eth.get_transaction_count(wallet_address, "pending")
         deadline = int(time.time()) + BUY_DEADLINE_SECONDS
 
@@ -371,10 +576,7 @@ def execute_purchase(token: str, pair: str, name: str, symbol: str) -> None:
             expected_out = int(amounts_out[-1])
             amount_out_min = int(expected_out * (10000 - SLIPPAGE_BPS) / 10000)
         except Exception:
-            # For very fresh tokens / taxed tokens, fallback to zero min output
             amount_out_min = 0
-
-        gas_price = w3.eth.gas_price
 
         tx = router_contract.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
             amount_out_min,
@@ -382,14 +584,7 @@ def execute_purchase(token: str, pair: str, name: str, symbol: str) -> None:
             wallet_address,
             deadline,
         ).build_transaction(
-            {
-                "from": wallet_address,
-                "value": value_wei,
-                "nonce": nonce,
-                "chainId": w3.eth.chain_id,
-                "gas": GAS_LIMIT_BUY,
-                "gasPrice": gas_price,
-            }
+            build_tx_params(wallet_address, nonce, GAS_LIMIT_BUY, value=value_wei)
         )
 
         signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
@@ -407,23 +602,59 @@ def execute_purchase(token: str, pair: str, name: str, symbol: str) -> None:
 
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
 
-        if receipt.status == 1:
-            send(
-                "✅ PURCHASE COMPLETED\n\n"
-                f"{name} ({symbol})\n"
-                f"USD amount: ${PURCHASE_AMOUNT_USD:.2f}\n"
-                f"Approx ETH: {eth_amount:.6f}\n"
-                f"Wallet: {wallet_address}\n"
-                f"Tx\n{tx_hex}"
-            )
-            send_copy_bubble("PURCHASE_TX", tx_hex)
-        else:
+        if receipt.status != 1:
             send(
                 "❌ PURCHASE FAILED\n\n"
                 f"{name} ({symbol})\n"
                 f"Wallet: {wallet_address}\n"
                 f"Tx\n{tx_hex}"
             )
+            return
+
+        balance_after = int(get_token_contract(token).functions.balanceOf(wallet_address).call())
+        token_balance_raw = max(balance_after - balance_before, 0)
+
+        send(
+            "✅ PURCHASE COMPLETED\n\n"
+            f"{name} ({symbol})\n"
+            f"USD amount: ${PURCHASE_AMOUNT_USD:.2f}\n"
+            f"Approx ETH: {eth_amount:.6f}\n"
+            f"Received tokens: {token_amount_to_human(token_balance_raw, decimals):,.6f}\n"
+            f"Wallet: {wallet_address}\n"
+            f"Tx\n{tx_hex}"
+        )
+        send_copy_bubble("PURCHASE_TX", tx_hex)
+
+        if token_balance_raw <= 0:
+            send(
+                "⚠️ POSITION NOT STARTED\n\n"
+                f"{name} ({symbol})\n"
+                "Reason: token balance after buy was zero"
+            )
+            return
+
+        if not approve_token_if_needed(token, token_balance_raw, name, symbol):
+            return
+
+        if ENABLE_POSITION_MONITOR:
+            position = Position(
+                token=token,
+                pair=pair,
+                name=name,
+                symbol=symbol,
+                decimals=decimals,
+                entry_liquidity=entry_liquidity,
+                entry_velocity=entry_velocity,
+                entry_buy_eth=entry_buy_eth,
+                entry_sell_eth=entry_sell_eth,
+                purchased_eth=eth_amount,
+                token_balance_raw=token_balance_raw,
+                tx_hash=tx_hex,
+            )
+            with POSITION_LOCK:
+                ACTIVE_POSITIONS[token] = position
+
+            threading.Thread(target=monitor_position, args=(position,), daemon=True).start()
 
     except Exception as e:
         send(
@@ -433,12 +664,266 @@ def execute_purchase(token: str, pair: str, name: str, symbol: str) -> None:
         )
 
 
+def execute_sell(position: Position, reason: str) -> None:
+    if position.closed:
+        return
+    if not purchases_enabled():
+        return
+
+    with POSITION_LOCK:
+        if position.closed:
+            return
+        position.closed = True
+
+    try:
+        token_contract = get_token_contract(position.token)
+        wallet_address = ACCOUNT.address
+        current_balance_raw = int(token_contract.functions.balanceOf(wallet_address).call())
+
+        if current_balance_raw <= 0:
+            send(
+                "⚠️ SELL SKIPPED\n\n"
+                f"{position.name} ({position.symbol})\n"
+                "Reason: token balance is zero"
+            )
+            return
+
+        amount_in = int(current_balance_raw * SELL_PERCENT)
+        if amount_in <= 0:
+            send(
+                "⚠️ SELL SKIPPED\n\n"
+                f"{position.name} ({position.symbol})\n"
+                "Reason: computed sell amount is zero"
+            )
+            return
+
+        if not approve_token_if_needed(position.token, amount_in, position.name, position.symbol):
+            return
+
+        deadline = int(time.time()) + SELL_DEADLINE_SECONDS
+        path = [position.token, WETH]
+
+        try:
+            amounts_out = router_contract.functions.getAmountsOut(amount_in, path).call()
+            expected_eth_out = int(amounts_out[-1])
+            amount_out_min = int(expected_eth_out * (10000 - SLIPPAGE_BPS) / 10000)
+        except Exception:
+            expected_eth_out = 0
+            amount_out_min = 0
+
+        nonce = w3.eth.get_transaction_count(wallet_address, "pending")
+        tx = router_contract.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            amount_in,
+            amount_out_min,
+            path,
+            wallet_address,
+            deadline,
+        ).build_transaction(
+            build_tx_params(wallet_address, nonce, GAS_LIMIT_SELL)
+        )
+
+        signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hex = tx_hash.hex()
+
+        send(
+            "🔴 AUTO SELL SUBMITTED\n\n"
+            f"{position.name} ({position.symbol})\n"
+            f"Reason: {reason}\n"
+            f"Sell percent: {SELL_PERCENT:.0%}\n"
+            f"Estimated ETH out: {float(w3.from_wei(expected_eth_out, 'ether')):.6f}\n"
+            f"Wallet: {wallet_address}\n"
+            f"Tx\n{tx_hex}"
+        )
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+        if receipt.status == 1:
+            send(
+                "✅ AUTO SELL COMPLETED\n\n"
+                f"{position.name} ({position.symbol})\n"
+                f"Reason: {reason}\n"
+                f"Sell percent: {SELL_PERCENT:.0%}\n"
+                f"Wallet: {wallet_address}\n"
+                f"Tx\n{tx_hex}"
+            )
+            send_copy_bubble("SELL_TX", tx_hex)
+        else:
+            send(
+                "❌ AUTO SELL FAILED\n\n"
+                f"{position.name} ({position.symbol})\n"
+                f"Reason: {reason}\n"
+                f"Wallet: {wallet_address}\n"
+                f"Tx\n{tx_hex}"
+            )
+
+    except Exception as e:
+        send(
+            "❌ AUTO SELL ERROR\n\n"
+            f"{position.name} ({position.symbol})\n"
+            f"Reason: {reason}\n"
+            f"Error: {e}"
+        )
+    finally:
+        with POSITION_LOCK:
+            ACTIVE_POSITIONS.pop(position.token, None)
+
+
+# ---------------------------
+# POSITION MONITOR
+# ---------------------------
+def monitor_position(position: Position) -> None:
+    send(
+        "🛡️ POSITION MONITOR STARTED\n\n"
+        f"{position.name} ({position.symbol})\n"
+        f"Entry liquidity: {position.entry_liquidity:.4f} ETH\n"
+        f"Entry velocity: {position.entry_velocity:.2f}/min\n"
+        f"Buy ETH at signal: {position.entry_buy_eth:.4f}\n"
+        f"Sell ETH at signal: {position.entry_sell_eth:.4f}\n"
+        f"Trailing stop: {format_bool(ENABLE_TRAILING_STOP)}"
+    )
+
+    pair_contract = get_pair_contract(position.pair)
+    token0 = pair_contract.functions.token0().call()
+    token1 = pair_contract.functions.token1().call()
+
+    recent_events = deque()
+
+    while not position.closed:
+        try:
+            current_liquidity = check_liquidity_eth(position.pair)
+
+            current_block = w3.eth.block_number
+            if current_block >= position.last_block:
+                try:
+                    events = pair_contract.events.Swap.get_logs(
+                        from_block=position.last_block,
+                        to_block=current_block,
+                    )
+                    position.last_block = current_block + 1
+                except Exception:
+                    events = []
+
+                for event in events:
+                    side, eth_amount, wallet = parse_swap_direction(event["args"], token0, token1)
+                    recent_events.append((now_ts(), side, eth_amount, str(wallet) if wallet else ""))
+
+            cutoff = now_ts() - NEG_FLOW_WINDOW_SECONDS
+            while recent_events and recent_events[0][0] < cutoff:
+                recent_events.popleft()
+
+            buy_eth_window = 0.0
+            sell_eth_window = 0.0
+            window_unique_buyers = set()
+            seller_eth = defaultdict(float)
+
+            for ts, side, eth_amount, wallet in recent_events:
+                if side == "buy":
+                    buy_eth_window += eth_amount
+                    if wallet:
+                        window_unique_buyers.add(wallet)
+                elif side == "sell":
+                    sell_eth_window += eth_amount
+                    if wallet:
+                        seller_eth[wallet] += eth_amount
+
+            elapsed_window_minutes = max(NEG_FLOW_WINDOW_SECONDS / 60.0, 0.01)
+            current_velocity = len(window_unique_buyers) / elapsed_window_minutes
+
+            wallet_balance_raw = int(get_token_contract(position.token).functions.balanceOf(ACCOUNT.address).call())
+            if wallet_balance_raw <= 0:
+                send(
+                    "ℹ️ POSITION CLOSED\n\n"
+                    f"{position.name} ({position.symbol})\n"
+                    "Wallet balance is zero, stopping monitor."
+                )
+                break
+
+            estimated_eth_now = estimate_eth_out_for_tokens(position.token, int(wallet_balance_raw * SELL_PERCENT))
+            if estimated_eth_now > position.peak_estimated_eth:
+                position.peak_estimated_eth = estimated_eth_now
+
+            pnl_pct = 0.0
+            if position.purchased_eth > 0:
+                pnl_pct = (estimated_eth_now / position.purchased_eth) - 1.0
+
+            # Activate trailing stop
+            if ENABLE_TRAILING_STOP and not position.trailing_active and pnl_pct >= TRAILING_ACTIVATE_PCT:
+                position.trailing_active = True
+                send(
+                    "📈 TRAILING STOP ACTIVATED\n\n"
+                    f"{position.name} ({position.symbol})\n"
+                    f"Estimated PnL: {pnl_pct * 100:.2f}%\n"
+                    f"Peak est ETH: {position.peak_estimated_eth:.6f}"
+                )
+
+            # Trailing stop exit
+            if position.trailing_active and position.peak_estimated_eth > 0:
+                trail_floor = position.peak_estimated_eth * (1.0 - TRAILING_DISTANCE_PCT)
+                if estimated_eth_now < trail_floor:
+                    execute_sell(
+                        position,
+                        f"trailing stop hit | est_eth={estimated_eth_now:.6f} peak={position.peak_estimated_eth:.6f}",
+                    )
+                    break
+
+            # Liquidity exit
+            liquidity_floor = position.entry_liquidity * (1.0 - LIQUIDITY_EXIT_DROP_PCT)
+            if current_liquidity > 0 and current_liquidity < liquidity_floor:
+                execute_sell(
+                    position,
+                    f"liquidity dropped below floor | current={current_liquidity:.4f} entry={position.entry_liquidity:.4f}",
+                )
+                break
+
+            # Emergency liquidity drain
+            emergency_floor = position.entry_liquidity * (1.0 - EMERGENCY_LIQUIDITY_DROP_PCT)
+            if current_liquidity > 0 and current_liquidity < emergency_floor:
+                execute_sell(
+                    position,
+                    f"emergency liquidity drain | current={current_liquidity:.4f} entry={position.entry_liquidity:.4f}",
+                )
+                break
+
+            # Sell pressure / negative flow
+            if sell_eth_window > buy_eth_window and sell_eth_window > 0:
+                position.fail_checks_sell_pressure += 1
+            else:
+                position.fail_checks_sell_pressure = 0
+
+            if position.fail_checks_sell_pressure >= SELL_PRESSURE_REQUIRED_CHECKS:
+                execute_sell(
+                    position,
+                    f"net flow negative | buy_eth={buy_eth_window:.4f} sell_eth={sell_eth_window:.4f}",
+                )
+                break
+
+            # Buyer velocity collapse
+            velocity_threshold = max(position.entry_velocity * VELOCITY_EXIT_RATIO, VELOCITY_MIN_ABS)
+            if current_velocity < velocity_threshold:
+                position.fail_checks_velocity += 1
+            else:
+                position.fail_checks_velocity = 0
+
+            if position.fail_checks_velocity >= MOMENTUM_FAIL_REQUIRED_CHECKS and sell_eth_window >= buy_eth_window:
+                execute_sell(
+                    position,
+                    f"buyer velocity collapsed | current={current_velocity:.2f}/min threshold={velocity_threshold:.2f}/min",
+                )
+                break
+
+            time.sleep(POSITION_CHECK_SECONDS)
+
+        except Exception as e:
+            print(f"Position monitor error for {position.symbol}: {e}")
+            time.sleep(POSITION_CHECK_SECONDS)
+
+    with POSITION_LOCK:
+        ACTIVE_POSITIONS.pop(position.token, None)
+
+
 # ---------------------------
 # CORE TRACKER
 # ---------------------------
-ACTIVE_PAIRS = set()
-
-
 def process_new_token(token: str, pair: str) -> None:
     if pair in ACTIVE_PAIRS:
         return
@@ -567,7 +1052,16 @@ def process_new_token(token: str, pair: str) -> None:
             send_copy_bubble("PAIR", pair)
 
             if purchases_enabled():
-                execute_purchase(token, pair, name, symbol)
+                execute_purchase(
+                    token=token,
+                    pair=pair,
+                    name=name,
+                    symbol=symbol,
+                    entry_liquidity=liquidity,
+                    entry_velocity=buyer_velocity,
+                    entry_buy_eth=buy_eth,
+                    entry_sell_eth=sell_eth,
+                )
 
         except Exception as e:
             print(f"Worker error for pair {pair}: {e}")
@@ -604,7 +1098,10 @@ def main_loop() -> None:
     send(
         "ETH early-run scanner started\n"
         f"Run purchase: {format_bool(purchases_enabled())}\n"
-        f"Purchase USD: ${PURCHASE_AMOUNT_USD:.2f}"
+        f"Purchase USD: ${PURCHASE_AMOUNT_USD:.2f}\n"
+        f"Position monitor: {format_bool(ENABLE_POSITION_MONITOR)}\n"
+        f"Liquidity exit drop: {LIQUIDITY_EXIT_DROP_PCT:.0%}\n"
+        f"Trailing stop: {format_bool(ENABLE_TRAILING_STOP)}"
     )
 
     last_block = w3.eth.block_number
