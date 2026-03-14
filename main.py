@@ -23,6 +23,7 @@ import time
 import threading
 from collections import defaultdict, deque
 
+
 # ---------------------------
 # CONFIG
 # ---------------------------
@@ -102,6 +103,7 @@ TRAILING_DISTANCE_PCT = float(os.getenv("TRAILING_DISTANCE_PCT", "0.10"))  # 10%
 # Partial / full exit
 SELL_PERCENT = float(os.getenv("SELL_PERCENT", "1.0"))  # 1.0 = 100%, 0.5 = 50%
 
+
 # ---------------------------
 # WEB3
 # ---------------------------
@@ -125,6 +127,7 @@ if PRIVATE_KEY:
 else:
     print("PRIVATE_KEY not set. Auto-purchase will remain disabled.")
 
+
 # ---------------------------
 # TELEGRAM
 # ---------------------------
@@ -146,8 +149,10 @@ def send(msg: str) -> None:
     print(msg)
 
 
-def send_copy_bubble(label: str, value: str) -> None:
-    send(f"{label}\n{value}")
+def send_raw_value(value: str) -> None:
+    clean = (value or "").strip()
+    if clean:
+        send(clean)
 
 
 # ---------------------------
@@ -316,6 +321,7 @@ factory_contract = w3.eth.contract(address=FACTORY, abi=FACTORY_ABI)
 router_contract = w3.eth.contract(address=UNISWAP_V2_ROUTER, abi=ROUTER_ABI)
 eth_usd_contract = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=CHAINLINK_ETH_USD_ABI)
 
+
 # ---------------------------
 # TOKEN / RISK
 # ---------------------------
@@ -442,14 +448,16 @@ def parse_swap_direction(args: dict, token0: str, token1: str):
 # POSITION STATE
 # ---------------------------
 PURCHASED_TOKENS = set()
+PURCHASE_IN_PROGRESS = set()
 PURCHASE_LOCK = threading.Lock()
+
 ACTIVE_PAIRS = set()
 ACTIVE_POSITIONS = {}
 POSITION_LOCK = threading.Lock()
 
 TOKEN_SELECTION_LOCK = threading.Lock()
 TOKEN_SELECTION_STARTED = set()
-TOKEN_ALERTED = set()
+TOKEN_DECIDED = set()
 TOKEN_CANDIDATES = defaultdict(dict)
 
 
@@ -509,68 +517,86 @@ def compute_pool_score(candidate: dict) -> float:
     return score
 
 
+def build_signal_message(best: dict, token: str) -> str:
+    mode = "🧪 WOULD BUY" if not purchases_enabled() else "🟢 BUY SIGNAL PASSED"
+
+    return (
+        f"{mode}\n\n"
+        f"{best['name']} ({best['symbol']})\n\n"
+        f"Liquidity: {best['liquidity']:.2f} ETH\n"
+        f"Buys: {best['buy_count']}\n"
+        f"Sells: {best['sell_count']}\n"
+        f"Unique buyers: {best['unique_buyer_count']}\n"
+        f"Unique sellers: {best['unique_seller_count']}\n"
+        f"Buy ETH: {best['buy_eth']:.2f}\n"
+        f"Sell ETH: {best['sell_eth']:.2f}\n"
+        f"Buyer velocity: {best['buyer_velocity']:.2f}/min\n"
+        f"Top buyer share: {best['top_buyer_share']:.0%}\n"
+        f"Pool score: {best.get('pool_score', 0.0):.2f}\n"
+        f"Sellability: {'PASS' if best['sell_count'] >= 1 else 'FAIL'}\n"
+        f"Risk check: {best['risk_reason']}\n"
+        f"Run purchase: {format_bool(purchases_enabled())}\n"
+        f"Purchase USD: ${PURCHASE_AMOUNT_USD:.2f}\n\n"
+        f"Pair\n{best['pair']}\n\n"
+        f"Token\n{token}\n\n"
+        "DexTools\n"
+        f"{dextools_link(best['pair'])}\n\n"
+        "DexScreener\n"
+        f"{dexscreener_link(best['pair'])}"
+    )
+
+
 def finalize_token_selection(token: str) -> None:
     time.sleep(POOL_SELECTION_WINDOW_SECONDS)
 
-    with TOKEN_SELECTION_LOCK:
-        if token in TOKEN_ALERTED:
-            return
-        candidates = list(TOKEN_CANDIDATES.get(token, {}).values())
-        if not candidates:
-            TOKEN_SELECTION_STARTED.discard(token)
-            return
-
-    best = None
-    best_score = None
-    for candidate in candidates:
-        score = compute_pool_score(candidate)
-        candidate["pool_score"] = score
-        if best is None or score > best_score:
-            best = candidate
-            best_score = score
-
-    if best is None:
+    try:
         with TOKEN_SELECTION_LOCK:
-            TOKEN_SELECTION_STARTED.discard(token)
-        return
+            if token in TOKEN_DECIDED:
+                return
+            candidates = list(TOKEN_CANDIDATES.get(token, {}).values())
+            if not candidates:
+                TOKEN_SELECTION_STARTED.discard(token)
+                return
 
-    if best_score is not None and best_score < POOL_SELECTION_MIN_SCORE:
+        best = None
+        best_score = None
+        for candidate in candidates:
+            score = compute_pool_score(candidate)
+            candidate["pool_score"] = score
+            if best is None or score > best_score:
+                best = candidate
+                best_score = score
+
+        if best is None:
+            return
+
+        if best_score is not None and best_score < POOL_SELECTION_MIN_SCORE:
+            return
+
+        with TOKEN_SELECTION_LOCK:
+            TOKEN_DECIDED.add(token)
+
+        # Alert only after the coin fully passes all buy criteria.
+        send(build_signal_message(best, token))
+        send_raw_value(token)
+
+        # Only place live buy if enabled.
+        if purchases_enabled():
+            execute_purchase(
+                token=token,
+                pair=best["pair"],
+                name=best["name"],
+                symbol=best["symbol"],
+                entry_liquidity=best["liquidity"],
+                entry_velocity=best["buyer_velocity"],
+                entry_buy_eth=best["buy_eth"],
+                entry_sell_eth=best["sell_eth"],
+            )
+
+    finally:
         with TOKEN_SELECTION_LOCK:
             TOKEN_SELECTION_STARTED.discard(token)
             TOKEN_CANDIDATES.pop(token, None)
-        return
-
-    with TOKEN_SELECTION_LOCK:
-        TOKEN_ALERTED.add(token)
-
-    send(
-        "🏆 BEST POOL SELECTED\n\n"
-        f"{best['name']} ({best['symbol']})\n"
-        f"Pool score: {best['pool_score']:.2f}\n"
-        f"Candidate pools seen: {len(candidates)}\n"
-        f"Chosen pair: {best['pair']}\n"
-        f"Token: {token}"
-    )
-
-    send(best["alert_msg"])
-    send_copy_bubble("TOKEN", token)
-    send_copy_bubble("PAIR", best["pair"])
-
-    if purchases_enabled():
-        execute_purchase(
-            token=token,
-            pair=best["pair"],
-            name=best["name"],
-            symbol=best["symbol"],
-            entry_liquidity=best["liquidity"],
-            entry_velocity=best["buyer_velocity"],
-            entry_buy_eth=best["buy_eth"],
-            entry_sell_eth=best["sell_eth"],
-        )
-
-    with TOKEN_SELECTION_LOCK:
-        TOKEN_SELECTION_STARTED.discard(token)
-        TOKEN_CANDIDATES.pop(token, None)
 
 
 # ---------------------------
@@ -645,9 +671,9 @@ def execute_purchase(
         return
 
     with PURCHASE_LOCK:
-        if token in PURCHASED_TOKENS:
+        if token in PURCHASED_TOKENS or token in PURCHASE_IN_PROGRESS:
             return
-        PURCHASED_TOKENS.add(token)
+        PURCHASE_IN_PROGRESS.add(token)
 
     try:
         eth_amount = usd_to_eth(PURCHASE_AMOUNT_USD)
@@ -714,7 +740,8 @@ def execute_purchase(
             f"Wallet: {wallet_address}\n"
             f"Tx\n{tx_hex}"
         )
-        send_copy_bubble("PURCHASE_TX", tx_hex)
+
+        send_raw_value(token)
 
         if token_balance_raw <= 0:
             send(
@@ -726,6 +753,9 @@ def execute_purchase(
 
         if not approve_token_if_needed(token, token_balance_raw, name, symbol):
             return
+
+        with PURCHASE_LOCK:
+            PURCHASED_TOKENS.add(token)
 
         if ENABLE_POSITION_MONITOR:
             position = Position(
@@ -753,6 +783,9 @@ def execute_purchase(
             f"{name} ({symbol})\n"
             f"Reason: {e}"
         )
+    finally:
+        with PURCHASE_LOCK:
+            PURCHASE_IN_PROGRESS.discard(token)
 
 
 def execute_sell(position: Position, reason: str) -> None:
@@ -837,7 +870,6 @@ def execute_sell(position: Position, reason: str) -> None:
                 f"Wallet: {wallet_address}\n"
                 f"Tx\n{tx_hex}"
             )
-            send_copy_bubble("SELL_TX", tx_hex)
         else:
             send(
                 "❌ AUTO SELL FAILED\n\n"
@@ -1124,39 +1156,20 @@ def process_new_token(token: str, pair: str) -> None:
                 "risk_reason": risk_reason,
             }
 
-            alert_msg = (
-                "💰 MONEY SIGNAL\n\n"
-                f"{name} ({symbol})\n\n"
-                f"Liquidity: {liquidity:.2f} ETH\n"
-                f"Buys: {buy_count}\n"
-                f"Sells: {sell_count}\n"
-                f"Unique buyers: {unique_buyer_count}\n"
-                f"Unique sellers: {len(unique_sellers)}\n"
-                f"Buy ETH: {buy_eth:.2f}\n"
-                f"Sell ETH: {sell_eth:.2f}\n"
-                f"Buyer velocity: {buyer_velocity:.2f}/min\n"
-                f"Top buyer share: {top_buyer_share:.0%}\n"
-                f"Sellability: {'PASS' if sell_count >= 1 else 'FAIL'}\n"
-                f"Risk check: {risk_reason}\n"
-                f"Run purchase: {format_bool(purchases_enabled())}\n"
-                f"Purchase USD: ${PURCHASE_AMOUNT_USD:.2f}\n\n"
-                "DexTools\n"
-                f"{dextools_link(pair)}\n\n"
-                "DexScreener\n"
-                f"{dexscreener_link(pair)}"
-            )
-            candidate["alert_msg"] = alert_msg
-
             if ONLY_ALERT_BEST_POOL_PER_TOKEN:
                 with TOKEN_SELECTION_LOCK:
                     TOKEN_CANDIDATES[token][pair] = candidate
-                    if token not in TOKEN_SELECTION_STARTED and token not in TOKEN_ALERTED:
+                    if token not in TOKEN_SELECTION_STARTED and token not in TOKEN_DECIDED:
                         TOKEN_SELECTION_STARTED.add(token)
                         threading.Thread(target=finalize_token_selection, args=(token,), daemon=True).start()
             else:
-                send(alert_msg)
-                send_copy_bubble("TOKEN", token)
-                send_copy_bubble("PAIR", pair)
+                candidate["pool_score"] = compute_pool_score(candidate)
+                if candidate["pool_score"] < POOL_SELECTION_MIN_SCORE:
+                    return
+
+                send(build_signal_message(candidate, token))
+                send_raw_value(token)
+
                 if purchases_enabled():
                     execute_purchase(
                         token=token,
@@ -1209,7 +1222,8 @@ def main_loop() -> None:
         f"Best-pool mode: {format_bool(ONLY_ALERT_BEST_POOL_PER_TOKEN)}\n"
         f"Pool selection window: {POOL_SELECTION_WINDOW_SECONDS}s\n"
         f"Liquidity exit drop: {LIQUIDITY_EXIT_DROP_PCT:.0%}\n"
-        f"Trailing stop: {format_bool(ENABLE_TRAILING_STOP)}"
+        f"Trailing stop: {format_bool(ENABLE_TRAILING_STOP)}\n"
+        "Alert mode: ONLY coins that fully pass buy criteria"
     )
 
     last_block = w3.eth.block_number
