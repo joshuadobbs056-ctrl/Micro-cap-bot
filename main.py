@@ -30,8 +30,18 @@ NODE = os.getenv("NODE")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+# Wallet / auto-purchase
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
+RUN_PURCHASE = os.getenv("RUN_PURCHASE", "off").strip().lower()  # on / off
+PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD", "50"))
+SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "1500"))  # 1500 = 15%
+GAS_LIMIT_BUY = int(os.getenv("GAS_LIMIT_BUY", "450000"))
+BUY_DEADLINE_SECONDS = int(os.getenv("BUY_DEADLINE_SECONDS", "180"))
+
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+UNISWAP_V2_ROUTER = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
+CHAINLINK_ETH_USD = Web3.to_checksum_address("0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419")
 
 # Binary-style early runner filters
 MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY", "1.5"))
@@ -46,7 +56,7 @@ MONEY_MIN_BUY_ETH = float(os.getenv("MONEY_MIN_BUY_ETH", "1.0"))
 MONEY_MIN_BUYER_VELOCITY = float(os.getenv("MONEY_MIN_BUYER_VELOCITY", "3.0"))  # unique buyers per minute
 REQUIRE_ONE_SUCCESSFUL_SELL = os.getenv("REQUIRE_ONE_SUCCESSFUL_SELL", "true").lower() == "true"
 
-# Upgrade filter to avoid obvious single-wallet bursts
+# Filter to avoid obvious single-wallet bursts
 MAX_TOP_BUYER_SHARE = float(os.getenv("MAX_TOP_BUYER_SHARE", "0.45"))
 
 BLOCK_POLL_SECONDS = float(os.getenv("BLOCK_POLL_SECONDS", "2"))
@@ -64,6 +74,16 @@ if not w3.is_connected():
     raise RuntimeError("Failed to connect to Ethereum node.")
 
 print("Connected to Ethereum node")
+
+ACCOUNT = None
+if PRIVATE_KEY:
+    try:
+        ACCOUNT = w3.eth.account.from_key(PRIVATE_KEY)
+        print(f"Loaded purchase wallet: {ACCOUNT.address}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load PRIVATE_KEY: {e}")
+else:
+    print("PRIVATE_KEY not set. Auto-purchase will remain disabled.")
 
 # ---------------------------
 # TELEGRAM
@@ -121,6 +141,14 @@ def dexscreener_link(pair: str) -> str:
     return f"https://dexscreener.com/ethereum/{pair}"
 
 
+def format_bool(v: bool) -> str:
+    return "ON" if v else "OFF"
+
+
+def purchases_enabled() -> bool:
+    return RUN_PURCHASE == "on" and ACCOUNT is not None
+
+
 # ---------------------------
 # ABIS
 # ---------------------------
@@ -172,7 +200,50 @@ FACTORY_ABI = [
     }
 ]
 
+ROUTER_ABI = [
+    {
+        "name": "getAmountsOut",
+        "outputs": [{"name": "", "type": "uint256[]"}],
+        "inputs": [
+            {"name": "amountIn", "type": "uint256"},
+            {"name": "path", "type": "address[]"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "name": "swapExactETHForTokensSupportingFeeOnTransferTokens",
+        "outputs": [],
+        "inputs": [
+            {"name": "amountOutMin", "type": "uint256"},
+            {"name": "path", "type": "address[]"},
+            {"name": "to", "type": "address"},
+            {"name": "deadline", "type": "uint256"},
+        ],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+]
+
+CHAINLINK_ETH_USD_ABI = [
+    {
+        "inputs": [],
+        "name": "latestRoundData",
+        "outputs": [
+            {"internalType": "uint80", "name": "roundId", "type": "uint80"},
+            {"internalType": "int256", "name": "answer", "type": "int256"},
+            {"internalType": "uint256", "name": "startedAt", "type": "uint256"},
+            {"internalType": "uint256", "name": "updatedAt", "type": "uint256"},
+            {"internalType": "uint80", "name": "answeredInRound", "type": "uint80"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
 factory_contract = w3.eth.contract(address=FACTORY, abi=FACTORY_ABI)
+router_contract = w3.eth.contract(address=UNISWAP_V2_ROUTER, abi=ROUTER_ABI)
+eth_usd_contract = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=CHAINLINK_ETH_USD_ABI)
 
 # ---------------------------
 # TOKEN / RISK
@@ -201,7 +272,7 @@ def honeypot_check(token: str) -> tuple[bool, str]:
 
 
 # ---------------------------
-# LIQUIDITY
+# LIQUIDITY / PRICE
 # ---------------------------
 def get_pair_contract(pair: str):
     return w3.eth.contract(address=pair, abi=PAIR_ABI)
@@ -225,6 +296,19 @@ def check_liquidity_eth(pair: str) -> float:
         return 0.0
 
 
+def get_eth_usd_price() -> float:
+    data = eth_usd_contract.functions.latestRoundData().call()
+    answer = int(data[1])
+    return answer / 10**8
+
+
+def usd_to_eth(usd_amount: float) -> float:
+    eth_usd = get_eth_usd_price()
+    if eth_usd <= 0:
+        raise RuntimeError("Failed to get ETH/USD price.")
+    return usd_amount / eth_usd
+
+
 # ---------------------------
 # BUY / SELL PARSING
 # ---------------------------
@@ -235,30 +319,118 @@ def parse_swap_direction(args: dict, token0: str, token1: str):
     amount1_out = int(args.get("amount1Out", 0))
 
     if token0.lower() == WETH.lower():
-        # buy token with WETH
         if amount0_in > 0 and amount1_out > 0:
             eth_amount = float(w3.from_wei(amount0_in, "ether"))
             buyer = args.get("to")
             return "buy", eth_amount, buyer
-        # sell token for WETH
         if amount1_in > 0 and amount0_out > 0:
             eth_amount = float(w3.from_wei(amount0_out, "ether"))
             seller = args.get("sender")
             return "sell", eth_amount, seller
 
     if token1.lower() == WETH.lower():
-        # buy token with WETH
         if amount1_in > 0 and amount0_out > 0:
             eth_amount = float(w3.from_wei(amount1_in, "ether"))
             buyer = args.get("to")
             return "buy", eth_amount, buyer
-        # sell token for WETH
         if amount0_in > 0 and amount1_out > 0:
             eth_amount = float(w3.from_wei(amount1_out, "ether"))
             seller = args.get("sender")
             return "sell", eth_amount, seller
 
     return None, 0.0, None
+
+
+# ---------------------------
+# AUTO BUY
+# ---------------------------
+PURCHASED_TOKENS = set()
+PURCHASE_LOCK = threading.Lock()
+
+
+def execute_purchase(token: str, pair: str, name: str, symbol: str) -> None:
+    if not purchases_enabled():
+        return
+
+    with PURCHASE_LOCK:
+        if token in PURCHASED_TOKENS:
+            return
+        PURCHASED_TOKENS.add(token)
+
+    try:
+        eth_amount = usd_to_eth(PURCHASE_AMOUNT_USD)
+        value_wei = int(w3.to_wei(eth_amount, "ether"))
+        path = [WETH, token]
+
+        wallet_address = ACCOUNT.address
+        nonce = w3.eth.get_transaction_count(wallet_address, "pending")
+        deadline = int(time.time()) + BUY_DEADLINE_SECONDS
+
+        try:
+            amounts_out = router_contract.functions.getAmountsOut(value_wei, path).call()
+            expected_out = int(amounts_out[-1])
+            amount_out_min = int(expected_out * (10000 - SLIPPAGE_BPS) / 10000)
+        except Exception:
+            # For very fresh tokens / taxed tokens, fallback to zero min output
+            amount_out_min = 0
+
+        gas_price = w3.eth.gas_price
+
+        tx = router_contract.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
+            amount_out_min,
+            path,
+            wallet_address,
+            deadline,
+        ).build_transaction(
+            {
+                "from": wallet_address,
+                "value": value_wei,
+                "nonce": nonce,
+                "chainId": w3.eth.chain_id,
+                "gas": GAS_LIMIT_BUY,
+                "gasPrice": gas_price,
+            }
+        )
+
+        signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hex = tx_hash.hex()
+
+        send(
+            "🟢 AUTO BUY SUBMITTED\n\n"
+            f"{name} ({symbol})\n"
+            f"USD amount: ${PURCHASE_AMOUNT_USD:.2f}\n"
+            f"Approx ETH: {eth_amount:.6f}\n"
+            f"Wallet: {wallet_address}\n"
+            f"Tx\n{tx_hex}"
+        )
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+
+        if receipt.status == 1:
+            send(
+                "✅ PURCHASE COMPLETED\n\n"
+                f"{name} ({symbol})\n"
+                f"USD amount: ${PURCHASE_AMOUNT_USD:.2f}\n"
+                f"Approx ETH: {eth_amount:.6f}\n"
+                f"Wallet: {wallet_address}\n"
+                f"Tx\n{tx_hex}"
+            )
+            send_copy_bubble("PURCHASE_TX", tx_hex)
+        else:
+            send(
+                "❌ PURCHASE FAILED\n\n"
+                f"{name} ({symbol})\n"
+                f"Wallet: {wallet_address}\n"
+                f"Tx\n{tx_hex}"
+            )
+
+    except Exception as e:
+        send(
+            "❌ PURCHASE ERROR\n\n"
+            f"{name} ({symbol})\n"
+            f"Reason: {e}"
+        )
 
 
 # ---------------------------
@@ -279,7 +451,6 @@ def process_new_token(token: str, pair: str) -> None:
             token0 = pair_contract.functions.token0().call()
             token1 = pair_contract.functions.token1().call()
 
-            # Wait for liquidity to appear
             liquidity = 0.0
             started = now_ts()
 
@@ -383,7 +554,9 @@ def process_new_token(token: str, pair: str) -> None:
                 f"Buyer velocity: {buyer_velocity:.2f}/min\n"
                 f"Top buyer share: {top_buyer_share:.0%}\n"
                 f"Sellability: {'PASS' if sell_count >= 1 else 'FAIL'}\n"
-                f"Risk check: {risk_reason}\n\n"
+                f"Risk check: {risk_reason}\n"
+                f"Run purchase: {format_bool(purchases_enabled())}\n"
+                f"Purchase USD: ${PURCHASE_AMOUNT_USD:.2f}\n\n"
                 "DexTools\n"
                 f"{dextools_link(pair)}\n\n"
                 "DexScreener\n"
@@ -392,6 +565,9 @@ def process_new_token(token: str, pair: str) -> None:
             send(msg)
             send_copy_bubble("TOKEN", token)
             send_copy_bubble("PAIR", pair)
+
+            if purchases_enabled():
+                execute_purchase(token, pair, name, symbol)
 
         except Exception as e:
             print(f"Worker error for pair {pair}: {e}")
@@ -425,7 +601,11 @@ def handle_event(event) -> None:
 # MAIN LOOP
 # ---------------------------
 def main_loop() -> None:
-    send("ETH early-run scanner started")
+    send(
+        "ETH early-run scanner started\n"
+        f"Run purchase: {format_bool(purchases_enabled())}\n"
+        f"Purchase USD: ${PURCHASE_AMOUNT_USD:.2f}"
+    )
 
     last_block = w3.eth.block_number
 
