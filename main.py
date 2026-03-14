@@ -66,6 +66,18 @@ BLOCK_POLL_SECONDS = float(os.getenv("BLOCK_POLL_SECONDS", "2"))
 PAIR_POLL_SECONDS = float(os.getenv("PAIR_POLL_SECONDS", "1.5"))
 
 # ---------------------------
+# TOKEN / POOL SELECTION CONFIG
+# ---------------------------
+ONLY_ALERT_BEST_POOL_PER_TOKEN = os.getenv("ONLY_ALERT_BEST_POOL_PER_TOKEN", "true").lower() == "true"
+POOL_SELECTION_WINDOW_SECONDS = int(os.getenv("POOL_SELECTION_WINDOW_SECONDS", "45"))
+POOL_SCORE_LIQUIDITY_WEIGHT = float(os.getenv("POOL_SCORE_LIQUIDITY_WEIGHT", "1.0"))
+POOL_SCORE_BUY_ETH_WEIGHT = float(os.getenv("POOL_SCORE_BUY_ETH_WEIGHT", "1.4"))
+POOL_SCORE_VELOCITY_WEIGHT = float(os.getenv("POOL_SCORE_VELOCITY_WEIGHT", "1.2"))
+POOL_SCORE_SELL_PENALTY_WEIGHT = float(os.getenv("POOL_SCORE_SELL_PENALTY_WEIGHT", "1.2"))
+POOL_SCORE_TOP_BUYER_PENALTY_WEIGHT = float(os.getenv("POOL_SCORE_TOP_BUYER_PENALTY_WEIGHT", "1.0"))
+POOL_SELECTION_MIN_SCORE = float(os.getenv("POOL_SELECTION_MIN_SCORE", "0"))
+
+# ---------------------------
 # AUTO-SELL / DEFENSE CONFIG
 # ---------------------------
 ENABLE_POSITION_MONITOR = os.getenv("ENABLE_POSITION_MONITOR", "true").lower() == "true"
@@ -150,15 +162,6 @@ def safe_call(fn, default=None):
         return fn()
     except Exception:
         return default
-
-
-def short_addr(addr: str) -> str:
-    if not addr:
-        return "unknown"
-    addr = str(addr)
-    if len(addr) < 12:
-        return addr
-    return f"{addr[:6]}...{addr[-4:]}"
 
 
 def dextools_link(pair: str) -> str:
@@ -444,6 +447,11 @@ ACTIVE_PAIRS = set()
 ACTIVE_POSITIONS = {}
 POSITION_LOCK = threading.Lock()
 
+TOKEN_SELECTION_LOCK = threading.Lock()
+TOKEN_SELECTION_STARTED = set()
+TOKEN_ALERTED = set()
+TOKEN_CANDIDATES = defaultdict(dict)
+
 
 class Position:
     def __init__(
@@ -480,6 +488,89 @@ class Position:
         self.fail_checks_sell_pressure = 0
         self.fail_checks_velocity = 0
         self.closed = False
+
+
+# ---------------------------
+# POOL SELECTION
+# ---------------------------
+def compute_pool_score(candidate: dict) -> float:
+    liquidity = float(candidate.get("liquidity", 0.0))
+    buy_eth = float(candidate.get("buy_eth", 0.0))
+    sell_eth = float(candidate.get("sell_eth", 0.0))
+    buyer_velocity = float(candidate.get("buyer_velocity", 0.0))
+    top_buyer_share = float(candidate.get("top_buyer_share", 0.0))
+
+    score = 0.0
+    score += liquidity * POOL_SCORE_LIQUIDITY_WEIGHT
+    score += buy_eth * POOL_SCORE_BUY_ETH_WEIGHT
+    score += buyer_velocity * POOL_SCORE_VELOCITY_WEIGHT
+    score -= sell_eth * POOL_SCORE_SELL_PENALTY_WEIGHT
+    score -= top_buyer_share * 100.0 * POOL_SCORE_TOP_BUYER_PENALTY_WEIGHT
+    return score
+
+
+def finalize_token_selection(token: str) -> None:
+    time.sleep(POOL_SELECTION_WINDOW_SECONDS)
+
+    with TOKEN_SELECTION_LOCK:
+        if token in TOKEN_ALERTED:
+            return
+        candidates = list(TOKEN_CANDIDATES.get(token, {}).values())
+        if not candidates:
+            TOKEN_SELECTION_STARTED.discard(token)
+            return
+
+    best = None
+    best_score = None
+    for candidate in candidates:
+        score = compute_pool_score(candidate)
+        candidate["pool_score"] = score
+        if best is None or score > best_score:
+            best = candidate
+            best_score = score
+
+    if best is None:
+        with TOKEN_SELECTION_LOCK:
+            TOKEN_SELECTION_STARTED.discard(token)
+        return
+
+    if best_score is not None and best_score < POOL_SELECTION_MIN_SCORE:
+        with TOKEN_SELECTION_LOCK:
+            TOKEN_SELECTION_STARTED.discard(token)
+            TOKEN_CANDIDATES.pop(token, None)
+        return
+
+    with TOKEN_SELECTION_LOCK:
+        TOKEN_ALERTED.add(token)
+
+    send(
+        "🏆 BEST POOL SELECTED\n\n"
+        f"{best['name']} ({best['symbol']})\n"
+        f"Pool score: {best['pool_score']:.2f}\n"
+        f"Candidate pools seen: {len(candidates)}\n"
+        f"Chosen pair: {best['pair']}\n"
+        f"Token: {token}"
+    )
+
+    send(best["alert_msg"])
+    send_copy_bubble("TOKEN", token)
+    send_copy_bubble("PAIR", best["pair"])
+
+    if purchases_enabled():
+        execute_purchase(
+            token=token,
+            pair=best["pair"],
+            name=best["name"],
+            symbol=best["symbol"],
+            entry_liquidity=best["liquidity"],
+            entry_velocity=best["buyer_velocity"],
+            entry_buy_eth=best["buy_eth"],
+            entry_sell_eth=best["sell_eth"],
+        )
+
+    with TOKEN_SELECTION_LOCK:
+        TOKEN_SELECTION_STARTED.discard(token)
+        TOKEN_CANDIDATES.pop(token, None)
 
 
 # ---------------------------
@@ -814,7 +905,6 @@ def monitor_position(position: Position) -> None:
             buy_eth_window = 0.0
             sell_eth_window = 0.0
             window_unique_buyers = set()
-            seller_eth = defaultdict(float)
 
             for ts, side, eth_amount, wallet in recent_events:
                 if side == "buy":
@@ -823,8 +913,6 @@ def monitor_position(position: Position) -> None:
                         window_unique_buyers.add(wallet)
                 elif side == "sell":
                     sell_eth_window += eth_amount
-                    if wallet:
-                        seller_eth[wallet] += eth_amount
 
             elapsed_window_minutes = max(NEG_FLOW_WINDOW_SECONDS / 60.0, 0.01)
             current_velocity = len(window_unique_buyers) / elapsed_window_minutes
@@ -846,7 +934,6 @@ def monitor_position(position: Position) -> None:
             if position.purchased_eth > 0:
                 pnl_pct = (estimated_eth_now / position.purchased_eth) - 1.0
 
-            # Activate trailing stop
             if ENABLE_TRAILING_STOP and not position.trailing_active and pnl_pct >= TRAILING_ACTIVATE_PCT:
                 position.trailing_active = True
                 send(
@@ -856,7 +943,6 @@ def monitor_position(position: Position) -> None:
                     f"Peak est ETH: {position.peak_estimated_eth:.6f}"
                 )
 
-            # Trailing stop exit
             if position.trailing_active and position.peak_estimated_eth > 0:
                 trail_floor = position.peak_estimated_eth * (1.0 - TRAILING_DISTANCE_PCT)
                 if estimated_eth_now < trail_floor:
@@ -866,7 +952,6 @@ def monitor_position(position: Position) -> None:
                     )
                     break
 
-            # Liquidity exit
             liquidity_floor = position.entry_liquidity * (1.0 - LIQUIDITY_EXIT_DROP_PCT)
             if current_liquidity > 0 and current_liquidity < liquidity_floor:
                 execute_sell(
@@ -875,7 +960,6 @@ def monitor_position(position: Position) -> None:
                 )
                 break
 
-            # Emergency liquidity drain
             emergency_floor = position.entry_liquidity * (1.0 - EMERGENCY_LIQUIDITY_DROP_PCT)
             if current_liquidity > 0 and current_liquidity < emergency_floor:
                 execute_sell(
@@ -884,7 +968,6 @@ def monitor_position(position: Position) -> None:
                 )
                 break
 
-            # Sell pressure / negative flow
             if sell_eth_window > buy_eth_window and sell_eth_window > 0:
                 position.fail_checks_sell_pressure += 1
             else:
@@ -897,7 +980,6 @@ def monitor_position(position: Position) -> None:
                 )
                 break
 
-            # Buyer velocity collapse
             velocity_threshold = max(position.entry_velocity * VELOCITY_EXIT_RATIO, VELOCITY_MIN_ABS)
             if current_velocity < velocity_threshold:
                 position.fail_checks_velocity += 1
@@ -996,7 +1078,6 @@ def process_new_token(token: str, pair: str) -> None:
                                 wallet = str(wallet)
                                 unique_buyers.add(wallet)
                                 buyer_counts[wallet] += 1
-
                         elif side == "sell":
                             sell_count += 1
                             sell_eth += eth_amount
@@ -1026,7 +1107,24 @@ def process_new_token(token: str, pair: str) -> None:
             if top_buyer_share > MAX_TOP_BUYER_SHARE:
                 return
 
-            msg = (
+            candidate = {
+                "token": token,
+                "pair": pair,
+                "name": name,
+                "symbol": symbol,
+                "liquidity": liquidity,
+                "buy_count": buy_count,
+                "sell_count": sell_count,
+                "buy_eth": buy_eth,
+                "sell_eth": sell_eth,
+                "unique_buyer_count": unique_buyer_count,
+                "unique_seller_count": len(unique_sellers),
+                "buyer_velocity": buyer_velocity,
+                "top_buyer_share": top_buyer_share,
+                "risk_reason": risk_reason,
+            }
+
+            alert_msg = (
                 "💰 MONEY SIGNAL\n\n"
                 f"{name} ({symbol})\n\n"
                 f"Liquidity: {liquidity:.2f} ETH\n"
@@ -1047,21 +1145,29 @@ def process_new_token(token: str, pair: str) -> None:
                 "DexScreener\n"
                 f"{dexscreener_link(pair)}"
             )
-            send(msg)
-            send_copy_bubble("TOKEN", token)
-            send_copy_bubble("PAIR", pair)
+            candidate["alert_msg"] = alert_msg
 
-            if purchases_enabled():
-                execute_purchase(
-                    token=token,
-                    pair=pair,
-                    name=name,
-                    symbol=symbol,
-                    entry_liquidity=liquidity,
-                    entry_velocity=buyer_velocity,
-                    entry_buy_eth=buy_eth,
-                    entry_sell_eth=sell_eth,
-                )
+            if ONLY_ALERT_BEST_POOL_PER_TOKEN:
+                with TOKEN_SELECTION_LOCK:
+                    TOKEN_CANDIDATES[token][pair] = candidate
+                    if token not in TOKEN_SELECTION_STARTED and token not in TOKEN_ALERTED:
+                        TOKEN_SELECTION_STARTED.add(token)
+                        threading.Thread(target=finalize_token_selection, args=(token,), daemon=True).start()
+            else:
+                send(alert_msg)
+                send_copy_bubble("TOKEN", token)
+                send_copy_bubble("PAIR", pair)
+                if purchases_enabled():
+                    execute_purchase(
+                        token=token,
+                        pair=pair,
+                        name=name,
+                        symbol=symbol,
+                        entry_liquidity=liquidity,
+                        entry_velocity=buyer_velocity,
+                        entry_buy_eth=buy_eth,
+                        entry_sell_eth=sell_eth,
+                    )
 
         except Exception as e:
             print(f"Worker error for pair {pair}: {e}")
@@ -1100,6 +1206,8 @@ def main_loop() -> None:
         f"Run purchase: {format_bool(purchases_enabled())}\n"
         f"Purchase USD: ${PURCHASE_AMOUNT_USD:.2f}\n"
         f"Position monitor: {format_bool(ENABLE_POSITION_MONITOR)}\n"
+        f"Best-pool mode: {format_bool(ONLY_ALERT_BEST_POOL_PER_TOKEN)}\n"
+        f"Pool selection window: {POOL_SELECTION_WINDOW_SECONDS}s\n"
         f"Liquidity exit drop: {LIQUIDITY_EXIT_DROP_PCT:.0%}\n"
         f"Trailing stop: {format_bool(ENABLE_TRAILING_STOP)}"
     )
