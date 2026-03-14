@@ -1,14 +1,12 @@
-import time
 import os
-import requests
-from web3 import Web3
-import spacy
-from bs4 import BeautifulSoup
-import json
-import subprocess
-import threading
 import asyncio
 import aiohttp
+import json
+from web3 import Web3
+from bs4 import BeautifulSoup
+import spacy
+import threading
+import requests
 
 # ---------------------------
 # CONFIG
@@ -16,7 +14,7 @@ import aiohttp
 NODE = os.getenv("NODE")  # WSS URL
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")  # optional
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
 
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
@@ -93,6 +91,7 @@ def get_token_links(token, symbol):
 try:
     nlp = spacy.load("en_core_web_sm")
 except OSError:
+    import subprocess
     subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
     nlp = spacy.load("en_core_web_sm")
 
@@ -110,11 +109,7 @@ def scan_entities(text, token_address):
             end = min(ent.end_char + 50, len(text))
             context = text[start:end].lower()
             if any(k in context for k in KEYWORDS):
-                alerts.append({
-                    "address": token_address,
-                    "name": ent.text,
-                    "indicator": "🔵"
-                })
+                alerts.append({"address": token_address, "name": ent.text, "indicator": "🔵"})
     return alerts
 
 # ---------------------------
@@ -130,6 +125,11 @@ async def fetch_text_from_url(session, url):
     except:
         pass
     return ""
+
+async def fetch_all_text(urls):
+    async with aiohttp.ClientSession() as session:
+        texts = await asyncio.gather(*[fetch_text_from_url(session, url) for url in urls])
+        return " ".join(texts)
 
 # ---------------------------
 # PAIR ABI & LIQUIDITY
@@ -167,12 +167,6 @@ def is_tradable(token, pair):
         balance = token_contract.functions.balanceOf(pair).call()
         if balance <= 0:
             return False
-        ROUTER_ADDRESS = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
-        ROUTER_ABI = [{"constant":True,"inputs":[{"name":"amountIn","type":"uint256"},{"name":"path","type":"address[]"}],"name":"getAmountsOut","outputs":[{"name":"amounts","type":"uint256[]"}],"type":"function"}]
-        router = w3.eth.contract(address=ROUTER_ADDRESS, abi=ROUTER_ABI)
-        path = [token, WETH] if token != WETH else [WETH, token]
-        small_amount = 10 ** 12
-        router.functions.getAmountsOut(small_amount, path).call()
         return True
     except:
         return False
@@ -197,8 +191,10 @@ def process_new_token(token, pair_address):
     def worker():
         if not honeypot_check(token):
             return
+
         liquidity = check_liquidity(pair_address)
         while liquidity < MIN_LIQUIDITY_ETH or not is_tradable(token, pair_address):
+            import time
             time.sleep(1)
             liquidity = check_liquidity(pair_address)
 
@@ -207,12 +203,8 @@ def process_new_token(token, pair_address):
         status_tag = "✅ *Verified*" if verified else "⚠️ *Unverified*"
         dextools = f"https://www.dextools.io/app/en/ether/pair-explorer/{pair_address}"
 
-        async def fetch_all_text():
-            async with aiohttp.ClientSession() as session:
-                texts = await asyncio.gather(*[fetch_text_from_url(session, url) for url in [website, social]])
-                return " ".join(texts)
-
-        extra_text = asyncio.run(fetch_all_text())
+        # Fetch async text
+        extra_text = asyncio.run(fetch_all_text([website, social]))
         text_to_scan = f"{name} {symbol} {website} {social} {extra_text}"
         for alert in scan_entities(text_to_scan, token):
             send(f"{alert['indicator']} *Entity Detected*\nToken: {alert['address']}\nMention: {alert['name']}")
@@ -229,6 +221,7 @@ def process_new_token(token, pair_address):
             f"📋 *Pair Address*\n```{pair_address}```"
         )
         send(msg)
+
     threading.Thread(target=worker).start()
 
 # ---------------------------
@@ -246,21 +239,19 @@ def handle_event(event):
 # ---------------------------
 def main_loop():
     send("🚀 Real-Time High-Potential Alert Bot Started")
-
-    # NOTE: use 'from_block' for Web3.py v6+
     event_filter = factory_contract.events.PairCreated.create_filter(from_block='latest')
 
     while True:
         try:
-            new_events = event_filter.get_new_entries()
-            for event in new_events:
+            for event in event_filter.get_new_entries():
                 handle_event(event)
+            import time
             time.sleep(1)
         except Exception as e:
             print(f"Error in main loop: {e}")
+            import time
             time.sleep(5)
             event_filter = factory_contract.events.PairCreated.create_filter(from_block='latest')
-
 
 if __name__ == "__main__":
     main_loop()
