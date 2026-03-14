@@ -1,353 +1,473 @@
-import time
-import os
-import requests
-from web3 import Web3
-import spacy
-from bs4 import BeautifulSoup
-import json
-import subprocess
-import threading
 import asyncio
-import aiohttp
+import json
+import os
+import subprocess
+import sys
+import time
+from collections import defaultdict, deque
+
+
+def ensure_package(package_name: str, import_name: str | None = None) -> None:
+    """Install a package at runtime if it is missing."""
+    target = import_name or package_name
+    try:
+        __import__(target)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+
+
+ensure_package("websockets")
+ensure_package("requests")
+
+import requests
+import websockets
 
 # ---------------------------
 # CONFIG
 # ---------------------------
-NODE = os.getenv("NODE")  # HTTP URL now
+PUMPPORTAL_WS = os.getenv("PUMPPORTAL_WS", "wss://pumpportal.fun/api/data")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
 
-WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
-FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+# Detection / alert windows
+SCOUT_MIN_AGE_SECONDS = int(os.getenv("SCOUT_MIN_AGE_SECONDS", "0"))
+HOT_WINDOW_SECONDS = int(os.getenv("HOT_WINDOW_SECONDS", "75"))
+TRACK_MAX_SECONDS = int(os.getenv("TRACK_MAX_SECONDS", "180"))
 
-MIN_LIQUIDITY_ETH = 10
-MIN_FIRST_SWAP_VOLUME = 0.05
+# Momentum thresholds
+MIN_TOTAL_BUYS = int(os.getenv("MIN_TOTAL_BUYS", "8"))
+MIN_UNIQUE_BUYERS = int(os.getenv("MIN_UNIQUE_BUYERS", "6"))
+MIN_BUY_SOL = float(os.getenv("MIN_BUY_SOL", "3"))
+MIN_BUY_SELL_RATIO = float(os.getenv("MIN_BUY_SELL_RATIO", "2.0"))
+MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "15000"))
+MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "350000"))
 
-# ---------------------------
-# WEB3 CONNECTION
-# ---------------------------
-w3 = Web3(Web3.HTTPProvider(NODE))
+# Sellability filter
+REQUIRE_ONE_SUCCESSFUL_SELL = os.getenv("REQUIRE_ONE_SUCCESSFUL_SELL", "true").lower() == "true"
 
-if not w3.is_connected():
-    print("❌ Failed to connect")
-else:
-    print("✅ Connected to Ethereum node")
+# Noise control
+MIN_NAME_LENGTH = int(os.getenv("MIN_NAME_LENGTH", "2"))
+MAX_TRACKED_TOKENS = int(os.getenv("MAX_TRACKED_TOKENS", "300"))
+
+# State
+TRACKED = {}
+RECENT_MINTS = deque(maxlen=5000)
+
 
 # ---------------------------
 # TELEGRAM ALERT
 # ---------------------------
-def send(msg):
+def send(msg: str) -> None:
     if TELEGRAM_TOKEN and CHAT_ID:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         try:
-            requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+            requests.post(
+                url,
+                data={
+                    "chat_id": CHAT_ID,
+                    "text": msg,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True,
+                },
+                timeout=10,
+            )
         except Exception as e:
             print(f"Telegram error: {e}")
-
     print(msg)
 
-# ---------------------------
-# HONEYPOT CHECK
-# ---------------------------
-def honeypot_check(token):
 
-    url = f"https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses={token}"
+# ---------------------------
+# HELPERS
+# ---------------------------
+def now_ts() -> float:
+    return time.time()
 
+
+def safe_float(value, default=0.0) -> float:
     try:
-        r = requests.get(url).json()
-        result = r.get("result", {}).get(token.lower(), {})
-        return result.get("is_honeypot") == "0"
-    except:
-        return False
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
 
-# ---------------------------
-# ERC20 ABI
-# ---------------------------
-ERC20_ABI = [
-    {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
-    {"constant":True,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function"},
-    {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
-]
 
-def get_token_info(token):
-
+def safe_int(value, default=0) -> int:
     try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except Exception:
+        return default
 
-        token_contract = w3.eth.contract(address=token, abi=ERC20_ABI)
 
-        return (
-            token_contract.functions.name().call(),
-            token_contract.functions.symbol().call()
-        )
+def get_first(d: dict, keys: list[str], default=None):
+    for key in keys:
+        if key in d and d[key] not in (None, ""):
+            return d[key]
+    return default
 
-    except:
 
-        return "Unknown","Unknown"
+def md_escape(text: str) -> str:
+    if text is None:
+        return ""
+    for ch in ["_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"]:
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
-# ---------------------------
-# TOKEN LINKS
-# ---------------------------
-def get_token_links(token, symbol):
 
-    website = f"https://etherscan.io/token/{token}"
-    social = f"https://t.me/{symbol}"
-    verified = False
+def short_addr(addr: str) -> str:
+    if not addr or len(addr) < 10:
+        return addr or "unknown"
+    return f"{addr[:4]}...{addr[-4:]}"
 
-    try:
 
-        url = f"https://api.etherscan.io/api?module=token&action=getTokenInfo&contractaddress={token}&apikey={ETHERSCAN_API_KEY}"
+def dexscreener_link(mint: str) -> str:
+    return f"https://dexscreener.com/solana/{mint}"
 
-        r = requests.get(url).json()
 
-        result = r.get("result", {})
+def gmgn_link(mint: str) -> str:
+    return f"https://gmgn.ai/sol/token/{mint}"
 
-        website = result.get("website", website)
-        social = result.get("telegram", social)
-        verified = result.get("is_verified","0") == "1"
-
-    except:
-        pass
-
-    return website, social, verified
 
 # ---------------------------
-# SPACY NLP
+# TOKEN STATE
 # ---------------------------
-try:
+def new_token_state(payload: dict) -> dict:
+    mint = get_first(payload, ["mint", "tokenAddress", "address"])
+    creator = get_first(payload, ["creator", "deployer", "owner"])
+    name = get_first(payload, ["name", "tokenName"], "Unknown")
+    symbol = get_first(payload, ["symbol", "ticker", "tokenSymbol"], "Unknown")
 
-    nlp = spacy.load("en_core_web_sm")
+    created_at = now_ts()
 
-except:
+    return {
+        "mint": mint,
+        "creator": creator,
+        "name": str(name).strip() if name else "Unknown",
+        "symbol": str(symbol).strip() if symbol else "Unknown",
+        "created_at": created_at,
+        "last_seen": created_at,
+        "buys": 0,
+        "sells": 0,
+        "buy_sol": 0.0,
+        "sell_sol": 0.0,
+        "unique_buyers": set(),
+        "unique_sellers": set(),
+        "wallet_buy_count": defaultdict(int),
+        "wallet_sell_count": defaultdict(int),
+        "scout_sent": False,
+        "hot_sent": False,
+        "last_market_cap": 0.0,
+        "last_price": 0.0,
+        "events": [],
+    }
 
-    subprocess.run(["python","-m","spacy","download","en_core_web_sm"])
-    nlp = spacy.load("en_core_web_sm")
 
-with open("big_names.json") as f:
-    BIG_NAMES = json.load(f)
+def track_token(payload: dict) -> None:
+    mint = get_first(payload, ["mint", "tokenAddress", "address"])
+    if not mint or mint in TRACKED:
+        return
 
-KEYWORDS = ["token","coin","crypto","project","launch","swap"]
+    if len(TRACKED) >= MAX_TRACKED_TOKENS:
+        oldest_mint = min(TRACKED, key=lambda m: TRACKED[m]["created_at"])
+        TRACKED.pop(oldest_mint, None)
 
-def scan_entities(text, token_address):
+    state = new_token_state(payload)
+    TRACKED[mint] = state
+    RECENT_MINTS.append(mint)
+    send_scout_alert(state)
 
-    alerts = []
-
-    doc = nlp(text)
-
-    for ent in doc.ents:
-
-        if ent.text in BIG_NAMES:
-
-            start = max(ent.start_char - 50,0)
-            end = min(ent.end_char + 50,len(text))
-
-            context = text[start:end].lower()
-
-            if any(k in context for k in KEYWORDS):
-
-                alerts.append({
-                    "address":token_address,
-                    "name":ent.text,
-                    "indicator":"🔵"
-                })
-
-    return alerts
 
 # ---------------------------
-# ASYNC SCRAPER
+# ALERTS
 # ---------------------------
-async def fetch_text(session,url):
+def send_scout_alert(state: dict) -> None:
+    age = int(now_ts() - state["created_at"])
+    if age < SCOUT_MIN_AGE_SECONDS or state["scout_sent"]:
+        return
 
-    try:
+    state["scout_sent"] = True
+    name = md_escape(state["name"])
+    symbol = md_escape(state["symbol"])
+    mint = state["mint"]
+    creator = md_escape(short_addr(state["creator"]))
 
-        async with session.get(url,timeout=5) as resp:
+    msg = (
+        f"🚨 *PUMPFUN SCOUT*\n\n"
+        f"*{name}* \$begin:math:text$\{symbol\}\\$end:math:text$\n"
+        f"Mint: `{mint}`\n"
+        f"Creator: `{creator}`\n"
+        f"Age: {age}s\n\n"
+        f"DexScreener\n{dexscreener_link(mint)}\n\n"
+        f"GMGN\n{gmgn_link(mint)}"
+    )
+    send(msg)
 
-            if resp.status == 200:
 
-                html = await resp.text()
+def send_hot_alert(state: dict, score: int, reason: str) -> None:
+    if state["hot_sent"]:
+        return
+    state["hot_sent"] = True
 
-                soup = BeautifulSoup(html,"html.parser")
+    name = md_escape(state["name"])
+    symbol = md_escape(state["symbol"])
+    mint = state["mint"]
+    age = int(now_ts() - state["created_at"])
+    market_cap = state["last_market_cap"]
+    price = state["last_price"]
+    buys = state["buys"]
+    sells = state["sells"]
+    unique_buyers = len(state["unique_buyers"])
+    buy_sell_ratio = (buys / sells) if sells > 0 else buys
 
-                return soup.get_text(separator=" ",strip=True)
+    msg = (
+        f"🔥 *PUMPFUN HOT ALERT*\n\n"
+        f"*{name}* \$begin:math:text$\{symbol\}\\$end:math:text$\n"
+        f"Score: *{score}/100*\n"
+        f"Reason: {md_escape(reason)}\n\n"
+        f"Mint: `{mint}`\n"
+        f"Age: {age}s\n"
+        f"Buys: {buys}\n"
+        f"Sells: {sells}\n"
+        f"Unique buyers: {unique_buyers}\n"
+        f"Buy volume: {state['buy_sol']:.2f} SOL\n"
+        f"Sell volume: {state['sell_sol']:.2f} SOL\n"
+        f"Buy/Sell ratio: {buy_sell_ratio:.2f}x\n"
+        f"Market cap: ${market_cap:,.0f}\n"
+        f"Price: ${price:.10f}\n"
+        f"One successful sell: {'YES' if sells >= 1 else 'NO'}\n\n"
+        f"DexScreener\n{dexscreener_link(mint)}\n\n"
+        f"GMGN\n{gmgn_link(mint)}"
+    )
+    send(msg)
 
-    except:
-        pass
 
+# ---------------------------
+# SCORING
+# ---------------------------
+def score_token(state: dict) -> tuple[int, str]:
+    buys = state["buys"]
+    sells = state["sells"]
+    unique_buyers = len(state["unique_buyers"])
+    buy_sol = state["buy_sol"]
+    market_cap = state["last_market_cap"]
+    age = now_ts() - state["created_at"]
+
+    if age > TRACK_MAX_SECONDS:
+        return 0, "expired"
+
+    if REQUIRE_ONE_SUCCESSFUL_SELL and sells < 1:
+        return 0, "no successful sell yet"
+
+    if buys < MIN_TOTAL_BUYS:
+        return 0, "not enough buys"
+
+    if unique_buyers < MIN_UNIQUE_BUYERS:
+        return 0, "not enough unique buyers"
+
+    if buy_sol < MIN_BUY_SOL:
+        return 0, "buy volume too low"
+
+    if market_cap and market_cap < MIN_MARKET_CAP_USD:
+        return 0, "market cap too low"
+
+    if market_cap and market_cap > MAX_MARKET_CAP_USD:
+        return 0, "market cap too high"
+
+    buy_sell_ratio = (buys / sells) if sells > 0 else buys
+    if buy_sell_ratio < MIN_BUY_SELL_RATIO:
+        return 0, "buy/sell ratio too weak"
+
+    buyer_velocity = unique_buyers / max(age, 1)
+    volume_velocity = buy_sol / max(age, 1)
+
+    score = 0
+    score += min(30, int(unique_buyers * 2.5))
+    score += min(25, int(buy_sol * 3))
+    score += min(20, int(buy_sell_ratio * 5))
+    score += min(15, int(buyer_velocity * 60))
+    score += min(10, int(volume_velocity * 50))
+    score = min(100, score)
+
+    reason = f"{buys} buys, {sells} sells, {unique_buyers} unique buyers, {buy_sol:.2f} SOL bought"
+    return score, reason
+
+
+# ---------------------------
+# MESSAGE PARSING
+# ---------------------------
+def normalize_trade_side(payload: dict) -> str:
+    side = str(get_first(payload, ["txType", "type", "side", "action"], "")).lower()
+    if "buy" in side:
+        return "buy"
+    if "sell" in side:
+        return "sell"
     return ""
 
-async def fetch_all_text(urls):
 
-    async with aiohttp.ClientSession() as session:
+def extract_wallet(payload: dict) -> str:
+    return str(get_first(payload, ["traderPublicKey", "wallet", "user", "maker", "owner"], ""))
 
-        texts = await asyncio.gather(*[fetch_text(session,u) for u in urls])
 
-        return " ".join(texts)
+def extract_sol_amount(payload: dict) -> float:
+    return safe_float(get_first(payload, ["solAmount", "amountSol", "amount_in_sol", "volumeSol", "vSolInBondingCurve"]))
 
-# ---------------------------
-# PAIR ABI
-# ---------------------------
-PAIR_ABI = [
-    {"constant":True,"inputs":[],"name":"getReserves","outputs":[
-        {"name":"_reserve0","type":"uint112"},
-        {"name":"_reserve1","type":"uint112"},
-        {"name":"_blockTimestampLast","type":"uint32"}],"type":"function"},
-    {"constant":True,"inputs":[],"name":"token0","outputs":[{"name":"","type":"address"}],"type":"function"},
-    {"constant":True,"inputs":[],"name":"token1","outputs":[{"name":"","type":"address"}],"type":"function"},
-]
 
-def check_liquidity(pair):
+def extract_market_cap(payload: dict) -> float:
+    return safe_float(get_first(payload, ["marketCapUsd", "usdMarketCap", "marketCap", "mc"]))
 
-    try:
 
-        pair_contract = w3.eth.contract(address=pair, abi=PAIR_ABI)
+def extract_price(payload: dict) -> float:
+    return safe_float(get_first(payload, ["priceUsd", "usdPrice", "price", "tokenPriceUsd"]))
 
-        reserves = pair_contract.functions.getReserves().call()
 
-        token0 = pair_contract.functions.token0().call()
-        token1 = pair_contract.functions.token1().call()
+def should_track_creation(payload: dict) -> bool:
+    mint = get_first(payload, ["mint", "tokenAddress", "address"])
+    name = str(get_first(payload, ["name", "tokenName"], "")).strip()
+    symbol = str(get_first(payload, ["symbol", "ticker", "tokenSymbol"], "")).strip()
 
-        weth_reserve = reserves[0] if token0.lower()==WETH.lower() else reserves[1] if token1.lower()==WETH.lower() else 0
+    if not mint:
+        return False
+    if len(name) < MIN_NAME_LENGTH and len(symbol) < MIN_NAME_LENGTH:
+        return False
+    return True
 
-        return w3.from_wei(weth_reserve,"ether")
-
-    except:
-
-        return 0
 
 # ---------------------------
-# PROCESS TOKEN
+# EVENT HANDLING
 # ---------------------------
-def process_new_token(token,pair):
+def handle_create_event(payload: dict) -> None:
+    if should_track_creation(payload):
+        track_token(payload)
 
-    def worker():
 
-        if not honeypot_check(token):
-            return
+def handle_trade_event(payload: dict) -> None:
+    mint = get_first(payload, ["mint", "tokenAddress", "address"])
+    if not mint or mint not in TRACKED:
+        return
 
-        liquidity = check_liquidity(pair)
+    state = TRACKED[mint]
+    state["last_seen"] = now_ts()
 
-        while liquidity < MIN_LIQUIDITY_ETH:
+    wallet = extract_wallet(payload)
+    side = normalize_trade_side(payload)
+    sol_amount = extract_sol_amount(payload)
+    market_cap = extract_market_cap(payload)
+    price = extract_price(payload)
 
-            time.sleep(1)
-            liquidity = check_liquidity(pair)
+    if market_cap > 0:
+        state["last_market_cap"] = market_cap
+    if price > 0:
+        state["last_price"] = price
 
-        name,symbol = get_token_info(token)
+    if side == "buy":
+        state["buys"] += 1
+        state["buy_sol"] += sol_amount
+        if wallet:
+            state["unique_buyers"].add(wallet)
+            state["wallet_buy_count"][wallet] += 1
+    elif side == "sell":
+        state["sells"] += 1
+        state["sell_sol"] += sol_amount
+        if wallet:
+            state["unique_sellers"].add(wallet)
+            state["wallet_sell_count"][wallet] += 1
+    else:
+        return
 
-        website,social,verified = get_token_links(token,symbol)
+    state["events"].append(
+        {
+            "ts": now_ts(),
+            "wallet": wallet,
+            "side": side,
+            "sol": sol_amount,
+            "market_cap": market_cap,
+            "price": price,
+        }
+    )
 
-        status = "✅ *Verified*" if verified else "⚠️ *Unverified*"
+    score, reason = score_token(state)
+    if score >= 70 and (now_ts() - state["created_at"]) <= HOT_WINDOW_SECONDS:
+        send_hot_alert(state, score, reason)
 
-        dextools = f"https://www.dextools.io/app/en/ether/pair-explorer/{pair}"
-
-        extra = asyncio.run(fetch_all_text([website,social]))
-
-        text_to_scan = f"{name} {symbol} {website} {social} {extra}"
-
-        for alert in scan_entities(text_to_scan,token):
-
-            send(f"{alert['indicator']} *Entity Detected*\nToken: {alert['address']}\nMention: {alert['name']}")
-
-        msg = f"""
-🚨 *HIGH POTENTIAL TOKEN*
-
-{status}
-
-*{name} ({symbol})*
-
-💰 Liquidity: {liquidity:.2f} ETH
-
-🌐 Website
-{website}
-
-📱 Social
-{social}
-
-📊 DexTools
-{dextools}
-
-Token
-`{token}`
-
-Pair
-`{pair}`
-"""
-
-        send(msg)
-
-    threading.Thread(target=worker).start()
 
 # ---------------------------
-# EVENT HANDLER
+# CLEANUP
 # ---------------------------
-def handle_event(event):
-
-    t0 = event["args"]["token0"]
-    t1 = event["args"]["token1"]
-
-    pair = event["args"]["pair"]
-
-    token = t1 if t0.lower()==WETH.lower() else t0
-
-    process_new_token(token,pair)
-
-# ---------------------------
-# MAIN LOOP
-# ---------------------------
-def main_loop():
-
-    send("🚀 Real-Time High-Potential Alert Bot Started")
-
-    last_block = w3.eth.block_number
-
+async def cleanup_loop() -> None:
     while True:
-
         try:
+            cutoff = now_ts() - TRACK_MAX_SECONDS
+            stale = [mint for mint, state in TRACKED.items() if state["last_seen"] < cutoff]
+            for mint in stale:
+                TRACKED.pop(mint, None)
+        except Exception as e:
+            print(f"Cleanup error: {e}")
+        await asyncio.sleep(15)
 
-            current_block = w3.eth.block_number
 
-            if current_block > last_block:
+# ---------------------------
+# WEBSOCKET LISTENER
+# ---------------------------
+async def maybe_subscribe_new_tracked_mint(ws, mint: str) -> None:
+    try:
+        await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
+    except Exception as e:
+        print(f"Subscribe trade error for {mint}: {e}")
 
-                events = factory_contract.events.PairCreated.get_logs(
-                    from_block=last_block+1,
-                    to_block=current_block
-                )
 
-                for event in events:
+async def listen() -> None:
+    backoff = 2
+    while True:
+        try:
+            print(f"Connecting to {PUMPPORTAL_WS}...")
+            async with websockets.connect(PUMPPORTAL_WS, ping_interval=20, ping_timeout=20, max_size=2**22) as ws:
+                print("Connected to PumpPortal websocket")
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
 
-                    handle_event(event)
+                known = set(TRACKED.keys())
+                for mint in known:
+                    await maybe_subscribe_new_tracked_mint(ws, mint)
 
-                last_block = current_block
+                backoff = 2
 
-            time.sleep(2)
+                while True:
+                    raw = await ws.recv()
+                    payload = json.loads(raw)
+                    if not isinstance(payload, dict):
+                        continue
+
+                    mint_before = set(TRACKED.keys())
+                    if get_first(payload, ["mint", "tokenAddress", "address"]) and any(
+                        k in payload for k in ["name", "symbol", "ticker", "tokenName"]
+                    ):
+                        handle_create_event(payload)
+
+                    new_mints = set(TRACKED.keys()) - mint_before
+                    for mint in new_mints:
+                        await maybe_subscribe_new_tracked_mint(ws, mint)
+
+                    side = normalize_trade_side(payload)
+                    if side in {"buy", "sell"}:
+                        handle_trade_event(payload)
 
         except Exception as e:
+            print(f"Websocket error: {e}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
 
-            print(f"Error in main loop: {e}")
-
-            time.sleep(5)
-
-# ---------------------------
-# FACTORY CONTRACT
-# ---------------------------
-factory_abi = [
-{
-"anonymous":False,
-"inputs":[
-{"indexed":True,"name":"token0","type":"address"},
-{"indexed":True,"name":"token1","type":"address"},
-{"indexed":False,"name":"pair","type":"address"},
-{"indexed":False,"name":"","type":"uint256"}
-],
-"name":"PairCreated",
-"type":"event"
-}
-]
-
-factory_contract = w3.eth.contract(address=FACTORY,abi=factory_abi)
 
 # ---------------------------
-# START
+# MAIN
 # ---------------------------
+async def main() -> None:
+    send("🚀 Pump.fun early scanner started")
+    await asyncio.gather(
+        listen(),
+        cleanup_loop(),
+    )
+
+
 if __name__ == "__main__":
-
-    main_loop()
+    asyncio.run(main())
