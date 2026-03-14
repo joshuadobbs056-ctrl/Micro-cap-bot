@@ -247,17 +247,20 @@ def handle_event(event):
 def main_loop():
     send("🚀 Real-Time High-Potential Alert Bot Started")
 
+    # NOTE: use 'from_block' for Web3.py v6+
     event_filter = factory_contract.events.PairCreated.create_filter(from_block='latest')
 
     while True:
         try:
-            for event in event_filter.get_new_entries():
+            new_events = event_filter.get_new_entries()
+            for event in new_events:
                 handle_event(event)
             time.sleep(1)
         except Exception as e:
             print(f"Error in main loop: {e}")
             time.sleep(5)
             event_filter = factory_contract.events.PairCreated.create_filter(from_block='latest')
+
 
 if __name__ == "__main__":
     main_loop()
