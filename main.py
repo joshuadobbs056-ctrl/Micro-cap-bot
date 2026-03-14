@@ -18,7 +18,6 @@ import asyncio
 import json
 import os
 import time
-from collections import defaultdict
 
 import requests
 import websockets
@@ -45,11 +44,14 @@ MONEY_REQUIRE_HONEYPOT_PASS = os.getenv("MONEY_REQUIRE_HONEYPOT_PASS", "true").l
 
 # Pump.fun secondary signal
 PUMP_WS = os.getenv("PUMP_WS", "wss://pumpportal.fun/api/data")
-PUMP_MIN_BUYS = int(os.getenv("PUMP_MIN_BUYS", "15"))
-PUMP_MIN_UNIQUE_BUYERS = int(os.getenv("PUMP_MIN_UNIQUE_BUYERS", "12"))
-PUMP_MIN_SOL_VOLUME = float(os.getenv("PUMP_MIN_SOL_VOLUME", "6"))
-PUMP_MAX_AGE_SECONDS = int(os.getenv("PUMP_MAX_AGE_SECONDS", "45"))
+PUMP_MAX_SIGNAL_AGE = int(os.getenv("PUMP_MAX_SIGNAL_AGE", "90"))
 PUMP_TRACK_MAX_SECONDS = int(os.getenv("PUMP_TRACK_MAX_SECONDS", "180"))
+PUMP_MIN_BUYS = int(os.getenv("PUMP_MIN_BUYS", "18"))
+PUMP_MIN_UNIQUE_BUYERS = int(os.getenv("PUMP_MIN_UNIQUE_BUYERS", "14"))
+PUMP_MIN_SOL_VOLUME = float(os.getenv("PUMP_MIN_SOL_VOLUME", "8"))
+PUMP_MIN_BUYER_VELOCITY = float(os.getenv("PUMP_MIN_BUYER_VELOCITY", "0.16"))
+PUMP_MIN_BONDING_SOL = float(os.getenv("PUMP_MIN_BONDING_SOL", "18"))
+PUMP_MIN_SCORE = int(os.getenv("PUMP_MIN_SCORE", "70"))
 
 # Static addresses
 ETH_FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
@@ -138,6 +140,10 @@ def send(msg: str) -> None:
         except Exception as exc:
             print(f"Telegram error: {exc}")
     print(msg)
+
+
+def send_token_bubble(label: str, value: str) -> None:
+    send(f"{label}\n`{value}`")
 
 
 def safe_float(value, default: float = 0.0) -> float:
@@ -270,6 +276,8 @@ def init_pump_state(payload: dict) -> dict:
         "buy_sol": 0.0,
         "buyers": set(),
         "alerted": False,
+        "bonding_sol": 0.0,
+        "score": 0,
     }
 
 # ---------------------------
@@ -305,10 +313,8 @@ def maybe_send_money_signal(state: dict) -> None:
     msg = (
         "💰 *MONEY SIGNAL*\n\n"
         f"*{state['name']} ({state['symbol']})*\n"
-        f"Token: `{state['token']}`\n"
-        f"Pair: `{state['pair']}`\n"
         f"Age: {int(age)}s\n"
-        f"Liquidity: {liq_eth:.2f} ETH \(~${liq_usd:,.0f}\)\n"
+        f"Liquidity: {liq_eth:.2f} ETH (~${liq_usd:,.0f})\n"
         f"Buys: {state['buys']}\n"
         f"Buy volume: {state['buy_eth']:.3f} ETH\n"
         f"Unique buyers: {unique_buyers}\n"
@@ -318,10 +324,11 @@ def maybe_send_money_signal(state: dict) -> None:
         f"Etherscan\n{etherscan_token_link(state['token'])}"
     )
     send(msg)
+    send_token_bubble("TOKEN", state["token"])
+    send_token_bubble("PAIR", state["pair"])
 
 
 def process_new_eth_pairs(from_block: int, to_block: int) -> None:
-    global eth_last_block
     if not factory_contract:
         return
 
@@ -351,11 +358,11 @@ def process_new_eth_pairs(from_block: int, to_block: int) -> None:
         send(
             "🟢 *ETH NEW PAIR WATCH*\n\n"
             f"*{state['name']} ({state['symbol']})*\n"
-            f"Token: `{token}`\n"
-            f"Pair: `{pair}`\n"
             f"Liquidity: {state['liquidity_eth']:.2f} ETH\n"
             f"Honeypot check: {'PASS' if state['honeypot_ok'] else 'FAIL'}"
         )
+        send_token_bubble("TOKEN", token)
+        send_token_bubble("PAIR", pair)
 
 
 def process_eth_swaps_for_state(state: dict, current_block: int) -> None:
@@ -371,6 +378,14 @@ def process_eth_swaps_for_state(state: dict, current_block: int) -> None:
         state["swap_from_block"] = current_block + 1
         state["last_seen_block"] = current_block
 
+    try:
+        pair_contract = w3.eth.contract(address=Web3.to_checksum_address(state["pair"]), abi=PAIR_ABI)
+        token0 = pair_contract.functions.token0().call()
+        token1 = pair_contract.functions.token1().call()
+    except Exception as exc:
+        print(f"Pair token read error for {state['pair']}: {exc}")
+        return
+
     for log in logs:
         args = log["args"]
         amount0_in = safe_float(args["amount0In"])
@@ -378,10 +393,6 @@ def process_eth_swaps_for_state(state: dict, current_block: int) -> None:
         amount0_out = safe_float(args["amount0Out"])
         amount1_out = safe_float(args["amount1Out"])
         to_addr = args["to"]
-
-        pair_contract = w3.eth.contract(address=Web3.to_checksum_address(state["pair"]), abi=PAIR_ABI)
-        token0 = pair_contract.functions.token0().call()
-        token1 = pair_contract.functions.token1().call()
 
         is_buy = False
         eth_in = 0.0
@@ -406,7 +417,7 @@ def process_eth_swaps_for_state(state: dict, current_block: int) -> None:
 async def eth_scanner_loop() -> None:
     global eth_last_block
     if not w3 or not w3.is_connected() or not factory_contract:
-        send("⚠️ ETH scanner disabled \(missing or invalid NODE\)")
+        send("⚠️ ETH scanner disabled (missing or invalid NODE)")
         return
 
     send("✅ ETH money-signal scanner started")
@@ -432,14 +443,45 @@ async def eth_scanner_loop() -> None:
 # ---------------------------
 # PUMP.FUN SECONDARY SIGNAL
 # ---------------------------
+def pump_score(state: dict) -> tuple[int, dict]:
+    age = now_ts() - state["created_at"]
+    buyers = len(state["buyers"])
+    buyer_velocity = buyers / max(age, 1)
+    bonding_sol = state["bonding_sol"]
+
+    if age > PUMP_MAX_SIGNAL_AGE:
+        return 0, {
+            "age": age,
+            "buyers": buyers,
+            "buyer_velocity": buyer_velocity,
+            "bonding_sol": bonding_sol,
+        }
+
+    score = 0
+    score += min(35, int(buyer_velocity * 100))
+    score += min(25, int(bonding_sol))
+    score += min(20, int(state["buy_sol"] * 2))
+    score += min(20, buyers)
+
+    return min(score, 100), {
+        "age": age,
+        "buyers": buyers,
+        "buyer_velocity": buyer_velocity,
+        "bonding_sol": bonding_sol,
+    }
+
+
 def maybe_send_pump_alert(state: dict) -> None:
     if state["alerted"]:
         return
 
-    age = now_ts() - state["created_at"]
-    buyers = len(state["buyers"])
+    score, metrics = pump_score(state)
+    age = metrics["age"]
+    buyers = metrics["buyers"]
+    buyer_velocity = metrics["buyer_velocity"]
+    bonding_sol = metrics["bonding_sol"]
 
-    if age > PUMP_MAX_AGE_SECONDS:
+    if age > PUMP_MAX_SIGNAL_AGE:
         return
     if state["buys"] < PUMP_MIN_BUYS:
         return
@@ -447,20 +489,30 @@ def maybe_send_pump_alert(state: dict) -> None:
         return
     if state["buy_sol"] < PUMP_MIN_SOL_VOLUME:
         return
+    if buyer_velocity < PUMP_MIN_BUYER_VELOCITY:
+        return
+    if bonding_sol < PUMP_MIN_BONDING_SOL:
+        return
+    if score < PUMP_MIN_SCORE:
+        return
 
     state["alerted"] = True
+    state["score"] = score
     msg = (
         "🚨 *PUMPFUN SECONDARY SIGNAL*\n\n"
         f"*{state['name']} ({state['symbol']})*\n"
-        f"Mint: `{state['mint']}`\n"
+        f"Score: {score}/100\n"
         f"Age: {int(age)}s\n"
         f"Buys: {state['buys']}\n"
         f"Buy volume: {state['buy_sol']:.2f} SOL\n"
-        f"Unique buyers: {buyers}\n\n"
+        f"Unique buyers: {buyers}\n"
+        f"Buyer velocity: {buyer_velocity:.3f}/s\n"
+        f"Bonding curve SOL: {bonding_sol:.2f}\n\n"
         f"DexScreener\n{dexscreener_sol_link(state['mint'])}\n\n"
         f"GMGN\n{gmgn_link(state['mint'])}"
     )
     send(msg)
+    send_token_bubble("MINT", state["mint"])
 
 
 def handle_pump_new_token(payload: dict) -> str | None:
@@ -486,6 +538,14 @@ def handle_pump_trade(payload: dict) -> None:
     wallet = str(get_first(payload, ["traderPublicKey", "wallet", "maker", "user"], ""))
     if wallet:
         state["buyers"].add(wallet)
+
+    bonding_candidate = max(
+        safe_float(get_first(payload, ["vSolInBondingCurve"], 0.0)),
+        safe_float(get_first(payload, ["bondingCurveSol"], 0.0)),
+        safe_float(get_first(payload, ["virtualSolReserves"], 0.0)),
+    )
+    if bonding_candidate > state["bonding_sol"]:
+        state["bonding_sol"] = bonding_candidate
 
     maybe_send_pump_alert(state)
 
