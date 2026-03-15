@@ -1,5 +1,2 @@
-web3>=6
-requests
-beautifulsoup4
-spacy>=3.8
-aiohttp
+requests>=2.31.0
+web3>=7.0.0
