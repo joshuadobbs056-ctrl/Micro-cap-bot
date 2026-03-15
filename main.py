@@ -50,7 +50,7 @@ if not NODE:
     raise RuntimeError("NODE missing")
 
 if NODE.startswith("ws"):
-    w3=Web3(Web3.WebsocketProvider(NODE))
+    w3=Web3(Web3.LegacyWebSocketProvider(NODE))
 else:
     w3=Web3(Web3.HTTPProvider(NODE))
 
@@ -217,15 +217,11 @@ def open_trade(token,pair):
     global ACCOUNT_CASH
 
     if len(PAPER_TRADES)>=MAX_OPEN_TRADES:
-
         send("⚠️ Trade skipped — max trades reached")
-
         return
 
     if ACCOUNT_CASH<PURCHASE_AMOUNT_USD:
-
         send("⚠️ Trade skipped — insufficient balance")
-
         return
 
     data=get_pair_data(pair)
@@ -391,8 +387,6 @@ Balance ${START_BALANCE}"""
 
     while True:
         time.sleep(60)
-
-# -------------------------
 
 if __name__=="__main__":
     main()
