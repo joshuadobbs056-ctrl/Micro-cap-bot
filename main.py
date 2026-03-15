@@ -1,7 +1,7 @@
 import subprocess
 import sys
 
-def install(package: str):
+def install(package):
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
 try:
@@ -24,30 +24,25 @@ import threading
 # ENV
 # -------------------------
 
-NODE = os.getenv("NODE")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+NODE=os.getenv("NODE")
+TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN")
+CHAT_ID=os.getenv("CHAT_ID")
 
-RUN_PURCHASE = os.getenv("RUN_PURCHASE","off").lower()
+RUN_PURCHASE=os.getenv("RUN_PURCHASE","off").lower()
 
-PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD","50"))
+START_BALANCE=float(os.getenv("START_BALANCE","2000"))
+PURCHASE_AMOUNT_USD=float(os.getenv("PURCHASE_AMOUNT_USD","50"))
 
-DEXS_MIN_LIQ_USD = float(os.getenv("DEXS_MIN_LIQ_USD","2000"))
+MAX_OPEN_TRADES=int(os.getenv("MAX_OPEN_TRADES","10"))
 
-DEXSCREENER_POLL_SECONDS = float(os.getenv("DEXSCREENER_POLL_SECONDS","20"))
+PORTFOLIO_UPDATE_SECONDS=int(os.getenv("PORTFOLIO_UPDATE_SECONDS","30"))
 
-HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS","300"))
+TAKE_PROFIT=float(os.getenv("TAKE_PROFIT","50"))
+STOP_LOSS=float(os.getenv("STOP_LOSS","-30"))
 
-PORTFOLIO_UPDATE_SECONDS = int(os.getenv("PORTFOLIO_UPDATE_SECONDS","30"))
+MAX_TOKEN_AGE_SECONDS=300
 
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT","50"))
-STOP_LOSS = float(os.getenv("STOP_LOSS","-30"))
-
-START_BALANCE = float(os.getenv("START_BALANCE","2000"))
-
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES","10"))
-
-ACCOUNT_CASH = START_BALANCE
+ACCOUNT_CASH=START_BALANCE
 
 # -------------------------
 # WEB3
@@ -56,12 +51,36 @@ ACCOUNT_CASH = START_BALANCE
 if not NODE:
     raise RuntimeError("NODE missing")
 
-w3 = Web3(Web3.HTTPProvider(NODE))
+w3=Web3(Web3.HTTPProvider(NODE))
 
 if not w3.is_connected():
     raise RuntimeError("Node failed")
 
-print("Connected to node")
+print("Connected")
+
+# -------------------------
+# CONSTANTS
+# -------------------------
+
+WETH=Web3.to_checksum_address(
+"0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2"
+)
+
+FACTORY=Web3.to_checksum_address(
+"0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+)
+
+FACTORY_ABI=[{
+"name":"PairCreated",
+"type":"event",
+"inputs":[
+{"indexed":True,"name":"token0","type":"address"},
+{"indexed":True,"name":"token1","type":"address"},
+{"indexed":False,"name":"pair","type":"address"}
+]
+}]
+
+factory=w3.eth.contract(address=FACTORY,abi=FACTORY_ABI)
 
 # -------------------------
 # TELEGRAM
@@ -70,12 +89,15 @@ print("Connected to node")
 def send(msg):
 
     if TELEGRAM_TOKEN and CHAT_ID:
+
         try:
+
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 data={"chat_id":CHAT_ID,"text":msg},
                 timeout=10
             )
+
         except:
             pass
 
@@ -95,14 +117,13 @@ def get_pair_data(pair):
 
         data=r.json()
 
-        pairdata=data.get("pair")
+        p=data.get("pair")
 
-        if not pairdata:
+        if not p:
             return None
 
         return {
-            "price":float(pairdata.get("priceUsd") or 0),
-            "liq":float((pairdata.get("liquidity") or {}).get("usd") or 0),
+            "price":float(p.get("priceUsd") or 0)
         }
 
     except:
@@ -114,21 +135,18 @@ def get_pair_data(pair):
 
 class PaperTrade:
 
-    def __init__(self,token,pair,entry_price):
+    def __init__(self,token,pair,price):
 
         self.token=token
         self.pair=pair
-
-        self.entry_price=entry_price
-
-        self.tokens=PURCHASE_AMOUNT_USD/entry_price
-
+        self.entry_price=price
+        self.tokens=PURCHASE_AMOUNT_USD/price
         self.open=time.time()
 
 PAPER_TRADES={}
 
 # -------------------------
-# MONITOR TRADE
+# TRADE MONITOR
 # -------------------------
 
 def monitor_trade(token):
@@ -168,13 +186,12 @@ Value
 ${value:.2f}
 
 PnL
-{pnl:.2f}%
-"""
+{pnl:.2f}%"""
 )
 
         if pnl>=TAKE_PROFIT or pnl<=STOP_LOSS:
 
-            ACCOUNT_CASH += value
+            ACCOUNT_CASH+=value
 
             send(
 f"""🧪 PAPER TRADE CLOSED
@@ -182,18 +199,12 @@ f"""🧪 PAPER TRADE CLOSED
 Token
 {trade.token}
 
-Entry
-${trade.entry_price}
+Entry ${trade.entry_price}
+Exit ${price}
 
-Exit
-${price}
+Value ${value:.2f}
 
-Final Value
-${value:.2f}
-
-PnL
-{pnl:.2f}%
-"""
+PnL {pnl:.2f}%"""
 )
 
             del PAPER_TRADES[token]
@@ -204,35 +215,19 @@ PnL
 # OPEN TRADE
 # -------------------------
 
-def open_paper_trade(token,pair):
+def open_trade(token,pair):
 
     global ACCOUNT_CASH
 
-    if len(PAPER_TRADES) >= MAX_OPEN_TRADES:
+    if len(PAPER_TRADES)>=MAX_OPEN_TRADES:
 
-        send(
-f"""⚠️ TRADE SKIPPED
-
-Reason: max open trades reached
-
-Open Trades: {len(PAPER_TRADES)}
-Limit: {MAX_OPEN_TRADES}
-"""
-)
+        send("⚠️ Trade skipped — max trades reached")
 
         return
 
-    if ACCOUNT_CASH < PURCHASE_AMOUNT_USD:
+    if ACCOUNT_CASH<PURCHASE_AMOUNT_USD:
 
-        send(
-f"""⚠️ TRADE SKIPPED
-
-Reason: insufficient balance
-
-Cash Available: ${ACCOUNT_CASH:.2f}
-Required: ${PURCHASE_AMOUNT_USD}
-"""
-)
+        send("⚠️ Trade skipped — insufficient cash")
 
         return
 
@@ -247,7 +242,7 @@ Required: ${PURCHASE_AMOUNT_USD}
 
     PAPER_TRADES[token]=trade
 
-    ACCOUNT_CASH -= PURCHASE_AMOUNT_USD
+    ACCOUNT_CASH-=PURCHASE_AMOUNT_USD
 
     send(
 f"""🧪 PAPER TRADE OPENED
@@ -255,16 +250,13 @@ f"""🧪 PAPER TRADE OPENED
 Token
 {token}
 
-Entry Price
+Entry
 ${price}
 
-Buy Size
-${PURCHASE_AMOUNT_USD}
-
 Tokens
-{trade.tokens:.2f}
+{trade.tokens}
 
-Open Trades
+Open trades
 {len(PAPER_TRADES)}/{MAX_OPEN_TRADES}
 """
 )
@@ -276,23 +268,12 @@ Open Trades
     ).start()
 
 # -------------------------
-# AUTO BUY
-# -------------------------
-
-def execute_buy(token):
-
-    if RUN_PURCHASE!="on":
-        return
-
-    send(f"🟢 LIVE BUY EXECUTED {token}")
-
-# -------------------------
-# PROCESS TOKEN
+# DISCOVERY
 # -------------------------
 
 ACTIVE=set()
 
-def process_pair(token,pair,liq):
+def process_pair(token,pair):
 
     if pair in ACTIVE:
         return
@@ -301,11 +282,8 @@ def process_pair(token,pair,liq):
 
     try:
 
-        if liq<DEXS_MIN_LIQ_USD:
-            return
-
         send(
-f"""🚀 BUY SIGNAL
+f"""🚀 NEW LAUNCH DETECTED
 
 Token
 {token}
@@ -313,162 +291,99 @@ Token
 Pair
 {pair}
 
-Liquidity
-${liq:,.0f}
+Age
+< 5 minutes
 """
 )
 
         if RUN_PURCHASE=="on":
-            execute_buy(token)
+            send(f"🟢 LIVE BUY {token}")
         else:
-            open_paper_trade(token,pair)
+            open_trade(token,pair)
 
     finally:
 
         ACTIVE.remove(pair)
 
 # -------------------------
-# DISCOVERY
+# EVENT LOOP
 # -------------------------
 
-def fetch_dex():
+def event_loop():
 
-    queries=["ETH","WETH","USDC","coin","pepe"]
-
-    results=[]
-
-    for q in queries:
-
-        try:
-
-            url=f"https://api.dexscreener.com/latest/dex/search?q={q}"
-
-            r=requests.get(url,timeout=10)
-
-            data=r.json()
-
-            pairs=data.get("pairs") or []
-
-            for p in pairs:
-
-                if str(p.get("chainId","")).lower()!="ethereum":
-                    continue
-
-                pair=p.get("pairAddress")
-                token=((p.get("baseToken") or {}).get("address"))
-
-                if not pair or not token:
-                    continue
-
-                liq=float((p.get("liquidity") or {}).get("usd") or 0)
-
-                results.append({
-                    "pair":pair,
-                    "token":token,
-                    "liq":liq
-                })
-
-        except:
-            pass
-
-    uniq={}
-
-    for r in results:
-        uniq[r["pair"].lower()]=r
-
-    return list(uniq.values())
-
-# -------------------------
-# DEX LOOP
-# -------------------------
-
-def dex_loop():
-
-    send("🛰 Dex discovery started")
+    last_block=w3.eth.block_number
 
     while True:
 
-        try:
+        block=w3.eth.block_number
 
-            cands=fetch_dex()
+        if block>last_block:
 
-            send(f"🛰 Dex candidates found: {len(cands)}")
+            events=factory.events.PairCreated.get_logs(
+                from_block=last_block+1,
+                to_block=block
+            )
 
-            for c in cands:
+            for e in events:
 
-                process_pair(
-                    c["token"],
-                    c["pair"],
-                    c["liq"]
-                )
+                token0=e["args"]["token0"]
+                token1=e["args"]["token1"]
+                pair=e["args"]["pair"]
 
-        except Exception as e:
+                token=None
 
-            print("dex error",e)
+                if token0.lower()==WETH.lower():
+                    token=token1
 
-        time.sleep(DEXSCREENER_POLL_SECONDS)
+                if token1.lower()==WETH.lower():
+                    token=token0
+
+                if token:
+
+                    process_pair(
+                        Web3.to_checksum_address(token),
+                        Web3.to_checksum_address(pair)
+                    )
+
+            last_block=block
+
+        time.sleep(2)
 
 # -------------------------
 # PORTFOLIO
 # -------------------------
 
-def portfolio_loop():
+def portfolio():
 
     while True:
 
-        total_value = ACCOUNT_CASH
+        total=ACCOUNT_CASH
 
-        for token,trade in PAPER_TRADES.items():
+        for t in PAPER_TRADES.values():
 
-            data=get_pair_data(trade.pair)
+            data=get_pair_data(t.pair)
 
             if not data:
                 continue
 
-            price=data["price"]
+            total+=t.tokens*data["price"]
 
-            total_value += trade.tokens * price
-
-        pnl = total_value - START_BALANCE
-        pnl_pct = (pnl / START_BALANCE) * 100
+        pnl=total-START_BALANCE
 
         send(
-f"""📊 PAPER PORTFOLIO
+f"""📊 PORTFOLIO
 
-Starting Balance: ${START_BALANCE}
+Balance ${total:.2f}
 
-Current Value: ${total_value:.2f}
+Profit ${pnl:.2f}
 
-Total Profit: ${pnl:.2f}
-PnL: {pnl_pct:.2f}%
+Cash ${ACCOUNT_CASH:.2f}
 
-Cash: ${ACCOUNT_CASH:.2f}
-
-Open Trades: {len(PAPER_TRADES)} / {MAX_OPEN_TRADES}
+Open Trades {len(PAPER_TRADES)}
 """
 )
 
         time.sleep(PORTFOLIO_UPDATE_SECONDS)
-
-# -------------------------
-# HEARTBEAT
-# -------------------------
-
-def heartbeat():
-
-    while True:
-
-        time.sleep(HEARTBEAT_SECONDS)
-
-        send(
-f"""💓 SCANNER HEARTBEAT
-
-Connected: YES
-Block: {w3.eth.block_number}
-
-Open Trades: {len(PAPER_TRADES)}
-"""
-)
 
 # -------------------------
 # MAIN
@@ -477,25 +392,21 @@ Open Trades: {len(PAPER_TRADES)}
 def main():
 
     send(
-f"""ETH Launch Scanner Started
+f"""Launch Sniper Started
 
-Mode
-{"LIVE" if RUN_PURCHASE=="on" else "PAPER"}
+Mode: {"LIVE" if RUN_PURCHASE=="on" else "PAPER"}
 
-Buy Size
-${PURCHASE_AMOUNT_USD}
+Balance ${START_BALANCE}
 """
 )
 
-    threading.Thread(target=dex_loop,daemon=True).start()
-    threading.Thread(target=heartbeat,daemon=True).start()
-    threading.Thread(target=portfolio_loop,daemon=True).start()
+    threading.Thread(target=event_loop,daemon=True).start()
+
+    threading.Thread(target=portfolio,daemon=True).start()
 
     while True:
         time.sleep(60)
 
-# -------------------------
-# START
 # -------------------------
 
 if __name__=="__main__":
