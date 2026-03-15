@@ -356,10 +356,7 @@ def get_token_security(token: str) -> Optional[dict]:
 def passes_tax_and_sellability(token: str) -> Tuple[bool, str]:
     sec = get_token_security(token)
     if not sec:
-        return False, "security check unavailable"
-
-    sell_tax = safe_pct(sec.get("sell_tax"))
-    buy_tax = safe_pct(sec.get("buy_tax"))
+        return True, "security unavailable"
 
     if sec.get("is_honeypot") == "1":
         return False, "honeypot flagged"
@@ -367,13 +364,24 @@ def passes_tax_and_sellability(token: str) -> Tuple[bool, str]:
     if sec.get("cannot_sell_all") == "1":
         return False, "cannot sell all flagged"
 
-    if sell_tax > MAX_SELL_TAX_PCT:
+    sell_tax_raw = sec.get("sell_tax")
+    buy_tax_raw = sec.get("buy_tax")
+
+    # Unknown tax values are common on very new launches.
+    # Treat them as unknown instead of fake 999% taxes.
+    sell_tax = safe_pct(sell_tax_raw, default=-1.0)
+    buy_tax = safe_pct(buy_tax_raw, default=-1.0)
+
+    if sell_tax >= 0 and sell_tax > MAX_SELL_TAX_PCT:
         return False, f"sell tax too high: {sell_tax:.2f}%"
 
-    if buy_tax > MAX_BUY_TAX_PCT:
+    if buy_tax >= 0 and buy_tax > MAX_BUY_TAX_PCT:
         return False, f"buy tax too high: {buy_tax:.2f}%"
 
-    return True, f"buy tax {buy_tax:.2f}% | sell tax {sell_tax:.2f}%"
+    sell_text = "unknown" if sell_tax < 0 else f"{sell_tax:.2f}%"
+    buy_text = "unknown" if buy_tax < 0 else f"{buy_tax:.2f}%"
+
+    return True, f"buy tax {buy_text} | sell tax {sell_text}"
 
 
 # -------------------------
