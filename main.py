@@ -35,12 +35,19 @@ PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD","50"))
 DEXS_MIN_LIQ_USD = float(os.getenv("DEXS_MIN_LIQ_USD","2000"))
 
 DEXSCREENER_POLL_SECONDS = float(os.getenv("DEXSCREENER_POLL_SECONDS","20"))
+
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS","300"))
 
-UPDATE_SECONDS = 60
+PORTFOLIO_UPDATE_SECONDS = int(os.getenv("PORTFOLIO_UPDATE_SECONDS","30"))
 
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT","50"))
 STOP_LOSS = float(os.getenv("STOP_LOSS","-30"))
+
+START_BALANCE = float(os.getenv("START_BALANCE","2000"))
+
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES","10"))
+
+ACCOUNT_CASH = START_BALANCE
 
 # -------------------------
 # WEB3
@@ -96,7 +103,6 @@ def get_pair_data(pair):
         return {
             "price":float(pairdata.get("priceUsd") or 0),
             "liq":float((pairdata.get("liquidity") or {}).get("usd") or 0),
-            "mc":float(pairdata.get("fdv") or 0)
         }
 
     except:
@@ -121,13 +127,19 @@ class PaperTrade:
 
 PAPER_TRADES={}
 
+# -------------------------
+# MONITOR TRADE
+# -------------------------
+
 def monitor_trade(token):
+
+    global ACCOUNT_CASH
 
     trade=PAPER_TRADES[token]
 
     while True:
 
-        time.sleep(UPDATE_SECONDS)
+        time.sleep(60)
 
         data=get_pair_data(trade.pair)
 
@@ -162,6 +174,8 @@ PnL
 
         if pnl>=TAKE_PROFIT or pnl<=STOP_LOSS:
 
+            ACCOUNT_CASH += value
+
             send(
 f"""🧪 PAPER TRADE CLOSED
 
@@ -186,7 +200,41 @@ PnL
 
             return
 
+# -------------------------
+# OPEN TRADE
+# -------------------------
+
 def open_paper_trade(token,pair):
+
+    global ACCOUNT_CASH
+
+    if len(PAPER_TRADES) >= MAX_OPEN_TRADES:
+
+        send(
+f"""⚠️ TRADE SKIPPED
+
+Reason: max open trades reached
+
+Open Trades: {len(PAPER_TRADES)}
+Limit: {MAX_OPEN_TRADES}
+"""
+)
+
+        return
+
+    if ACCOUNT_CASH < PURCHASE_AMOUNT_USD:
+
+        send(
+f"""⚠️ TRADE SKIPPED
+
+Reason: insufficient balance
+
+Cash Available: ${ACCOUNT_CASH:.2f}
+Required: ${PURCHASE_AMOUNT_USD}
+"""
+)
+
+        return
 
     data=get_pair_data(pair)
 
@@ -199,6 +247,8 @@ def open_paper_trade(token,pair):
 
     PAPER_TRADES[token]=trade
 
+    ACCOUNT_CASH -= PURCHASE_AMOUNT_USD
+
     send(
 f"""🧪 PAPER TRADE OPENED
 
@@ -208,11 +258,14 @@ Token
 Entry Price
 ${price}
 
-Simulated Buy
+Buy Size
 ${PURCHASE_AMOUNT_USD}
 
 Tokens
 {trade.tokens:.2f}
+
+Open Trades
+{len(PAPER_TRADES)}/{MAX_OPEN_TRADES}
 """
 )
 
@@ -232,6 +285,47 @@ def execute_buy(token):
         return
 
     send(f"🟢 LIVE BUY EXECUTED {token}")
+
+# -------------------------
+# PROCESS TOKEN
+# -------------------------
+
+ACTIVE=set()
+
+def process_pair(token,pair,liq):
+
+    if pair in ACTIVE:
+        return
+
+    ACTIVE.add(pair)
+
+    try:
+
+        if liq<DEXS_MIN_LIQ_USD:
+            return
+
+        send(
+f"""🚀 BUY SIGNAL
+
+Token
+{token}
+
+Pair
+{pair}
+
+Liquidity
+${liq:,.0f}
+"""
+)
+
+        if RUN_PURCHASE=="on":
+            execute_buy(token)
+        else:
+            open_paper_trade(token,pair)
+
+    finally:
+
+        ACTIVE.remove(pair)
 
 # -------------------------
 # DISCOVERY
@@ -285,48 +379,7 @@ def fetch_dex():
     return list(uniq.values())
 
 # -------------------------
-# PROCESS
-# -------------------------
-
-ACTIVE=set()
-
-def process_pair(token,pair,liq):
-
-    if pair in ACTIVE:
-        return
-
-    ACTIVE.add(pair)
-
-    try:
-
-        if liq<DEXS_MIN_LIQ_USD:
-            return
-
-        send(
-f"""🚀 BUY SIGNAL
-
-Token
-{token}
-
-Pair
-{pair}
-
-Liquidity
-${liq:,.0f}
-"""
-)
-
-        if RUN_PURCHASE=="on":
-            execute_buy(token)
-        else:
-            open_paper_trade(token,pair)
-
-    finally:
-
-        ACTIVE.remove(pair)
-
-# -------------------------
-# DISCOVERY LOOP
+# DEX LOOP
 # -------------------------
 
 def dex_loop():
@@ -356,6 +409,48 @@ def dex_loop():
         time.sleep(DEXSCREENER_POLL_SECONDS)
 
 # -------------------------
+# PORTFOLIO
+# -------------------------
+
+def portfolio_loop():
+
+    while True:
+
+        total_value = ACCOUNT_CASH
+
+        for token,trade in PAPER_TRADES.items():
+
+            data=get_pair_data(trade.pair)
+
+            if not data:
+                continue
+
+            price=data["price"]
+
+            total_value += trade.tokens * price
+
+        pnl = total_value - START_BALANCE
+        pnl_pct = (pnl / START_BALANCE) * 100
+
+        send(
+f"""📊 PAPER PORTFOLIO
+
+Starting Balance: ${START_BALANCE}
+
+Current Value: ${total_value:.2f}
+
+Total Profit: ${pnl:.2f}
+PnL: {pnl_pct:.2f}%
+
+Cash: ${ACCOUNT_CASH:.2f}
+
+Open Trades: {len(PAPER_TRADES)} / {MAX_OPEN_TRADES}
+"""
+)
+
+        time.sleep(PORTFOLIO_UPDATE_SECONDS)
+
+# -------------------------
 # HEARTBEAT
 # -------------------------
 
@@ -371,8 +466,7 @@ f"""💓 SCANNER HEARTBEAT
 Connected: YES
 Block: {w3.eth.block_number}
 
-Active Trades
-{len(PAPER_TRADES)}
+Open Trades: {len(PAPER_TRADES)}
 """
 )
 
@@ -395,6 +489,7 @@ ${PURCHASE_AMOUNT_USD}
 
     threading.Thread(target=dex_loop,daemon=True).start()
     threading.Thread(target=heartbeat,daemon=True).start()
+    threading.Thread(target=portfolio_loop,daemon=True).start()
 
     while True:
         time.sleep(60)
