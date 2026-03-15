@@ -36,8 +36,9 @@ RUN_PURCHASE = os.getenv("RUN_PURCHASE", "off").lower()
 
 PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD", "50"))
 
-MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY", "0.25"))
-MAX_ETH_LIQUIDITY = float(os.getenv("MAX_ETH_LIQUIDITY", "120"))
+# On-chain V2 ETH liquidity filters
+MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY", "0"))
+MAX_ETH_LIQUIDITY = float(os.getenv("MAX_ETH_LIQUIDITY", "999999"))
 
 TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "30"))
 PAIR_POLL_SECONDS = float(os.getenv("PAIR_POLL_SECONDS", "1.5"))
@@ -63,8 +64,8 @@ MOMENTUM_SPIKE_MULTIPLIER = float(os.getenv("MOMENTUM_SPIKE_MULTIPLIER", "3.0"))
 # DexScreener
 USE_DEXSCREENER = os.getenv("USE_DEXSCREENER", "true").lower() == "true"
 DEXSCREENER_TIMEOUT = int(os.getenv("DEXSCREENER_TIMEOUT", "10"))
-DEXS_MIN_LIQ_USD = float(os.getenv("DEXS_MIN_LIQ_USD", "0"))
-DEXS_MIN_BUYS_5M = int(os.getenv("DEXS_MIN_BUYS_5M", "0"))
+DEXS_MIN_LIQ_USD = float(os.getenv("DEXS_MIN_LIQ_USD", "3000"))
+DEXS_MIN_BUYS_5M = int(os.getenv("DEXS_MIN_BUYS_5M", "1"))
 DEXS_REQUIRE_PAIR_FOUND = os.getenv("DEXS_REQUIRE_PAIR_FOUND", "false").lower() == "true"
 DEXS_MAX_AGE_MINUTES = int(os.getenv("DEXS_MAX_AGE_MINUTES", "240"))
 DEXS_SEARCH_LIMIT = int(os.getenv("DEXS_SEARCH_LIMIT", "8"))
@@ -255,8 +256,16 @@ def monitor_paper_trade(token: str):
 
     current_liq = get_liquidity(trade.pair)
     if current_liq <= 0:
-        exit_eth = trade.entry * 0.50
-        reason = "liquidity vanished"
+        ds = fetch_dexscreener_by_pair(trade.pair)
+        liq_usd = safe_float((ds or {}).get("liquidity_usd"), 0.0)
+
+        if liq_usd <= 0:
+            exit_eth = trade.entry * 0.50
+            reason = "liquidity vanished"
+        else:
+            ratio = max(0.25, min(liq_usd / max(DEXS_MIN_LIQ_USD, 1.0), 3.0))
+            exit_eth = trade.entry * ratio
+            reason = "paper timed exit (dex liquidity)"
     else:
         entry_liq = max(trade.entry, 0.0001)
         ratio = current_liq / entry_liq
@@ -374,7 +383,6 @@ def fetch_dexscreener_candidates() -> list:
         except Exception as e:
             print("dexscreener discovery error:", e)
 
-    # de-dupe by pair
     dedup = {}
     for item in results:
         dedup[item["pair_address"].lower()] = item
@@ -556,11 +564,6 @@ def parse_swap_direction(args: dict, token0: str, token1: str):
     return None, 0.0, ""
 
 
-def quote_is_major(token: str) -> bool:
-    t = str(token).lower()
-    return t in {WETH.lower(), USDC.lower(), USDT.lower()}
-
-
 # -------------------------
 # TRACK TOKEN
 # -------------------------
@@ -589,7 +592,10 @@ def process_pair(token: str, pair: str, source: str = "unknown", ds_hint: dict =
 
     def worker():
         try:
+            ds = ds_hint or fetch_dexscreener_by_pair(pair)
             liquidity = get_liquidity(pair)
+
+            liq_usd = safe_float((ds or {}).get("liquidity_usd"), 0.0)
 
             if ALERT_TRACKING_START:
                 send(
@@ -603,13 +609,18 @@ Pair
 Token
 {token}
 
-Liquidity: {liquidity:.4f} ETH"""
+Liquidity ETH: {liquidity:.4f}
+Liquidity USD: {liq_usd:,.0f}"""
                 )
             else:
-                print(f"Tracking pair {pair} | liquidity {liquidity:.4f} ETH | source {source}")
+                print(f"Tracking pair {pair} | liquidity_eth {liquidity:.4f} | liquidity_usd {liq_usd:.0f} | source {source}")
 
-            if liquidity < MIN_ETH_LIQUIDITY or liquidity > MAX_ETH_LIQUIDITY:
-                reject("UNKNOWN", f"liquidity {liquidity:.4f} not in range {MIN_ETH_LIQUIDITY}-{MAX_ETH_LIQUIDITY}")
+            # accept either valid on-chain ETH liquidity OR valid DexScreener USD liquidity
+            has_valid_eth_liquidity = liquidity > 0 and MIN_ETH_LIQUIDITY <= liquidity <= MAX_ETH_LIQUIDITY
+            has_valid_usd_liquidity = liq_usd >= DEXS_MIN_LIQ_USD
+
+            if not has_valid_eth_liquidity and not has_valid_usd_liquidity:
+                reject("UNKNOWN", f"liquidity eth {liquidity:.4f} and liquidity usd {liq_usd:.0f} failed")
                 return
 
             name, symbol = token_info(token)
@@ -695,19 +706,21 @@ Liquidity: {liquidity:.4f} ETH"""
                 reject(symbol, f"unique buyers {unique} < {MONEY_MIN_UNIQUE_BUYERS}")
                 return
 
+            # if no ETH-side swap parsing worked, fall back to DexScreener buys count
             if buy_eth < MONEY_MIN_BUY_ETH:
-                reject(symbol, f"buy_eth {buy_eth:.4f} < {MONEY_MIN_BUY_ETH}")
-                return
+                ds_buys_5m = int((ds or {}).get("txns_5m_buys") or 0)
+                if ds_buys_5m < max(1, DEXS_MIN_BUYS_5M):
+                    reject(symbol, f"buy_eth {buy_eth:.4f} < {MONEY_MIN_BUY_ETH}")
+                    return
 
             if velocity < MONEY_MIN_BUYER_VELOCITY and not momentum_spike:
                 reject(symbol, f"velocity {velocity:.2f} < {MONEY_MIN_BUYER_VELOCITY}")
                 return
 
-            if top_buyer_share > MAX_TOP_BUYER_SHARE:
+            if top_buyer_share > MAX_TOP_BUYER_SHARE and buy_count > 1:
                 reject(symbol, f"top buyer share {top_buyer_share:.2%} > {MAX_TOP_BUYER_SHARE:.2%}")
                 return
 
-            ds = ds_hint or fetch_dexscreener_by_pair(pair)
             if not dexscreener_passes(ds):
                 reject(symbol, "failed DexScreener confirmation")
                 return
@@ -735,7 +748,8 @@ Dex ID: {ds.get('dex_id') or ''}
 {name} ({symbol})
 
 Source: {source}
-Liquidity: {liquidity:.2f} ETH
+Liquidity ETH: {liquidity:.2f}
+Liquidity USD: {liq_usd:,.0f}
 Buys: {buy_count}
 Sells: {sell_count}
 Buy ETH: {buy_eth:.3f}
@@ -847,8 +861,6 @@ Pool
 {pool}"""
             )
 
-        # We still try to process it through the same engine.
-        # Some V3 pools will not support V2-style reserve reads, so many will reject on liquidity.
         process_pair(token, pool, source="uniswap_v3")
     except Exception as ex:
         send(f"handle_v3_event error: {ex}")
@@ -869,7 +881,6 @@ def dexscreener_discovery_loop():
                 if not pair or not token:
                     continue
 
-                # only consider major-quote pairs
                 quote_symbol = (c.get("quote_symbol") or "").upper()
                 if quote_symbol not in {"WETH", "ETH", "USDC", "USDT"}:
                     continue
