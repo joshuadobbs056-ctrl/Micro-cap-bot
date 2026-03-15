@@ -44,6 +44,9 @@ DISCOVERY_WAIT_SECONDS = int(os.getenv("DISCOVERY_WAIT_SECONDS", "10"))
 DISCOVERY_POLL_SECONDS = float(os.getenv("DISCOVERY_POLL_SECONDS", "3"))
 POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "20"))
 
+# scan recent blocks on startup so the scanner can prove detection quickly
+STARTUP_LOOKBACK_BLOCKS = int(os.getenv("STARTUP_LOOKBACK_BLOCKS", "250"))
+
 # earliest launch only
 MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "900"))  # 15 min
 
@@ -901,7 +904,7 @@ def dispatch_pool_thread(token: str, pair: str, source: str):
 # EVENT LISTENERS
 # -------------------------
 def v2_event_listener():
-    last_block = safe_block_number()
+    last_block = max(safe_block_number() - STARTUP_LOOKBACK_BLOCKS, 0)
     send("Listening for new V2 pairs...")
 
     while True:
@@ -933,7 +936,7 @@ def v2_event_listener():
 
 
 def v3_event_listener():
-    last_block = safe_block_number()
+    last_block = max(safe_block_number() - STARTUP_LOOKBACK_BLOCKS, 0)
     send("Listening for new V3 pools...")
 
     while True:
@@ -1027,7 +1030,8 @@ def main():
         f"Entry Rules: volume there and sells >= {MIN_SELLS_5M}\n"
         f"Security Rules: sell tax <= {MAX_SELL_TAX_PCT:.2f}% | buy tax <= {MAX_BUY_TAX_PCT:.2f}%\n"
         f"Exit Rule: liquidity drop {LIQUIDITY_DROP_EXIT_PCT:.0f}%\n"
-        f"Discovery: V2 + V3"
+        f"Discovery: V2 + V3\n"
+        f"Startup Lookback {STARTUP_LOOKBACK_BLOCKS} blocks"
     )
 
     threading.Thread(target=v2_event_listener, daemon=True).start()
