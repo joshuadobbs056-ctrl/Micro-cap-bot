@@ -21,7 +21,7 @@ except Exception:
 import os
 import time
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 
 
 # -------------------------
@@ -36,35 +36,43 @@ RUN_PURCHASE = os.getenv("RUN_PURCHASE", "off").lower()
 
 PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD", "50"))
 
-MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY", "0.75"))
-MAX_ETH_LIQUIDITY = float(os.getenv("MAX_ETH_LIQUIDITY", "80"))
+MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY", "0.25"))
+MAX_ETH_LIQUIDITY = float(os.getenv("MAX_ETH_LIQUIDITY", "120"))
 
-TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "45"))
+TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "30"))
 PAIR_POLL_SECONDS = float(os.getenv("PAIR_POLL_SECONDS", "1.5"))
 BLOCK_POLL_SECONDS = float(os.getenv("BLOCK_POLL_SECONDS", "2"))
 
-MONEY_MIN_BUYS = int(os.getenv("MONEY_MIN_BUYS", "2"))
-MONEY_MIN_UNIQUE_BUYERS = int(os.getenv("MONEY_MIN_UNIQUE_BUYERS", "2"))
-MONEY_MIN_BUY_ETH = float(os.getenv("MONEY_MIN_BUY_ETH", "0.12"))
-MONEY_MIN_BUYER_VELOCITY = float(os.getenv("MONEY_MIN_BUYER_VELOCITY", "0.7"))
-MAX_TOP_BUYER_SHARE = float(os.getenv("MAX_TOP_BUYER_SHARE", "0.85"))
-
-# momentum spike detector
-ENABLE_MOMENTUM_SPIKE = os.getenv("ENABLE_MOMENTUM_SPIKE", "true").lower() == "true"
-MOMENTUM_LOOKBACK_SECONDS = int(os.getenv("MOMENTUM_LOOKBACK_SECONDS", "20"))
-MOMENTUM_SPIKE_MULTIPLIER = float(os.getenv("MOMENTUM_SPIKE_MULTIPLIER", "3.0"))
+MONEY_MIN_BUYS = int(os.getenv("MONEY_MIN_BUYS", "1"))
+MONEY_MIN_UNIQUE_BUYERS = int(os.getenv("MONEY_MIN_UNIQUE_BUYERS", "1"))
+MONEY_MIN_BUY_ETH = float(os.getenv("MONEY_MIN_BUY_ETH", "0.03"))
+MONEY_MIN_BUYER_VELOCITY = float(os.getenv("MONEY_MIN_BUYER_VELOCITY", "0.2"))
+MAX_TOP_BUYER_SHARE = float(os.getenv("MAX_TOP_BUYER_SHARE", "0.95"))
 
 # paper trade settings
 PAPER_TRADE_HOLD_SECONDS = int(os.getenv("PAPER_TRADE_HOLD_SECONDS", "180"))
 PAPER_MIN_PROFIT_PCT = float(os.getenv("PAPER_MIN_PROFIT_PCT", "15"))
 PAPER_STOP_LOSS_PCT = float(os.getenv("PAPER_STOP_LOSS_PCT", "-15"))
 
-# DexScreener confirmation
+# momentum
+ENABLE_MOMENTUM_SPIKE = os.getenv("ENABLE_MOMENTUM_SPIKE", "true").lower() == "true"
+MOMENTUM_LOOKBACK_SECONDS = int(os.getenv("MOMENTUM_LOOKBACK_SECONDS", "20"))
+MOMENTUM_SPIKE_MULTIPLIER = float(os.getenv("MOMENTUM_SPIKE_MULTIPLIER", "3.0"))
+
+# DexScreener
 USE_DEXSCREENER = os.getenv("USE_DEXSCREENER", "true").lower() == "true"
 DEXSCREENER_TIMEOUT = int(os.getenv("DEXSCREENER_TIMEOUT", "10"))
-DEXS_MIN_LIQ_USD = float(os.getenv("DEXS_MIN_LIQ_USD", "2000"))
+DEXS_MIN_LIQ_USD = float(os.getenv("DEXS_MIN_LIQ_USD", "0"))
 DEXS_MIN_BUYS_5M = int(os.getenv("DEXS_MIN_BUYS_5M", "0"))
 DEXS_REQUIRE_PAIR_FOUND = os.getenv("DEXS_REQUIRE_PAIR_FOUND", "false").lower() == "true"
+
+# proof-of-life
+SEND_STARTUP_HEARTBEAT = os.getenv("SEND_STARTUP_HEARTBEAT", "true").lower() == "true"
+HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
+ALERT_NEW_PAIRS = os.getenv("ALERT_NEW_PAIRS", "true").lower() == "true"
+ALERT_TRACKING_START = os.getenv("ALERT_TRACKING_START", "true").lower() == "true"
+ALERT_REJECTIONS = os.getenv("ALERT_REJECTIONS", "true").lower() == "true"
+
 
 # -------------------------
 # WEB3
@@ -137,6 +145,14 @@ def dextools_link(pair: str) -> str:
 
 def dexscreener_link(pair: str) -> str:
     return f"https://dexscreener.com/ethereum/{pair}"
+
+
+def reject(symbol: str, reason: str):
+    msg = f"⛔ REJECTED {symbol}: {reason}"
+    if ALERT_REJECTIONS:
+        send(msg)
+    else:
+        print(msg)
 
 
 # -------------------------
@@ -453,9 +469,24 @@ def process_pair(token: str, pair: str):
     def worker():
         try:
             liquidity = get_liquidity(pair)
-            print(f"Tracking pair {pair} | liquidity {liquidity:.4f} ETH")
+
+            if ALERT_TRACKING_START:
+                send(
+                    f"""🔎 TRACKING STARTED
+
+Pair
+{pair}
+
+Token
+{token}
+
+Liquidity: {liquidity:.4f} ETH"""
+                )
+            else:
+                print(f"Tracking pair {pair} | liquidity {liquidity:.4f} ETH")
 
             if liquidity < MIN_ETH_LIQUIDITY or liquidity > MAX_ETH_LIQUIDITY:
+                reject("UNKNOWN", f"liquidity {liquidity:.4f} not in range {MIN_ETH_LIQUIDITY}-{MAX_ETH_LIQUIDITY}")
                 return
 
             name, symbol = token_info(token)
@@ -472,13 +503,9 @@ def process_pair(token: str, pair: str):
             buy_count = 0
             sell_count = 0
 
-            # for momentum spike
             recent_unique_buyer_times = deque()
-
             start = now_ts()
             start_block = w3.eth.block_number
-
-            send(f"🔎 Tracking {name} ({symbol}) | Pair {pair}")
 
             while now_ts() - start < TRACK_SECONDS:
                 try:
@@ -538,22 +565,28 @@ def process_pair(token: str, pair: str):
                 top_buyer_share = max(buyer_counts.values()) / buy_count
 
             if buy_count < MONEY_MIN_BUYS:
+                reject(symbol, f"buy_count {buy_count} < {MONEY_MIN_BUYS}")
                 return
 
             if unique < MONEY_MIN_UNIQUE_BUYERS:
+                reject(symbol, f"unique buyers {unique} < {MONEY_MIN_UNIQUE_BUYERS}")
                 return
 
             if buy_eth < MONEY_MIN_BUY_ETH:
+                reject(symbol, f"buy_eth {buy_eth:.4f} < {MONEY_MIN_BUY_ETH}")
                 return
 
             if velocity < MONEY_MIN_BUYER_VELOCITY and not momentum_spike:
+                reject(symbol, f"velocity {velocity:.2f} < {MONEY_MIN_BUYER_VELOCITY}")
                 return
 
             if top_buyer_share > MAX_TOP_BUYER_SHARE:
+                reject(symbol, f"top buyer share {top_buyer_share:.2%} > {MAX_TOP_BUYER_SHARE:.2%}")
                 return
 
             ds = fetch_dexscreener_by_pair(pair)
             if not dexscreener_passes(ds):
+                reject(symbol, "failed DexScreener confirmation")
                 return
 
             smart_detected = len(smart_buyers) > 0
@@ -627,17 +660,50 @@ def handle_event(e):
 
         if str(t0).lower() == WETH.lower():
             token = t1
-
-        if str(t1).lower() == WETH.lower():
+        elif str(t1).lower() == WETH.lower():
             token = t0
 
         if token:
-            process_pair(
-                Web3.to_checksum_address(token),
-                Web3.to_checksum_address(pair),
-            )
+            token = Web3.to_checksum_address(token)
+            pair = Web3.to_checksum_address(pair)
+
+            if ALERT_NEW_PAIRS:
+                send(
+                    f"""🆕 NEW PAIR DETECTED
+
+Token
+{token}
+
+Pair
+{pair}"""
+                )
+
+            process_pair(token, pair)
+
     except Exception as ex:
+        send(f"handle_event error: {ex}")
         print("handle_event error:", ex)
+
+
+# -------------------------
+# HEARTBEAT
+# -------------------------
+def heartbeat_loop():
+    while True:
+        try:
+            time.sleep(HEARTBEAT_SECONDS)
+            send(
+                f"""💓 SCANNER HEARTBEAT
+
+Connected: YES
+Current block: {w3.eth.block_number}
+Mode: {"LIVE" if purchases_enabled() else "PAPER"}
+Active pair trackers: {len(ACTIVE_PAIRS)}
+Open paper trades: {len(PAPER_TRADES)}
+"""
+            )
+        except Exception as e:
+            print("heartbeat error", e)
 
 
 # -------------------------
@@ -665,12 +731,17 @@ USE_DEXSCREENER={format_bool(USE_DEXSCREENER)}
 DEXS_MIN_LIQ_USD={DEXS_MIN_LIQ_USD}
 DEXS_MIN_BUYS_5M={DEXS_MIN_BUYS_5M}
 
-Momentum Spike
-ENABLE_MOMENTUM_SPIKE={format_bool(ENABLE_MOMENTUM_SPIKE)}
-MOMENTUM_LOOKBACK_SECONDS={MOMENTUM_LOOKBACK_SECONDS}
-MOMENTUM_SPIKE_MULTIPLIER={MOMENTUM_SPIKE_MULTIPLIER}
+Proof Of Life
+ALERT_NEW_PAIRS={format_bool(ALERT_NEW_PAIRS)}
+ALERT_TRACKING_START={format_bool(ALERT_TRACKING_START)}
+ALERT_REJECTIONS={format_bool(ALERT_REJECTIONS)}
+SEND_STARTUP_HEARTBEAT={format_bool(SEND_STARTUP_HEARTBEAT)}
+HEARTBEAT_SECONDS={HEARTBEAT_SECONDS}
 """
     )
+
+    if SEND_STARTUP_HEARTBEAT:
+        threading.Thread(target=heartbeat_loop, daemon=True).start()
 
     last_block = w3.eth.block_number
 
@@ -685,7 +756,7 @@ MOMENTUM_SPIKE_MULTIPLIER={MOMENTUM_SPIKE_MULTIPLIER}
                 )
 
                 if events:
-                    print(f"Found {len(events)} new pair(s) between {last_block + 1} and {block}")
+                    send(f"📡 Found {len(events)} new pair(s) between blocks {last_block + 1} and {block}")
 
                 for e in events:
                     handle_event(e)
