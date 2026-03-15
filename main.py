@@ -39,10 +39,10 @@ MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))
 
 PORTFOLIO_UPDATE_SECONDS = int(os.getenv("PORTFOLIO_UPDATE_SECONDS", "30"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
-EVENT_POLL_SECONDS = float(os.getenv("EVENT_POLL_SECONDS", "1"))
-DISCOVERY_WAIT_SECONDS = int(os.getenv("DISCOVERY_WAIT_SECONDS", "20"))
-DISCOVERY_POLL_SECONDS = float(os.getenv("DISCOVERY_POLL_SECONDS", "2"))
-POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "15"))
+EVENT_POLL_SECONDS = float(os.getenv("EVENT_POLL_SECONDS", "5"))
+DISCOVERY_WAIT_SECONDS = int(os.getenv("DISCOVERY_WAIT_SECONDS", "15"))
+DISCOVERY_POLL_SECONDS = float(os.getenv("DISCOVERY_POLL_SECONDS", "3"))
+POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "20"))
 
 # earliest launch only
 MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "300"))  # 5 min
@@ -67,6 +67,11 @@ GAS_LIMIT_APPROVE = int(os.getenv("GAS_LIMIT_APPROVE", "120000"))
 GAS_LIMIT_SELL = int(os.getenv("GAS_LIMIT_SELL", "450000"))
 BUY_DEADLINE_SECONDS = int(os.getenv("BUY_DEADLINE_SECONDS", "180"))
 SELL_DEADLINE_SECONDS = int(os.getenv("SELL_DEADLINE_SECONDS", "180"))
+
+# provider limits / retry
+MAX_LOG_RANGE = int(os.getenv("MAX_LOG_RANGE", "10"))
+RPC_BACKOFF_START_SECONDS = int(os.getenv("RPC_BACKOFF_START_SECONDS", "2"))
+RPC_BACKOFF_MAX_SECONDS = int(os.getenv("RPC_BACKOFF_MAX_SECONDS", "30"))
 
 
 # -------------------------
@@ -98,11 +103,12 @@ if PRIVATE_KEY:
 # CONSTANTS / ABIS
 # -------------------------
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
-FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+V2_FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+V3_FACTORY = Web3.to_checksum_address("0x1F98431c8aD98523631AE4a59f267346ea31F984")
 ROUTER = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
 CHAINLINK_ETH_USD = Web3.to_checksum_address("0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419")
 
-FACTORY_ABI = [
+V2_FACTORY_ABI = [
     {
         "anonymous": False,
         "inputs": [
@@ -112,6 +118,21 @@ FACTORY_ABI = [
             {"indexed": False, "name": "", "type": "uint256"},
         ],
         "name": "PairCreated",
+        "type": "event",
+    }
+]
+
+V3_FACTORY_ABI = [
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "name": "token0", "type": "address"},
+            {"indexed": True, "name": "token1", "type": "address"},
+            {"indexed": True, "name": "fee", "type": "uint24"},
+            {"indexed": False, "name": "tickSpacing", "type": "int24"},
+            {"indexed": False, "name": "pool", "type": "address"},
+        ],
+        "name": "PoolCreated",
         "type": "event",
     }
 ]
@@ -212,7 +233,8 @@ CHAINLINK_ETH_USD_ABI = [
     }
 ]
 
-factory = w3.eth.contract(address=FACTORY, abi=FACTORY_ABI)
+v2_factory = w3.eth.contract(address=V2_FACTORY, abi=V2_FACTORY_ABI)
+v3_factory = w3.eth.contract(address=V3_FACTORY, abi=V3_FACTORY_ABI)
 router = w3.eth.contract(address=ROUTER, abi=ROUTER_ABI)
 eth_usd_feed = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=CHAINLINK_ETH_USD_ABI)
 
@@ -360,15 +382,20 @@ def get_pair_snapshot(pair: str) -> Optional[Dict[str, Any]]:
         if created_ms:
             age_seconds = (now_ts() * 1000 - float(created_ms)) / 1000.0
 
+        txns_5m = (p.get("txns") or {}).get("m5") or {}
+        liquidity = p.get("liquidity") or {}
+        volume = p.get("volume") or {}
+        base = p.get("baseToken") or {}
+
         return {
             "pair": p.get("pairAddress"),
-            "token": ((p.get("baseToken") or {}).get("address") or ""),
-            "symbol": ((p.get("baseToken") or {}).get("symbol") or "UNK"),
+            "token": base.get("address") or "",
+            "symbol": base.get("symbol") or "UNK",
             "price_usd": safe_float(p.get("priceUsd")),
-            "liquidity_usd": safe_float((p.get("liquidity") or {}).get("usd")),
-            "volume_5m": safe_float((p.get("volume") or {}).get("m5")),
-            "buys_5m": int(((p.get("txns") or {}).get("m5") or {}).get("buys") or 0),
-            "sells_5m": int(((p.get("txns") or {}).get("m5") or {}).get("sells") or 0),
+            "liquidity_usd": safe_float(liquidity.get("usd")),
+            "volume_5m": safe_float(volume.get("m5")),
+            "buys_5m": int(txns_5m.get("buys") or 0),
+            "sells_5m": int(txns_5m.get("sells") or 0),
             "fdv": safe_float(p.get("fdv")),
             "age_seconds": age_seconds,
             "url": p.get("url", ""),
@@ -555,8 +582,8 @@ class PaperTrade:
 
 PAPER_TRADES: Dict[str, PaperTrade] = {}
 LIVE_POSITIONS: Dict[str, dict] = {}
-SEEN_PAIRS = set()
-ACTIVE = set()
+SEEN_POOLS = set()
+ACTIVE_POOLS = set()
 LOCK = threading.Lock()
 
 
@@ -684,7 +711,7 @@ def open_paper_trade(token: str, pair: str, snap: dict):
 
 
 # -------------------------
-# PROCESS NEW PAIR
+# PROCESS NEW POOL
 # -------------------------
 def qualifies_for_entry(snap: dict) -> bool:
     age = snap["age_seconds"]
@@ -703,11 +730,11 @@ def qualifies_for_entry(snap: dict) -> bool:
     return True
 
 
-def process_pair(token: str, pair: str):
+def process_pool(token: str, pair: str, source: str):
     with LOCK:
-        if pair in ACTIVE or pair in SEEN_PAIRS:
+        if pair in ACTIVE_POOLS or pair in SEEN_POOLS:
             return
-        ACTIVE.add(pair)
+        ACTIVE_POOLS.add(pair)
 
     try:
         snap = None
@@ -726,6 +753,7 @@ def process_pair(token: str, pair: str):
         if not ok:
             send(
                 f"⚠️ TRADE SKIPPED\n\n"
+                f"Source {source}\n"
                 f"Token\n{token}\n\n"
                 f"Pair\n{pair}\n\n"
                 f"Reason: {security_reason}"
@@ -735,6 +763,7 @@ def process_pair(token: str, pair: str):
         age = snap["age_seconds"] or 0
         send(
             f"🚀 NEW LAUNCH DETECTED\n\n"
+            f"Source {source}\n"
             f"{snap['symbol']}\n"
             f"Token\n{token}\n\n"
             f"Pair\n{pair}\n\n"
@@ -748,7 +777,7 @@ def process_pair(token: str, pair: str):
         )
 
         with LOCK:
-            SEEN_PAIRS.add(pair)
+            SEEN_POOLS.add(pair)
 
         if RUN_PURCHASE == "on":
             if len(LIVE_POSITIONS) >= MAX_OPEN_TRADES:
@@ -763,17 +792,82 @@ def process_pair(token: str, pair: str):
 
     finally:
         with LOCK:
-            ACTIVE.discard(pair)
+            ACTIVE_POOLS.discard(pair)
 
 
 # -------------------------
-# EVENT LISTENER
+# EVENT HELPERS
 # -------------------------
-def event_listener():
+def parse_v2_event(e) -> Optional[Tuple[str, str, str]]:
+    try:
+        token0 = e["args"]["token0"]
+        token1 = e["args"]["token1"]
+        pair = e["args"]["pair"]
+
+        token = None
+        if token0.lower() == WETH.lower():
+            token = token1
+        elif token1.lower() == WETH.lower():
+            token = token0
+
+        if token:
+            return Web3.to_checksum_address(token), Web3.to_checksum_address(pair), "V2"
+    except Exception as ex:
+        print("parse_v2_event error:", ex)
+    return None
+
+
+def parse_v3_event(e) -> Optional[Tuple[str, str, str]]:
+    try:
+        token0 = e["args"]["token0"]
+        token1 = e["args"]["token1"]
+        pool = e["args"]["pool"]
+
+        token = None
+        if token0.lower() == WETH.lower():
+            token = token1
+        elif token1.lower() == WETH.lower():
+            token = token0
+
+        if token:
+            return Web3.to_checksum_address(token), Web3.to_checksum_address(pool), "V3"
+    except Exception as ex:
+        print("parse_v3_event error:", ex)
+    return None
+
+
+def process_log_range_with_backoff(contract, event_name: str, start_block: int, end_block: int):
+    backoff_seconds = RPC_BACKOFF_START_SECONDS
+    while True:
+        try:
+            if event_name == "PairCreated":
+                return contract.events.PairCreated.get_logs(from_block=start_block, to_block=end_block)
+            if event_name == "PoolCreated":
+                return contract.events.PoolCreated.get_logs(from_block=start_block, to_block=end_block)
+            return []
+        except Exception as e:
+            msg = str(e)
+            print(f"{event_name} get_logs error [{start_block}-{end_block}]:", e)
+
+            if "429" in msg or "compute units per second" in msg:
+                time.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 2, RPC_BACKOFF_MAX_SECONDS)
+                continue
+
+            if "10 block range" in msg or "up to a 10 block range" in msg:
+                time.sleep(2)
+                return []
+
+            time.sleep(2)
+            return []
+
+
+# -------------------------
+# EVENT LISTENERS
+# -------------------------
+def v2_event_listener():
     last_block = safe_block_number()
     send("Listening for new V2 pairs...")
-
-    max_log_range = 10  # free-tier limit
 
     while True:
         try:
@@ -783,37 +877,14 @@ def event_listener():
                 start_block = last_block + 1
 
                 while start_block <= block:
-                    end_block = min(start_block + max_log_range - 1, block)
-
-                    try:
-                        events = factory.events.PairCreated.get_logs(
-                            from_block=start_block,
-                            to_block=end_block
-                        )
-                    except Exception as e:
-                        print(f"PairCreated get_logs error [{start_block}-{end_block}]:", e)
-                        time.sleep(2)
-                        break
+                    end_block = min(start_block + MAX_LOG_RANGE - 1, block)
+                    events = process_log_range_with_backoff(v2_factory, "PairCreated", start_block, end_block)
 
                     for e in events:
-                        try:
-                            token0 = e["args"]["token0"]
-                            token1 = e["args"]["token1"]
-                            pair = e["args"]["pair"]
-
-                            token = None
-                            if token0.lower() == WETH.lower():
-                                token = token1
-                            elif token1.lower() == WETH.lower():
-                                token = token0
-
-                            if token:
-                                process_pair(
-                                    Web3.to_checksum_address(token),
-                                    Web3.to_checksum_address(pair)
-                                )
-                        except Exception as inner_e:
-                            print("event parse error:", inner_e)
+                        parsed = parse_v2_event(e)
+                        if parsed:
+                            token, pair, source = parsed
+                            process_pool(token, pair, source)
 
                     start_block = end_block + 1
 
@@ -822,7 +893,39 @@ def event_listener():
             time.sleep(EVENT_POLL_SECONDS)
 
         except Exception as e:
-            print("event listener outer error:", e)
+            print("v2_event_listener outer error:", e)
+            time.sleep(5)
+
+
+def v3_event_listener():
+    last_block = safe_block_number()
+    send("Listening for new V3 pools...")
+
+    while True:
+        try:
+            block = safe_block_number(last_block)
+
+            if block > last_block:
+                start_block = last_block + 1
+
+                while start_block <= block:
+                    end_block = min(start_block + MAX_LOG_RANGE - 1, block)
+                    events = process_log_range_with_backoff(v3_factory, "PoolCreated", start_block, end_block)
+
+                    for e in events:
+                        parsed = parse_v3_event(e)
+                        if parsed:
+                            token, pair, source = parsed
+                            process_pool(token, pair, source)
+
+                    start_block = end_block + 1
+
+                last_block = block
+
+            time.sleep(EVENT_POLL_SECONDS)
+
+        except Exception as e:
+            print("v3_event_listener outer error:", e)
             time.sleep(5)
 
 
@@ -867,7 +970,9 @@ def heartbeat_loop():
             f"Mode {'LIVE' if RUN_PURCHASE == 'on' else 'PAPER'}\n"
             f"Paper Trades {len(PAPER_TRADES)}/{MAX_OPEN_TRADES}\n"
             f"Live Positions {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}\n"
-            f"Seen Pairs {len(SEEN_PAIRS)}"
+            f"Seen Pools {len(SEEN_POOLS)}\n"
+            f"V2 ON\n"
+            f"V3 ON"
         )
         time.sleep(HEARTBEAT_SECONDS)
 
@@ -885,10 +990,12 @@ def main():
         f"Age Limit {MAX_TOKEN_AGE_SECONDS}s\n"
         f"Entry Rules: volume there and sells exist\n"
         f"Security Rules: sell tax <= {MAX_SELL_TAX_PCT:.2f}% | buy tax <= {MAX_BUY_TAX_PCT:.2f}%\n"
-        f"Exit Rule: liquidity drop {LIQUIDITY_DROP_EXIT_PCT:.0f}%"
+        f"Exit Rule: liquidity drop {LIQUIDITY_DROP_EXIT_PCT:.0f}%\n"
+        f"Discovery: V2 + V3"
     )
 
-    threading.Thread(target=event_listener, daemon=True).start()
+    threading.Thread(target=v2_event_listener, daemon=True).start()
+    threading.Thread(target=v3_event_listener, daemon=True).start()
     threading.Thread(target=portfolio_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
 
