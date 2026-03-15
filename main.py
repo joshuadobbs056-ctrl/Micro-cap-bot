@@ -77,6 +77,11 @@ ALERT_NEW_PAIRS = os.getenv("ALERT_NEW_PAIRS", "true").lower() == "true"
 ALERT_TRACKING_START = os.getenv("ALERT_TRACKING_START", "true").lower() == "true"
 ALERT_REJECTIONS = os.getenv("ALERT_REJECTIONS", "true").lower() == "true"
 
+# debug
+DEBUG_DEX = os.getenv("DEBUG_DEX", "true").lower() == "true"
+DEBUG_EVENTS = os.getenv("DEBUG_EVENTS", "true").lower() == "true"
+DEBUG_DISCOVERY_ALERTS = os.getenv("DEBUG_DISCOVERY_ALERTS", "true").lower() == "true"
+
 # discovery sources
 ENABLE_UNISWAP_V2 = os.getenv("ENABLE_UNISWAP_V2", "true").lower() == "true"
 ENABLE_UNISWAP_V3 = os.getenv("ENABLE_UNISWAP_V3", "true").lower() == "true"
@@ -307,10 +312,14 @@ def fetch_dexscreener_by_pair(pair: str) -> dict:
 
     url = f"https://api.dexscreener.com/latest/dex/pairs/ethereum/{pair}"
     try:
+        if DEBUG_DEX:
+            print(f"DEX PAIR LOOKUP: {url}")
         r = requests.get(url, timeout=DEXSCREENER_TIMEOUT)
         data = r.json()
         pairs = data.get("pairs") or []
         if not pairs:
+            if DEBUG_DEX:
+                print(f"DEX PAIR LOOKUP EMPTY for {pair}")
             return {}
         p = pairs[0]
         return {
@@ -338,19 +347,34 @@ def fetch_dexscreener_candidates() -> list:
     if not ENABLE_DEXSCREENER_DISCOVERY:
         return []
 
-    queries = ["ethereum"]
+    # wider set of searches than just "ethereum"
+    queries = [
+        "WETH",
+        "ETH",
+        "USDC",
+        "USDT",
+        "new",
+        "uniswap",
+    ]
     results = []
 
     for q in queries:
         try:
             url = f"https://api.dexscreener.com/latest/dex/search?q={q}"
+            if DEBUG_DEX:
+                print(f"Calling DexScreener search API: {url}")
             r = requests.get(url, timeout=DEXSCREENER_TIMEOUT)
             data = r.json()
+
+            if DEBUG_DEX:
+                print(f"DexScreener raw keys for query {q}: {list(data.keys())}")
+                print(f"DexScreener raw pair count for query {q}: {len(data.get('pairs') or [])}")
+
             pairs = data.get("pairs") or []
 
             for p in pairs[:DEXS_SEARCH_LIMIT]:
-                chain_id = p.get("chainId", "")
-                if str(chain_id).lower() != "ethereum":
+                chain_id = str(p.get("chainId", "")).lower()
+                if chain_id != "ethereum":
                     continue
 
                 pair_addr = p.get("pairAddress", "")
@@ -386,7 +410,11 @@ def fetch_dexscreener_candidates() -> list:
     dedup = {}
     for item in results:
         dedup[item["pair_address"].lower()] = item
-    return list(dedup.values())
+
+    final_results = list(dedup.values())
+    if DEBUG_DEX:
+        print(f"DEX DISCOVERY FINAL COUNT: {len(final_results)}")
+    return final_results
 
 
 def dexscreener_passes(ds: dict) -> bool:
@@ -594,7 +622,6 @@ def process_pair(token: str, pair: str, source: str = "unknown", ds_hint: dict =
         try:
             ds = ds_hint or fetch_dexscreener_by_pair(pair)
             liquidity = get_liquidity(pair)
-
             liq_usd = safe_float((ds or {}).get("liquidity_usd"), 0.0)
 
             if ALERT_TRACKING_START:
@@ -615,7 +642,6 @@ Liquidity USD: {liq_usd:,.0f}"""
             else:
                 print(f"Tracking pair {pair} | liquidity_eth {liquidity:.4f} | liquidity_usd {liq_usd:.0f} | source {source}")
 
-            # accept either valid on-chain ETH liquidity OR valid DexScreener USD liquidity
             has_valid_eth_liquidity = liquidity > 0 and MIN_ETH_LIQUIDITY <= liquidity <= MAX_ETH_LIQUIDITY
             has_valid_usd_liquidity = liq_usd >= DEXS_MIN_LIQ_USD
 
@@ -706,7 +732,6 @@ Liquidity USD: {liq_usd:,.0f}"""
                 reject(symbol, f"unique buyers {unique} < {MONEY_MIN_UNIQUE_BUYERS}")
                 return
 
-            # if no ETH-side swap parsing worked, fall back to DexScreener buys count
             if buy_eth < MONEY_MIN_BUY_ETH:
                 ds_buys_5m = int((ds or {}).get("txns_5m_buys") or 0)
                 if ds_buys_5m < max(1, DEXS_MIN_BUYS_5M):
@@ -868,11 +893,22 @@ Pool
 
 
 def dexscreener_discovery_loop():
+    first_tick = True
+
     while True:
         try:
+            if DEBUG_DEX:
+                print("DEX LOOP TICK")
+            if DEBUG_DISCOVERY_ALERTS and first_tick:
+                send("🛰 DexScreener discovery loop entered")
+                first_tick = False
+
             candidates = fetch_dexscreener_candidates()
-            if candidates:
-                print(f"dexscreener discovery found {len(candidates)} candidate(s)")
+
+            if DEBUG_DEX:
+                print(f"DEX CANDIDATES FOUND: {len(candidates)}")
+            if DEBUG_DISCOVERY_ALERTS:
+                send(f"🛰 Dex candidates found: {len(candidates)}")
 
             for c in candidates:
                 pair = c["pair_address"]
@@ -915,6 +951,8 @@ Buys 5m: {int(c.get('txns_5m_buys') or 0)}"""
 
         except Exception as e:
             print("dexscreener discovery loop error", e)
+            if DEBUG_DISCOVERY_ALERTS:
+                send(f"❌ Dex discovery loop error: {e}")
 
         time.sleep(DEXSCREENER_POLL_SECONDS)
 
@@ -976,6 +1014,11 @@ USE_DEXSCREENER={format_bool(USE_DEXSCREENER)}
 DEXS_MIN_LIQ_USD={DEXS_MIN_LIQ_USD}
 DEXS_MIN_BUYS_5M={DEXS_MIN_BUYS_5M}
 
+Debug
+DEBUG_DEX={format_bool(DEBUG_DEX)}
+DEBUG_EVENTS={format_bool(DEBUG_EVENTS)}
+DEBUG_DISCOVERY_ALERTS={format_bool(DEBUG_DISCOVERY_ALERTS)}
+
 Proof Of Life
 ALERT_NEW_PAIRS={format_bool(ALERT_NEW_PAIRS)}
 ALERT_TRACKING_START={format_bool(ALERT_TRACKING_START)}
@@ -985,11 +1028,14 @@ HEARTBEAT_SECONDS={HEARTBEAT_SECONDS}
 """
     )
 
+    send("✅ Main started")
+
     if SEND_STARTUP_HEARTBEAT:
         threading.Thread(target=heartbeat_loop, daemon=True).start()
 
     if ENABLE_DEXSCREENER_DISCOVERY:
         threading.Thread(target=dexscreener_discovery_loop, daemon=True).start()
+        send("✅ Dex thread started")
 
     last_v2_block = w3.eth.block_number
     last_v3_block = last_v2_block
@@ -1004,6 +1050,8 @@ HEARTBEAT_SECONDS={HEARTBEAT_SECONDS}
                     to_block=block,
                 )
 
+                if DEBUG_EVENTS:
+                    print(f"V2 event count: {len(events)}")
                 if events:
                     send(f"📡 Found {len(events)} new V2 pair(s) between blocks {last_v2_block + 1} and {block}")
 
@@ -1018,6 +1066,8 @@ HEARTBEAT_SECONDS={HEARTBEAT_SECONDS}
                     to_block=block,
                 )
 
+                if DEBUG_EVENTS:
+                    print(f"V3 event count: {len(events)}")
                 if events:
                     send(f"📡 Found {len(events)} new V3 pool(s) between blocks {last_v3_block + 1} and {block}")
 
