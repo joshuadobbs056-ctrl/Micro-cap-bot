@@ -42,6 +42,7 @@ MAX_ETH_LIQUIDITY = float(os.getenv("MAX_ETH_LIQUIDITY", "120"))
 TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "30"))
 PAIR_POLL_SECONDS = float(os.getenv("PAIR_POLL_SECONDS", "1.5"))
 BLOCK_POLL_SECONDS = float(os.getenv("BLOCK_POLL_SECONDS", "2"))
+DEXSCREENER_POLL_SECONDS = float(os.getenv("DEXSCREENER_POLL_SECONDS", "20"))
 
 MONEY_MIN_BUYS = int(os.getenv("MONEY_MIN_BUYS", "1"))
 MONEY_MIN_UNIQUE_BUYERS = int(os.getenv("MONEY_MIN_UNIQUE_BUYERS", "1"))
@@ -65,6 +66,8 @@ DEXSCREENER_TIMEOUT = int(os.getenv("DEXSCREENER_TIMEOUT", "10"))
 DEXS_MIN_LIQ_USD = float(os.getenv("DEXS_MIN_LIQ_USD", "0"))
 DEXS_MIN_BUYS_5M = int(os.getenv("DEXS_MIN_BUYS_5M", "0"))
 DEXS_REQUIRE_PAIR_FOUND = os.getenv("DEXS_REQUIRE_PAIR_FOUND", "false").lower() == "true"
+DEXS_MAX_AGE_MINUTES = int(os.getenv("DEXS_MAX_AGE_MINUTES", "240"))
+DEXS_SEARCH_LIMIT = int(os.getenv("DEXS_SEARCH_LIMIT", "8"))
 
 # proof-of-life
 SEND_STARTUP_HEARTBEAT = os.getenv("SEND_STARTUP_HEARTBEAT", "true").lower() == "true"
@@ -72,6 +75,11 @@ HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
 ALERT_NEW_PAIRS = os.getenv("ALERT_NEW_PAIRS", "true").lower() == "true"
 ALERT_TRACKING_START = os.getenv("ALERT_TRACKING_START", "true").lower() == "true"
 ALERT_REJECTIONS = os.getenv("ALERT_REJECTIONS", "true").lower() == "true"
+
+# discovery sources
+ENABLE_UNISWAP_V2 = os.getenv("ENABLE_UNISWAP_V2", "true").lower() == "true"
+ENABLE_UNISWAP_V3 = os.getenv("ENABLE_UNISWAP_V3", "true").lower() == "true"
+ENABLE_DEXSCREENER_DISCOVERY = os.getenv("ENABLE_DEXSCREENER_DISCOVERY", "true").lower() == "true"
 
 
 # -------------------------
@@ -100,7 +108,11 @@ if PRIVATE_KEY:
 # CONSTANTS
 # -------------------------
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
-FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+USDC = Web3.to_checksum_address("0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+USDT = Web3.to_checksum_address("0xdAC17F958D2ee523a2206206994597C13D831ec7")
+
+UNISWAP_V2_FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
+UNISWAP_V3_FACTORY = Web3.to_checksum_address("0x1F98431c8aD98523631AE4a59f267346ea31F984")
 
 
 # -------------------------
@@ -153,6 +165,22 @@ def reject(symbol: str, reason: str):
         send(msg)
     else:
         print(msg)
+
+
+def safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def parse_created_at_minutes(created_ms) -> float:
+    try:
+        if created_ms is None:
+            return 999999.0
+        return (now_ts() * 1000.0 - float(created_ms)) / 60000.0
+    except Exception:
+        return 999999.0
 
 
 # -------------------------
@@ -278,6 +306,7 @@ def fetch_dexscreener_by_pair(pair: str) -> dict:
         p = pairs[0]
         return {
             "pair_address": p.get("pairAddress", ""),
+            "base_address": ((p.get("baseToken") or {}).get("address") or ""),
             "base_symbol": ((p.get("baseToken") or {}).get("symbol") or ""),
             "quote_symbol": ((p.get("quoteToken") or {}).get("symbol") or ""),
             "price_usd": p.get("priceUsd"),
@@ -288,10 +317,68 @@ def fetch_dexscreener_by_pair(pair: str) -> dict:
             "volume_5m": ((p.get("volume") or {}).get("m5")),
             "price_change_5m": ((p.get("priceChange") or {}).get("m5")),
             "url": p.get("url", ""),
+            "created_at_ms": p.get("pairCreatedAt"),
+            "dex_id": p.get("dexId", ""),
         }
     except Exception as e:
-        print("dexscreener error:", e)
+        print("dexscreener pair lookup error:", e)
         return {}
+
+
+def fetch_dexscreener_candidates() -> list:
+    if not ENABLE_DEXSCREENER_DISCOVERY:
+        return []
+
+    queries = ["ethereum"]
+    results = []
+
+    for q in queries:
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/search?q={q}"
+            r = requests.get(url, timeout=DEXSCREENER_TIMEOUT)
+            data = r.json()
+            pairs = data.get("pairs") or []
+
+            for p in pairs[:DEXS_SEARCH_LIMIT]:
+                chain_id = p.get("chainId", "")
+                if str(chain_id).lower() != "ethereum":
+                    continue
+
+                pair_addr = p.get("pairAddress", "")
+                base_addr = ((p.get("baseToken") or {}).get("address") or "")
+                if not pair_addr or not base_addr:
+                    continue
+
+                created_mins = parse_created_at_minutes(p.get("pairCreatedAt"))
+                if created_mins > DEXS_MAX_AGE_MINUTES:
+                    continue
+
+                results.append(
+                    {
+                        "pair_address": pair_addr,
+                        "base_address": base_addr,
+                        "base_symbol": ((p.get("baseToken") or {}).get("symbol") or ""),
+                        "quote_symbol": ((p.get("quoteToken") or {}).get("symbol") or ""),
+                        "price_usd": p.get("priceUsd"),
+                        "fdv": p.get("fdv"),
+                        "liquidity_usd": ((p.get("liquidity") or {}).get("usd")),
+                        "txns_5m_buys": (((p.get("txns") or {}).get("m5") or {}).get("buys")),
+                        "txns_5m_sells": (((p.get("txns") or {}).get("m5") or {}).get("sells")),
+                        "volume_5m": ((p.get("volume") or {}).get("m5")),
+                        "price_change_5m": ((p.get("priceChange") or {}).get("m5")),
+                        "url": p.get("url", ""),
+                        "created_at_ms": p.get("pairCreatedAt"),
+                        "dex_id": p.get("dexId", ""),
+                    }
+                )
+        except Exception as e:
+            print("dexscreener discovery error:", e)
+
+    # de-dupe by pair
+    dedup = {}
+    for item in results:
+        dedup[item["pair_address"].lower()] = item
+    return list(dedup.values())
 
 
 def dexscreener_passes(ds: dict) -> bool:
@@ -316,7 +403,7 @@ def dexscreener_passes(ds: dict) -> bool:
 # -------------------------
 # ABIs
 # -------------------------
-FACTORY_ABI = [
+UNISWAP_V2_FACTORY_ABI = [
     {
         "anonymous": False,
         "inputs": [
@@ -325,6 +412,21 @@ FACTORY_ABI = [
             {"indexed": False, "name": "pair", "type": "address"},
         ],
         "name": "PairCreated",
+        "type": "event",
+    }
+]
+
+UNISWAP_V3_FACTORY_ABI = [
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "name": "token0", "type": "address"},
+            {"indexed": True, "name": "token1", "type": "address"},
+            {"indexed": True, "name": "fee", "type": "uint24"},
+            {"indexed": False, "name": "tickSpacing", "type": "int24"},
+            {"indexed": False, "name": "pool", "type": "address"},
+        ],
+        "name": "PoolCreated",
         "type": "event",
     }
 ]
@@ -387,7 +489,8 @@ ERC20_ABI = [
     },
 ]
 
-factory = w3.eth.contract(address=FACTORY, abi=FACTORY_ABI)
+v2_factory = w3.eth.contract(address=UNISWAP_V2_FACTORY, abi=UNISWAP_V2_FACTORY_ABI)
+v3_factory = w3.eth.contract(address=UNISWAP_V3_FACTORY, abi=UNISWAP_V3_FACTORY_ABI)
 
 
 # -------------------------
@@ -453,14 +556,32 @@ def parse_swap_direction(args: dict, token0: str, token1: str):
     return None, 0.0, ""
 
 
+def quote_is_major(token: str) -> bool:
+    t = str(token).lower()
+    return t in {WETH.lower(), USDC.lower(), USDT.lower()}
+
+
 # -------------------------
 # TRACK TOKEN
 # -------------------------
 ACTIVE_PAIRS = set()
 ACTIVE_PAIRS_LOCK = threading.Lock()
+SEEN_DISCOVERY = set()
+SEEN_DISCOVERY_LOCK = threading.Lock()
 
 
-def process_pair(token: str, pair: str):
+def mark_seen(key: str) -> bool:
+    with SEEN_DISCOVERY_LOCK:
+        if key in SEEN_DISCOVERY:
+            return False
+        SEEN_DISCOVERY.add(key)
+        return True
+
+
+def process_pair(token: str, pair: str, source: str = "unknown", ds_hint: dict = None):
+    pair = Web3.to_checksum_address(pair)
+    token = Web3.to_checksum_address(token)
+
     with ACTIVE_PAIRS_LOCK:
         if pair in ACTIVE_PAIRS:
             return
@@ -474,6 +595,8 @@ def process_pair(token: str, pair: str):
                 send(
                     f"""🔎 TRACKING STARTED
 
+Source: {source}
+
 Pair
 {pair}
 
@@ -483,7 +606,7 @@ Token
 Liquidity: {liquidity:.4f} ETH"""
                 )
             else:
-                print(f"Tracking pair {pair} | liquidity {liquidity:.4f} ETH")
+                print(f"Tracking pair {pair} | liquidity {liquidity:.4f} ETH | source {source}")
 
             if liquidity < MIN_ETH_LIQUIDITY or liquidity > MAX_ETH_LIQUIDITY:
                 reject("UNKNOWN", f"liquidity {liquidity:.4f} not in range {MIN_ETH_LIQUIDITY}-{MAX_ETH_LIQUIDITY}")
@@ -584,7 +707,7 @@ Liquidity: {liquidity:.4f} ETH"""
                 reject(symbol, f"top buyer share {top_buyer_share:.2%} > {MAX_TOP_BUYER_SHARE:.2%}")
                 return
 
-            ds = fetch_dexscreener_by_pair(pair)
+            ds = ds_hint or fetch_dexscreener_by_pair(pair)
             if not dexscreener_passes(ds):
                 reject(symbol, "failed DexScreener confirmation")
                 return
@@ -603,6 +726,7 @@ Sells 5m: {int(ds.get('txns_5m_sells') or 0)}
 Volume 5m: {float(ds.get('volume_5m') or 0):,.0f}
 Price Change 5m: {float(ds.get('price_change_5m') or 0):.2f}%
 FDV: {float(ds.get('fdv') or 0):,.0f}
+Dex ID: {ds.get('dex_id') or ''}
 """
 
             send(
@@ -610,6 +734,7 @@ FDV: {float(ds.get('fdv') or 0):,.0f}
 
 {name} ({symbol})
 
+Source: {source}
 Liquidity: {liquidity:.2f} ETH
 Buys: {buy_count}
 Sells: {sell_count}
@@ -648,9 +773,9 @@ DexScreener
 
 
 # -------------------------
-# HANDLE EVENT
+# DISCOVERY HANDLERS
 # -------------------------
-def handle_event(e):
+def handle_v2_event(e):
     try:
         t0 = e["args"]["token0"]
         t1 = e["args"]["token1"]
@@ -667,9 +792,12 @@ def handle_event(e):
             token = Web3.to_checksum_address(token)
             pair = Web3.to_checksum_address(pair)
 
+            if not mark_seen(f"pair:{pair.lower()}"):
+                return
+
             if ALERT_NEW_PAIRS:
                 send(
-                    f"""🆕 NEW PAIR DETECTED
+                    f"""🆕 NEW V2 PAIR DETECTED
 
 Token
 {token}
@@ -678,11 +806,106 @@ Pair
 {pair}"""
                 )
 
-            process_pair(token, pair)
-
+            process_pair(token, pair, source="uniswap_v2")
     except Exception as ex:
-        send(f"handle_event error: {ex}")
-        print("handle_event error:", ex)
+        send(f"handle_v2_event error: {ex}")
+        print("handle_v2_event error:", ex)
+
+
+def handle_v3_event(e):
+    try:
+        t0 = e["args"]["token0"]
+        t1 = e["args"]["token1"]
+        pool = e["args"]["pool"]
+        fee = e["args"]["fee"]
+
+        token = None
+
+        if str(t0).lower() == WETH.lower():
+            token = t1
+        elif str(t1).lower() == WETH.lower():
+            token = t0
+        else:
+            return
+
+        token = Web3.to_checksum_address(token)
+        pool = Web3.to_checksum_address(pool)
+
+        if not mark_seen(f"pair:{pool.lower()}"):
+            return
+
+        if ALERT_NEW_PAIRS:
+            send(
+                f"""🆕 NEW V3 POOL DETECTED
+
+Fee: {fee}
+
+Token
+{token}
+
+Pool
+{pool}"""
+            )
+
+        # We still try to process it through the same engine.
+        # Some V3 pools will not support V2-style reserve reads, so many will reject on liquidity.
+        process_pair(token, pool, source="uniswap_v3")
+    except Exception as ex:
+        send(f"handle_v3_event error: {ex}")
+        print("handle_v3_event error:", ex)
+
+
+def dexscreener_discovery_loop():
+    while True:
+        try:
+            candidates = fetch_dexscreener_candidates()
+            if candidates:
+                print(f"dexscreener discovery found {len(candidates)} candidate(s)")
+
+            for c in candidates:
+                pair = c["pair_address"]
+                token = c["base_address"]
+
+                if not pair or not token:
+                    continue
+
+                # only consider major-quote pairs
+                quote_symbol = (c.get("quote_symbol") or "").upper()
+                if quote_symbol not in {"WETH", "ETH", "USDC", "USDT"}:
+                    continue
+
+                if not mark_seen(f"pair:{pair.lower()}"):
+                    continue
+
+                if ALERT_NEW_PAIRS:
+                    send(
+                        f"""🆕 DEXSCREENER CANDIDATE DETECTED
+
+Token
+{token}
+
+Pair
+{pair}
+
+Created minutes ago: {parse_created_at_minutes(c.get('created_at_ms')):.1f}
+Liquidity USD: {safe_float(c.get('liquidity_usd')):,.0f}
+Buys 5m: {int(c.get('txns_5m_buys') or 0)}"""
+                    )
+
+                try:
+                    process_pair(
+                        Web3.to_checksum_address(token),
+                        Web3.to_checksum_address(pair),
+                        source="dexscreener",
+                        ds_hint=c,
+                    )
+                except Exception as e:
+                    print("dexscreener candidate process error:", e)
+
+        except Exception as e:
+            print("dexscreener discovery loop error", e)
+
+        time.sleep(DEXSCREENER_POLL_SECONDS)
 
 
 # -------------------------
@@ -700,6 +923,10 @@ Current block: {w3.eth.block_number}
 Mode: {"LIVE" if purchases_enabled() else "PAPER"}
 Active pair trackers: {len(ACTIVE_PAIRS)}
 Open paper trades: {len(PAPER_TRADES)}
+Seen discoveries: {len(SEEN_DISCOVERY)}
+V2: {format_bool(ENABLE_UNISWAP_V2)}
+V3: {format_bool(ENABLE_UNISWAP_V3)}
+DexScreener discovery: {format_bool(ENABLE_DEXSCREENER_DISCOVERY)}
 """
             )
         except Exception as e:
@@ -726,7 +953,14 @@ MONEY_MIN_BUYER_VELOCITY={MONEY_MIN_BUYER_VELOCITY}
 MAX_TOP_BUYER_SHARE={MAX_TOP_BUYER_SHARE}
 TRACK_SECONDS={TRACK_SECONDS}
 
-DexScreener
+Discovery Sources
+ENABLE_UNISWAP_V2={format_bool(ENABLE_UNISWAP_V2)}
+ENABLE_UNISWAP_V3={format_bool(ENABLE_UNISWAP_V3)}
+ENABLE_DEXSCREENER_DISCOVERY={format_bool(ENABLE_DEXSCREENER_DISCOVERY)}
+DEXSCREENER_POLL_SECONDS={DEXSCREENER_POLL_SECONDS}
+DEXS_MAX_AGE_MINUTES={DEXS_MAX_AGE_MINUTES}
+
+DexScreener Filters
 USE_DEXSCREENER={format_bool(USE_DEXSCREENER)}
 DEXS_MIN_LIQ_USD={DEXS_MIN_LIQ_USD}
 DEXS_MIN_BUYS_5M={DEXS_MIN_BUYS_5M}
@@ -743,25 +977,43 @@ HEARTBEAT_SECONDS={HEARTBEAT_SECONDS}
     if SEND_STARTUP_HEARTBEAT:
         threading.Thread(target=heartbeat_loop, daemon=True).start()
 
-    last_block = w3.eth.block_number
+    if ENABLE_DEXSCREENER_DISCOVERY:
+        threading.Thread(target=dexscreener_discovery_loop, daemon=True).start()
+
+    last_v2_block = w3.eth.block_number
+    last_v3_block = last_v2_block
 
     while True:
         try:
             block = w3.eth.block_number
 
-            if block > last_block:
-                events = factory.events.PairCreated.get_logs(
-                    from_block=last_block + 1,
+            if ENABLE_UNISWAP_V2 and block > last_v2_block:
+                events = v2_factory.events.PairCreated.get_logs(
+                    from_block=last_v2_block + 1,
                     to_block=block,
                 )
 
                 if events:
-                    send(f"📡 Found {len(events)} new pair(s) between blocks {last_block + 1} and {block}")
+                    send(f"📡 Found {len(events)} new V2 pair(s) between blocks {last_v2_block + 1} and {block}")
 
                 for e in events:
-                    handle_event(e)
+                    handle_v2_event(e)
 
-                last_block = block
+                last_v2_block = block
+
+            if ENABLE_UNISWAP_V3 and block > last_v3_block:
+                events = v3_factory.events.PoolCreated.get_logs(
+                    from_block=last_v3_block + 1,
+                    to_block=block,
+                )
+
+                if events:
+                    send(f"📡 Found {len(events)} new V3 pool(s) between blocks {last_v3_block + 1} and {block}")
+
+                for e in events:
+                    handle_v3_event(e)
+
+                last_v3_block = block
 
             time.sleep(BLOCK_POLL_SECONDS)
 
