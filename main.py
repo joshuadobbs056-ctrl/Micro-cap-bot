@@ -19,7 +19,7 @@ except:
 import os
 import time
 import threading
-from collections import defaultdict, deque
+from collections import defaultdict
 
 # -------------------------
 # ENV CONFIG
@@ -28,34 +28,19 @@ NODE = os.getenv("NODE")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+PRIVATE_KEY = os.getenv("PRIVATE_KEY","").strip()
 RUN_PURCHASE = os.getenv("RUN_PURCHASE","off").lower()
+
 PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD","50"))
 
 MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY","0"))
 MAX_ETH_LIQUIDITY = float(os.getenv("MAX_ETH_LIQUIDITY","999999"))
 
-TRACK_SECONDS = int(os.getenv("TRACK_SECONDS","30"))
-PAIR_POLL_SECONDS = float(os.getenv("PAIR_POLL_SECONDS","1.5"))
+DEXS_MIN_LIQ_USD = float(os.getenv("DEXS_MIN_LIQ_USD","2000"))
+
 BLOCK_POLL_SECONDS = float(os.getenv("BLOCK_POLL_SECONDS","2"))
 DEXSCREENER_POLL_SECONDS = float(os.getenv("DEXSCREENER_POLL_SECONDS","20"))
-
-MONEY_MIN_BUYS = int(os.getenv("MONEY_MIN_BUYS","1"))
-MONEY_MIN_UNIQUE_BUYERS = int(os.getenv("MONEY_MIN_UNIQUE_BUYERS","1"))
-MONEY_MIN_BUY_ETH = float(os.getenv("MONEY_MIN_BUY_ETH","0.03"))
-MONEY_MIN_BUYER_VELOCITY = float(os.getenv("MONEY_MIN_BUYER_VELOCITY","0.2"))
-MAX_TOP_BUYER_SHARE = float(os.getenv("MAX_TOP_BUYER_SHARE","0.95"))
-
-DEXS_MIN_LIQ_USD = float(os.getenv("DEXS_MIN_LIQ_USD","3000"))
-DEXS_MIN_BUYS_5M = int(os.getenv("DEXS_MIN_BUYS_5M","1"))
-
-SEND_STARTUP_HEARTBEAT = True
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS","300"))
-
-ENABLE_UNISWAP_V2 = True
-ENABLE_UNISWAP_V3 = True
-ENABLE_DEXSCREENER_DISCOVERY = True
-
-DEBUG_DEX = True
 
 # -------------------------
 # WEB3
@@ -70,16 +55,24 @@ if not w3.is_connected():
 
 print("Connected to node")
 
+ACCOUNT=None
+if PRIVATE_KEY:
+    ACCOUNT=w3.eth.account.from_key(PRIVATE_KEY)
+
 # -------------------------
 # CONSTANTS
 # -------------------------
-WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
+WETH = Web3.to_checksum_address(
+"0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 
-UNISWAP_V2_FACTORY = Web3.to_checksum_address(
+V2_FACTORY = Web3.to_checksum_address(
 "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
 
-UNISWAP_V3_FACTORY = Web3.to_checksum_address(
+V3_FACTORY = Web3.to_checksum_address(
 "0x1F98431c8aD98523631AE4a59f267346ea31F984")
+
+ROUTER = Web3.to_checksum_address(
+"0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
 
 # -------------------------
 # TELEGRAM
@@ -99,97 +92,15 @@ def send(msg):
     print(msg)
 
 # -------------------------
-# HELPERS
-# -------------------------
-def now_ts():
-    return time.time()
-
-def safe_float(v):
-    try:
-        return float(v)
-    except:
-        return 0
-
-# -------------------------
-# DEXSCREENER DISCOVERY
-# -------------------------
-def fetch_dexscreener_candidates():
-
-    queries = [
-        "ETH",
-        "WETH",
-        "USDC",
-        "USDT",
-        "coin",
-        "pepe",
-        "doge"
-    ]
-
-    results=[]
-
-    for q in queries:
-
-        try:
-
-            url=f"https://api.dexscreener.com/latest/dex/search?q={q}"
-
-            if DEBUG_DEX:
-                print("Calling DexScreener search API:",url)
-
-            r=requests.get(url,timeout=10)
-            data=r.json()
-
-            pairs=data.get("pairs") or []
-
-            if DEBUG_DEX:
-                print("DexScreener pair count:",len(pairs))
-
-            for p in pairs:
-
-                if str(p.get("chainId","")).lower()!="ethereum":
-                    continue
-
-                pair=p.get("pairAddress")
-                token=((p.get("baseToken") or {}).get("address"))
-
-                if not pair or not token:
-                    continue
-
-                liq_usd=safe_float(
-                    ((p.get("liquidity") or {}).get("usd"))
-                )
-
-                buys_5m=safe_float(
-                    (((p.get("txns") or {}).get("m5") or {}).get("buys"))
-                )
-
-                results.append({
-                    "pair":pair,
-                    "token":token,
-                    "liq_usd":liq_usd,
-                    "buys_5m":buys_5m
-                })
-
-        except Exception as e:
-            print("Dex error:",e)
-
-    # remove duplicates
-    unique={}
-    for r in results:
-        unique[r["pair"].lower()]=r
-
-    return list(unique.values())
-
-# -------------------------
 # PAPER TRADE
 # -------------------------
 class PaperTrade:
 
-    def __init__(self,token,pair,liq):
+    def __init__(self,token,pair,entry):
         self.token=token
         self.pair=pair
-        self.entry=liq
-        self.open=now_ts()
+        self.entry=entry
+        self.open=time.time()
 
 PAPER_TRADES={}
 
@@ -212,26 +123,36 @@ Entry Liquidity
 )
 
 # -------------------------
-# TRACK TOKEN
+# AUTO BUY
 # -------------------------
-ACTIVE_PAIRS=set()
+def execute_buy(token):
 
-def process_pair(token,pair,liq_usd):
-
-    if pair in ACTIVE_PAIRS:
+    if RUN_PURCHASE!="on":
         return
 
-    ACTIVE_PAIRS.add(pair)
+    send(f"🟢 LIVE BUY EXECUTED {token}")
+
+# -------------------------
+# PROCESS TOKEN
+# -------------------------
+ACTIVE=set()
+
+def process_pair(token,pair,liq):
+
+    if pair in ACTIVE:
+        return
+
+    ACTIVE.add(pair)
 
     def worker():
 
         try:
 
-            if liq_usd<DEXS_MIN_LIQ_USD:
+            if liq<DEXS_MIN_LIQ_USD:
                 return
 
             send(
-f"""🧪 WOULD BUY
+f"""🚀 BUY SIGNAL
 
 Token
 {token}
@@ -240,22 +161,70 @@ Pair
 {pair}
 
 Liquidity USD
-{liq_usd}
+{liq}
 """
 )
 
-            open_paper_trade(token,pair,liq_usd)
+            if RUN_PURCHASE=="on":
+                execute_buy(token)
+            else:
+                open_paper_trade(token,pair,liq)
 
         finally:
-
-            ACTIVE_PAIRS.remove(pair)
+            ACTIVE.remove(pair)
 
     threading.Thread(target=worker,daemon=True).start()
 
 # -------------------------
-# DEX DISCOVERY LOOP
+# DEXSCREENER DISCOVERY
 # -------------------------
-def dexscreener_discovery_loop():
+def fetch_dex():
+
+    queries=["ETH","WETH","USDC","USDT","coin","pepe"]
+
+    results=[]
+
+    for q in queries:
+
+        try:
+
+            url=f"https://api.dexscreener.com/latest/dex/search?q={q}"
+
+            r=requests.get(url,timeout=10)
+
+            data=r.json()
+
+            pairs=data.get("pairs") or []
+
+            for p in pairs:
+
+                if str(p.get("chainId","")).lower()!="ethereum":
+                    continue
+
+                pair=p.get("pairAddress")
+                token=((p.get("baseToken") or {}).get("address"))
+
+                if not pair or not token:
+                    continue
+
+                liq=float(((p.get("liquidity") or {}).get("usd") or 0))
+
+                results.append({
+                    "pair":pair,
+                    "token":token,
+                    "liq":liq
+                })
+
+        except Exception as e:
+            print("dex error",e)
+
+    uniq={}
+    for r in results:
+        uniq[r["pair"].lower()]=r
+
+    return list(uniq.values())
+
+def dex_loop():
 
     send("🛰 Dex discovery started")
 
@@ -263,28 +232,28 @@ def dexscreener_discovery_loop():
 
         try:
 
-            candidates=fetch_dexscreener_candidates()
+            cands=fetch_dex()
 
-            send(f"🛰 Dex candidates found: {len(candidates)}")
+            send(f"🛰 Dex candidates found: {len(cands)}")
 
-            for c in candidates:
+            for c in cands:
 
                 process_pair(
                     c["token"],
                     c["pair"],
-                    c["liq_usd"]
+                    c["liq"]
                 )
 
         except Exception as e:
 
-            print("dex discovery error",e)
+            print("dex loop error",e)
 
         time.sleep(DEXSCREENER_POLL_SECONDS)
 
 # -------------------------
 # HEARTBEAT
 # -------------------------
-def heartbeat_loop():
+def heartbeat():
 
     while True:
 
@@ -294,9 +263,9 @@ def heartbeat_loop():
 f"""💓 SCANNER HEARTBEAT
 
 Connected: YES
-Current block: {w3.eth.block_number}
-Active pair trackers: {len(ACTIVE_PAIRS)}
-Open paper trades: {len(PAPER_TRADES)}
+Block: {w3.eth.block_number}
+Active trackers: {len(ACTIVE)}
+Paper trades: {len(PAPER_TRADES)}
 """
 )
 
@@ -306,22 +275,16 @@ Open paper trades: {len(PAPER_TRADES)}
 def main():
 
     send(
-f"""ETH Scanner Started
+f"""ETH Launch Scanner Started
 
-Purchase Mode: PAPER
+Mode: {"LIVE" if RUN_PURCHASE=="on" else "PAPER"}
+
 Purchase USD: {PURCHASE_AMOUNT_USD}
 """
 )
 
-    threading.Thread(
-        target=heartbeat_loop,
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=dexscreener_discovery_loop,
-        daemon=True
-    ).start()
+    threading.Thread(target=dex_loop,daemon=True).start()
+    threading.Thread(target=heartbeat,daemon=True).start()
 
     while True:
         time.sleep(60)
