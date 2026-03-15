@@ -1,25 +1,28 @@
 import subprocess
 import sys
 
+
 def install(package: str):
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
+
 try:
     import requests
-except:
+except Exception:
     install("requests")
     import requests
 
 try:
     from web3 import Web3
-except:
+except Exception:
     install("web3")
     from web3 import Web3
 
 import os
 import time
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
+
 
 # -------------------------
 # ENV CONFIG
@@ -28,25 +31,29 @@ NODE = os.getenv("NODE")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-PRIVATE_KEY = os.getenv("PRIVATE_KEY","").strip()
-RUN_PURCHASE = os.getenv("RUN_PURCHASE","off").lower()
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
+RUN_PURCHASE = os.getenv("RUN_PURCHASE", "off").lower()
 
-PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD","50"))
+PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD", "50"))
 
-MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY","1.5"))
-MAX_ETH_LIQUIDITY = float(os.getenv("MAX_ETH_LIQUIDITY","40"))
+MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY", "1.0"))
+MAX_ETH_LIQUIDITY = float(os.getenv("MAX_ETH_LIQUIDITY", "60"))
 
-TRACK_SECONDS = int(os.getenv("TRACK_SECONDS","60"))
-PAIR_POLL_SECONDS = float(os.getenv("PAIR_POLL_SECONDS","1.5"))
+TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "45"))
+PAIR_POLL_SECONDS = float(os.getenv("PAIR_POLL_SECONDS", "1.5"))
+BLOCK_POLL_SECONDS = float(os.getenv("BLOCK_POLL_SECONDS", "2"))
 
-MONEY_MIN_BUYS = int(os.getenv("MONEY_MIN_BUYS","3"))
-MONEY_MIN_UNIQUE_BUYERS = int(os.getenv("MONEY_MIN_UNIQUE_BUYERS","3"))
-MONEY_MIN_BUY_ETH = float(os.getenv("MONEY_MIN_BUY_ETH","0.4"))
-MONEY_MIN_BUYER_VELOCITY = float(os.getenv("MONEY_MIN_BUYER_VELOCITY","1.5"))
+MONEY_MIN_BUYS = int(os.getenv("MONEY_MIN_BUYS", "2"))
+MONEY_MIN_UNIQUE_BUYERS = int(os.getenv("MONEY_MIN_UNIQUE_BUYERS", "2"))
+MONEY_MIN_BUY_ETH = float(os.getenv("MONEY_MIN_BUY_ETH", "0.15"))
+MONEY_MIN_BUYER_VELOCITY = float(os.getenv("MONEY_MIN_BUYER_VELOCITY", "0.8"))
 
-MAX_TOP_BUYER_SHARE = float(os.getenv("MAX_TOP_BUYER_SHARE","0.60"))
+MAX_TOP_BUYER_SHARE = float(os.getenv("MAX_TOP_BUYER_SHARE", "0.80"))
 
-BLOCK_POLL_SECONDS = float(os.getenv("BLOCK_POLL_SECONDS","2"))
+# paper trade settings
+PAPER_TRADE_HOLD_SECONDS = int(os.getenv("PAPER_TRADE_HOLD_SECONDS", "180"))
+PAPER_MIN_PROFIT_PCT = float(os.getenv("PAPER_MIN_PROFIT_PCT", "15"))
+PAPER_STOP_LOSS_PCT = float(os.getenv("PAPER_STOP_LOSS_PCT", "-15"))
 
 # -------------------------
 # WEB3
@@ -63,7 +70,12 @@ print("Connected to node")
 
 ACCOUNT = None
 if PRIVATE_KEY:
-    ACCOUNT = w3.eth.account.from_key(PRIVATE_KEY)
+    try:
+        ACCOUNT = w3.eth.account.from_key(PRIVATE_KEY)
+        print(f"Loaded wallet: {ACCOUNT.address}")
+    except Exception as e:
+        raise RuntimeError(f"Bad PRIVATE_KEY: {e}")
+
 
 # -------------------------
 # CONSTANTS
@@ -71,216 +83,415 @@ if PRIVATE_KEY:
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
 
+
 # -------------------------
 # TELEGRAM
 # -------------------------
-def send(msg):
-
+def send(msg: str):
     if TELEGRAM_TOKEN and CHAT_ID:
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                data={"chat_id":CHAT_ID,"text":msg},
-                timeout=10
+                data={
+                    "chat_id": CHAT_ID,
+                    "text": msg,
+                    "disable_web_page_preview": True,
+                },
+                timeout=10,
             )
-        except:
-            pass
+        except Exception as e:
+            print("Telegram error:", e)
 
     print(msg)
+
+
+# -------------------------
+# HELPERS
+# -------------------------
+def now_ts() -> float:
+    return time.time()
+
+
+def format_bool(v: bool) -> str:
+    return "ON" if v else "OFF"
+
+
+def purchases_enabled() -> bool:
+    return RUN_PURCHASE == "on" and ACCOUNT is not None
+
+
+def dextools_link(pair: str) -> str:
+    return f"https://www.dextools.io/app/en/ether/pair-explorer/{pair}"
+
+
+def dexscreener_link(pair: str) -> str:
+    return f"https://dexscreener.com/ethereum/{pair}"
+
 
 # -------------------------
 # PAPER TRADE
 # -------------------------
 class PaperTrade:
+    def __init__(self, token: str, name: str, symbol: str, entry_eth: float, pair: str):
+        self.token = token
+        self.name = name
+        self.symbol = symbol
+        self.entry = entry_eth
+        self.pair = pair
+        self.open = now_ts()
 
-    def __init__(self,token,name,symbol,entry_eth):
-        self.token=token
-        self.name=name
-        self.symbol=symbol
-        self.entry=entry_eth
-        self.open=time.time()
 
-PAPER_TRADES={}
+PAPER_TRADES = {}
+PAPER_LOCK = threading.Lock()
 
-def open_paper_trade(token,name,symbol,eth):
 
-    PAPER_TRADES[token]=PaperTrade(token,name,symbol,eth)
+def open_paper_trade(token: str, name: str, symbol: str, entry_eth: float, pair: str):
+    with PAPER_LOCK:
+        if token in PAPER_TRADES:
+            return
+        PAPER_TRADES[token] = PaperTrade(token, name, symbol, entry_eth, pair)
 
     send(
-f"""🧪 PAPER TRADE OPENED
+        f"""🧪 PAPER TRADE OPENED
 
 {name} ({symbol})
 
-Entry: {eth:.4f} ETH
-"""
-)
+Entry: {entry_eth:.4f} ETH
+Token
+{token}
 
-def close_paper_trade(token,exit_eth):
+Pair
+{pair}"""
+    )
 
-    trade=PAPER_TRADES.get(token)
-    if not trade:
-        return
+    threading.Thread(target=monitor_paper_trade, args=(token,), daemon=True).start()
 
-    pnl=(exit_eth/trade.entry-1)*100
 
-    send(
-f"""🧪 PAPER TRADE CLOSED
+def close_paper_trade(token: str, exit_eth: float, reason: str):
+    with PAPER_LOCK:
+        trade = PAPER_TRADES.get(token)
+        if not trade:
+            return
+
+        pnl = ((exit_eth / trade.entry) - 1.0) * 100 if trade.entry > 0 else 0.0
+
+        send(
+            f"""🧪 PAPER TRADE CLOSED
 
 {trade.name} ({trade.symbol})
 
+Reason: {reason}
 Entry: {trade.entry:.4f}
 Exit: {exit_eth:.4f}
 
 PnL: {pnl:.2f}%"""
-)
+        )
 
-    del PAPER_TRADES[token]
+        del PAPER_TRADES[token]
+
+
+def monitor_paper_trade(token: str):
+    time.sleep(PAPER_TRADE_HOLD_SECONDS)
+
+    with PAPER_LOCK:
+        trade = PAPER_TRADES.get(token)
+        if not trade:
+            return
+
+    # very simple paper exit approximation:
+    # use liquidity change as proxy since full quote routing is not implemented here
+    current_liq = get_liquidity(trade.pair)
+    if current_liq <= 0:
+        exit_eth = trade.entry * 0.50
+        reason = "liquidity vanished"
+    else:
+        entry_liq = max(trade.entry, 0.0001)
+        ratio = current_liq / entry_liq
+
+        # clamp rough estimate
+        ratio = max(0.25, min(ratio, 3.0))
+        exit_eth = trade.entry * ratio
+
+        pnl_pct = ((exit_eth / trade.entry) - 1.0) * 100.0
+        if pnl_pct >= PAPER_MIN_PROFIT_PCT:
+            reason = "paper take profit window"
+        elif pnl_pct <= PAPER_STOP_LOSS_PCT:
+            reason = "paper stop loss window"
+        else:
+            reason = "paper timed exit"
+
+    close_paper_trade(token, exit_eth, reason)
+
 
 # -------------------------
 # SMART WALLET MEMORY
 # -------------------------
-SMART_WALLETS=set()
+SMART_WALLETS = set()
 
-def remember_wallet(wallet,profit_pct):
 
-    if profit_pct>200:
-        SMART_WALLETS.add(wallet)
+def remember_wallet(wallet: str, profit_pct: float):
+    if wallet and profit_pct > 200:
+        SMART_WALLETS.add(wallet.lower())
 
-def wallet_is_smart(wallet):
-    return wallet in SMART_WALLETS
+
+def wallet_is_smart(wallet: str) -> bool:
+    return bool(wallet) and wallet.lower() in SMART_WALLETS
+
 
 # -------------------------
 # ABIs
 # -------------------------
-FACTORY_ABI=[{
-"name":"PairCreated",
-"type":"event",
-"inputs":[
-{"indexed":True,"name":"token0","type":"address"},
-{"indexed":True,"name":"token1","type":"address"},
-{"indexed":False,"name":"pair","type":"address"}
-]
-}]
-
-PAIR_ABI=[
-{"name":"getReserves","outputs":[
-{"type":"uint112"},
-{"type":"uint112"},
-{"type":"uint32"}],
-"inputs":[],
-"stateMutability":"view",
-"type":"function"
-},
-{"name":"token0","outputs":[{"type":"address"}],"inputs":[],"stateMutability":"view","type":"function"},
-{"name":"token1","outputs":[{"type":"address"}],"inputs":[],"stateMutability":"view","type":"function"}
+FACTORY_ABI = [
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "name": "token0", "type": "address"},
+            {"indexed": True, "name": "token1", "type": "address"},
+            {"indexed": False, "name": "pair", "type": "address"},
+        ],
+        "name": "PairCreated",
+        "type": "event",
+    }
 ]
 
-ERC20_ABI=[
-{"name":"name","outputs":[{"type":"string"}],"inputs":[],"stateMutability":"view","type":"function"},
-{"name":"symbol","outputs":[{"type":"string"}],"inputs":[],"stateMutability":"view","type":"function"}
+PAIR_ABI = [
+    {
+        "name": "getReserves",
+        "outputs": [
+            {"type": "uint112"},
+            {"type": "uint112"},
+            {"type": "uint32"},
+        ],
+        "inputs": [],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "name": "token0",
+        "outputs": [{"type": "address"}],
+        "inputs": [],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "name": "token1",
+        "outputs": [{"type": "address"}],
+        "inputs": [],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "name": "sender", "type": "address"},
+            {"indexed": False, "name": "amount0In", "type": "uint256"},
+            {"indexed": False, "name": "amount1In", "type": "uint256"},
+            {"indexed": False, "name": "amount0Out", "type": "uint256"},
+            {"indexed": False, "name": "amount1Out", "type": "uint256"},
+            {"indexed": True, "name": "to", "type": "address"},
+        ],
+        "name": "Swap",
+        "type": "event",
+    },
 ]
 
-factory=w3.eth.contract(address=FACTORY,abi=FACTORY_ABI)
+ERC20_ABI = [
+    {
+        "name": "name",
+        "outputs": [{"type": "string"}],
+        "inputs": [],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "name": "symbol",
+        "outputs": [{"type": "string"}],
+        "inputs": [],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+factory = w3.eth.contract(address=FACTORY, abi=FACTORY_ABI)
+
 
 # -------------------------
 # HELPERS
 # -------------------------
-def get_pair(pair):
-    return w3.eth.contract(address=pair,abi=PAIR_ABI)
+def get_pair(pair: str):
+    return w3.eth.contract(address=pair, abi=PAIR_ABI)
 
-def get_liquidity(pair):
 
+def get_liquidity(pair: str) -> float:
     try:
-        c=get_pair(pair)
-        r=c.functions.getReserves().call()
-        t0=c.functions.token0().call()
-        t1=c.functions.token1().call()
+        c = get_pair(pair)
+        r = c.functions.getReserves().call()
+        t0 = c.functions.token0().call()
+        t1 = c.functions.token1().call()
 
-        if t0.lower()==WETH.lower():
-            return float(w3.from_wei(r[0],"ether"))
+        if t0.lower() == WETH.lower():
+            return float(w3.from_wei(r[0], "ether"))
 
-        if t1.lower()==WETH.lower():
-            return float(w3.from_wei(r[1],"ether"))
+        if t1.lower() == WETH.lower():
+            return float(w3.from_wei(r[1], "ether"))
 
-    except:
+    except Exception:
         pass
 
-    return 0
+    return 0.0
 
-def token_info(token):
 
+def token_info(token: str):
     try:
-        c=w3.eth.contract(address=token,abi=ERC20_ABI)
-        return c.functions.name().call(),c.functions.symbol().call()
-    except:
-        return "Unknown","UNK"
+        c = w3.eth.contract(address=token, abi=ERC20_ABI)
+        return c.functions.name().call(), c.functions.symbol().call()
+    except Exception:
+        return "Unknown", "UNK"
+
+
+def parse_swap_direction(args: dict, token0: str, token1: str):
+    amount0_in = int(args.get("amount0In", 0))
+    amount1_in = int(args.get("amount1In", 0))
+    amount0_out = int(args.get("amount0Out", 0))
+    amount1_out = int(args.get("amount1Out", 0))
+
+    # WETH is token0
+    if token0.lower() == WETH.lower():
+        if amount0_in > 0 and amount1_out > 0:
+            eth_amount = float(w3.from_wei(amount0_in, "ether"))
+            buyer = args.get("to")
+            return "buy", eth_amount, str(buyer) if buyer else ""
+        if amount1_in > 0 and amount0_out > 0:
+            eth_amount = float(w3.from_wei(amount0_out, "ether"))
+            seller = args.get("sender")
+            return "sell", eth_amount, str(seller) if seller else ""
+
+    # WETH is token1
+    if token1.lower() == WETH.lower():
+        if amount1_in > 0 and amount0_out > 0:
+            eth_amount = float(w3.from_wei(amount1_in, "ether"))
+            buyer = args.get("to")
+            return "buy", eth_amount, str(buyer) if buyer else ""
+        if amount0_in > 0 and amount1_out > 0:
+            eth_amount = float(w3.from_wei(amount1_out, "ether"))
+            seller = args.get("sender")
+            return "sell", eth_amount, str(seller) if seller else ""
+
+    return None, 0.0, ""
+
 
 # -------------------------
 # TRACK TOKEN
 # -------------------------
-ACTIVE_PAIRS=set()
+ACTIVE_PAIRS = set()
+ACTIVE_PAIRS_LOCK = threading.Lock()
 
-def process_pair(token,pair):
 
-    if pair in ACTIVE_PAIRS:
-        return
-
-    ACTIVE_PAIRS.add(pair)
+def process_pair(token: str, pair: str):
+    with ACTIVE_PAIRS_LOCK:
+        if pair in ACTIVE_PAIRS:
+            return
+        ACTIVE_PAIRS.add(pair)
 
     def worker():
-
         try:
+            liquidity = get_liquidity(pair)
 
-            liquidity=get_liquidity(pair)
-
-            if liquidity<MIN_ETH_LIQUIDITY or liquidity>MAX_ETH_LIQUIDITY:
+            if liquidity < MIN_ETH_LIQUIDITY or liquidity > MAX_ETH_LIQUIDITY:
                 return
 
-            name,symbol=token_info(token)
+            name, symbol = token_info(token)
+            pair_contract = get_pair(pair)
+            token0 = pair_contract.functions.token0().call()
+            token1 = pair_contract.functions.token1().call()
 
-            buyers=set()
-            buyer_counts=defaultdict(int)
-            buy_eth=0
-            buy_count=0
+            buyers = set()
+            smart_buyers = set()
+            buyer_counts = defaultdict(int)
 
-            start=time.time()
+            buy_eth = 0.0
+            sell_eth = 0.0
+            buy_count = 0
+            sell_count = 0
 
-            while time.time()-start<TRACK_SECONDS:
+            start = now_ts()
+            start_block = w3.eth.block_number
 
-                # simplified scan placeholder
+            send(f"🔎 Tracking {name} ({symbol}) | Pair {pair}")
+
+            while now_ts() - start < TRACK_SECONDS:
+                try:
+                    current_block = w3.eth.block_number
+
+                    if current_block >= start_block:
+                        events = pair_contract.events.Swap.get_logs(
+                            from_block=start_block,
+                            to_block=current_block,
+                        )
+                        start_block = current_block + 1
+
+                        for ev in events:
+                            side, eth_amount, wallet = parse_swap_direction(
+                                ev["args"], token0, token1
+                            )
+
+                            if side == "buy":
+                                buy_count += 1
+                                buy_eth += eth_amount
+                                if wallet:
+                                    wallet = wallet.lower()
+                                    buyers.add(wallet)
+                                    buyer_counts[wallet] += 1
+                                    if wallet_is_smart(wallet):
+                                        smart_buyers.add(wallet)
+
+                            elif side == "sell":
+                                sell_count += 1
+                                sell_eth += eth_amount
+
+                except Exception as e:
+                    print(f"swap tracking error for {pair}: {e}")
+
                 time.sleep(PAIR_POLL_SECONDS)
 
-            unique=len(buyers)
+            unique = len(buyers)
+            velocity = unique / max(TRACK_SECONDS / 60.0, 0.01)
 
-            velocity=unique/(TRACK_SECONDS/60)
+            top_buyer_share = 0.0
+            if buy_count > 0 and buyer_counts:
+                top_buyer_share = max(buyer_counts.values()) / buy_count
 
-            if buy_count<MONEY_MIN_BUYS:
+            if buy_count < MONEY_MIN_BUYS:
                 return
 
-            if unique<MONEY_MIN_UNIQUE_BUYERS:
+            if unique < MONEY_MIN_UNIQUE_BUYERS:
                 return
 
-            if buy_eth<MONEY_MIN_BUY_ETH:
+            if buy_eth < MONEY_MIN_BUY_ETH:
                 return
 
-            if velocity<MONEY_MIN_BUYER_VELOCITY:
+            if velocity < MONEY_MIN_BUYER_VELOCITY:
                 return
 
-            smart_detected=False
-            for w in buyers:
-                if wallet_is_smart(w):
-                    smart_detected=True
+            if top_buyer_share > MAX_TOP_BUYER_SHARE:
+                return
 
-            mode="🧪 WOULD BUY" if RUN_PURCHASE!="on" else "🟢 BUY"
+            smart_detected = len(smart_buyers) > 0
+            mode = "🧪 WOULD BUY" if RUN_PURCHASE != "on" else "🟢 BUY"
 
             send(
-f"""{mode}
+                f"""{mode}
 
 {name} ({symbol})
 
 Liquidity: {liquidity:.2f} ETH
+Buys: {buy_count}
+Sells: {sell_count}
+Buy ETH: {buy_eth:.3f}
+Sell ETH: {sell_eth:.3f}
 Unique buyers: {unique}
 Velocity: {velocity:.2f}/min
+Top buyer share: {top_buyer_share:.0%}
 Smart wallets: {"YES" if smart_detected else "NO"}
 
 Token
@@ -288,82 +499,104 @@ Token
 
 Pair
 {pair}
-"""
-)
 
-            if RUN_PURCHASE!="on":
-                open_paper_trade(token,name,symbol,liquidity)
+DexTools
+{dextools_link(pair)}
+
+DexScreener
+{dexscreener_link(pair)}
+"""
+            )
+
+            if RUN_PURCHASE != "on":
+                # use buy_eth as rough entry strength instead of raw pool liquidity
+                rough_entry = max(min(buy_eth, 2.0), 0.05)
+                open_paper_trade(token, name, symbol, rough_entry, pair)
 
         finally:
-            ACTIVE_PAIRS.remove(pair)
+            with ACTIVE_PAIRS_LOCK:
+                ACTIVE_PAIRS.discard(pair)
 
-    threading.Thread(target=worker,daemon=True).start()
+    threading.Thread(target=worker, daemon=True).start()
+
 
 # -------------------------
 # HANDLE EVENT
 # -------------------------
 def handle_event(e):
+    try:
+        t0 = e["args"]["token0"]
+        t1 = e["args"]["token1"]
+        pair = e["args"]["pair"]
 
-    t0=e["args"]["token0"]
-    t1=e["args"]["token1"]
-    pair=e["args"]["pair"]
+        token = None
 
-    token=None
+        if str(t0).lower() == WETH.lower():
+            token = t1
 
-    if t0.lower()==WETH.lower():
-        token=t1
+        if str(t1).lower() == WETH.lower():
+            token = t0
 
-    if t1.lower()==WETH.lower():
-        token=t0
+        if token:
+            process_pair(
+                Web3.to_checksum_address(token),
+                Web3.to_checksum_address(pair),
+            )
+    except Exception as ex:
+        print("handle_event error:", ex)
 
-    if token:
-        process_pair(
-            Web3.to_checksum_address(token),
-            Web3.to_checksum_address(pair)
-        )
 
 # -------------------------
 # MAIN LOOP
 # -------------------------
 def main():
-
     send(
-f"""ETH Scanner Started
+        f"""ETH Scanner Started
 
-Purchase Mode: {"LIVE" if RUN_PURCHASE=="on" else "PAPER"}
-
+Purchase Mode: {"LIVE" if RUN_PURCHASE == "on" else "PAPER"}
 Purchase USD: {PURCHASE_AMOUNT_USD}
-"""
-)
 
-    last_block=w3.eth.block_number
+Filters
+MIN_ETH_LIQUIDITY={MIN_ETH_LIQUIDITY}
+MAX_ETH_LIQUIDITY={MAX_ETH_LIQUIDITY}
+MONEY_MIN_BUYS={MONEY_MIN_BUYS}
+MONEY_MIN_UNIQUE_BUYERS={MONEY_MIN_UNIQUE_BUYERS}
+MONEY_MIN_BUY_ETH={MONEY_MIN_BUY_ETH}
+MONEY_MIN_BUYER_VELOCITY={MONEY_MIN_BUYER_VELOCITY}
+MAX_TOP_BUYER_SHARE={MAX_TOP_BUYER_SHARE}
+TRACK_SECONDS={TRACK_SECONDS}
+"""
+    )
+
+    last_block = w3.eth.block_number
 
     while True:
-
         try:
+            block = w3.eth.block_number
 
-            block=w3.eth.block_number
-
-            if block>last_block:
-
-                events=factory.events.PairCreated.get_logs(
-                    from_block=last_block+1,
-                    to_block=block
+            if block > last_block:
+                events = factory.events.PairCreated.get_logs(
+                    from_block=last_block + 1,
+                    to_block=block,
                 )
+
+                if events:
+                    print(f"Found {len(events)} new pair(s) between {last_block+1} and {block}")
 
                 for e in events:
                     handle_event(e)
 
-                last_block=block
+                last_block = block
 
             time.sleep(BLOCK_POLL_SECONDS)
 
         except Exception as e:
-            print("loop error",e)
+            print("loop error", e)
             time.sleep(5)
+
 
 # -------------------------
 # START
 # -------------------------
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
