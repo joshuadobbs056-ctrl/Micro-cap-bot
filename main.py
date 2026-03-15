@@ -2,7 +2,7 @@ import subprocess
 import sys
 
 def install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+    subprocess.check_call([sys.executable,"-m","pip","install",package])
 
 try:
     import requests
@@ -21,7 +21,7 @@ import time
 import threading
 
 # -------------------------
-# ENV
+# ENV VARIABLES
 # -------------------------
 
 NODE=os.getenv("NODE")
@@ -40,23 +40,24 @@ PORTFOLIO_UPDATE_SECONDS=int(os.getenv("PORTFOLIO_UPDATE_SECONDS","30"))
 TAKE_PROFIT=float(os.getenv("TAKE_PROFIT","50"))
 STOP_LOSS=float(os.getenv("STOP_LOSS","-30"))
 
-MAX_TOKEN_AGE_SECONDS=300
-
 ACCOUNT_CASH=START_BALANCE
 
 # -------------------------
-# WEB3
+# WEB3 CONNECTION
 # -------------------------
 
 if not NODE:
     raise RuntimeError("NODE missing")
 
-w3=Web3(Web3.HTTPProvider(NODE))
+if NODE.startswith("ws"):
+    w3=Web3(Web3.WebsocketProvider(NODE))
+else:
+    w3=Web3(Web3.HTTPProvider(NODE))
 
 if not w3.is_connected():
-    raise RuntimeError("Node failed")
+    raise RuntimeError("Node connection failed")
 
-print("Connected")
+print("Connected to node")
 
 # -------------------------
 # CONSTANTS
@@ -104,7 +105,7 @@ def send(msg):
     print(msg)
 
 # -------------------------
-# PRICE FETCH
+# PRICE DATA
 # -------------------------
 
 def get_pair_data(pair):
@@ -130,17 +131,17 @@ def get_pair_data(pair):
         return None
 
 # -------------------------
-# PAPER TRADE
+# PAPER TRADE MODEL
 # -------------------------
 
 class PaperTrade:
 
-    def __init__(self,token,pair,price):
+    def __init__(self,token,pair,entry):
 
         self.token=token
         self.pair=pair
-        self.entry_price=price
-        self.tokens=PURCHASE_AMOUNT_USD/price
+        self.entry_price=entry
+        self.tokens=PURCHASE_AMOUNT_USD/entry
         self.open=time.time()
 
 PAPER_TRADES={}
@@ -176,17 +177,13 @@ f"""📊 PAPER TRADE UPDATE
 Token
 {trade.token}
 
-Entry
-${trade.entry_price}
+Entry ${trade.entry_price}
 
-Current
-${price}
+Current ${price}
 
-Value
-${value:.2f}
+Value ${value:.2f}
 
-PnL
-{pnl:.2f}%"""
+PnL {pnl:.2f}%"""
 )
 
         if pnl>=TAKE_PROFIT or pnl<=STOP_LOSS:
@@ -196,10 +193,10 @@ PnL
             send(
 f"""🧪 PAPER TRADE CLOSED
 
-Token
-{trade.token}
+Token {trade.token}
 
 Entry ${trade.entry_price}
+
 Exit ${price}
 
 Value ${value:.2f}
@@ -227,7 +224,7 @@ def open_trade(token,pair):
 
     if ACCOUNT_CASH<PURCHASE_AMOUNT_USD:
 
-        send("⚠️ Trade skipped — insufficient cash")
+        send("⚠️ Trade skipped — insufficient balance")
 
         return
 
@@ -247,18 +244,13 @@ def open_trade(token,pair):
     send(
 f"""🧪 PAPER TRADE OPENED
 
-Token
-{token}
+Token {token}
 
-Entry
-${price}
+Entry ${price}
 
-Tokens
-{trade.tokens}
+Tokens {trade.tokens}
 
-Open trades
-{len(PAPER_TRADES)}/{MAX_OPEN_TRADES}
-"""
+Open trades {len(PAPER_TRADES)}/{MAX_OPEN_TRADES}"""
 )
 
     threading.Thread(
@@ -268,7 +260,7 @@ Open trades
     ).start()
 
 # -------------------------
-# DISCOVERY
+# PROCESS NEW LAUNCH
 # -------------------------
 
 ACTIVE=set()
@@ -285,15 +277,9 @@ def process_pair(token,pair):
         send(
 f"""🚀 NEW LAUNCH DETECTED
 
-Token
-{token}
+Token {token}
 
-Pair
-{pair}
-
-Age
-< 5 minutes
-"""
+Pair {pair}"""
 )
 
         if RUN_PURCHASE=="on":
@@ -306,12 +292,14 @@ Age
         ACTIVE.remove(pair)
 
 # -------------------------
-# EVENT LOOP
+# EVENT LISTENER
 # -------------------------
 
-def event_loop():
+def event_listener():
 
     last_block=w3.eth.block_number
+
+    send("Listening for new pairs...")
 
     while True:
 
@@ -347,13 +335,13 @@ def event_loop():
 
             last_block=block
 
-        time.sleep(2)
+        time.sleep(1)
 
 # -------------------------
-# PORTFOLIO
+# PORTFOLIO LOOP
 # -------------------------
 
-def portfolio():
+def portfolio_loop():
 
     while True:
 
@@ -379,8 +367,7 @@ Profit ${pnl:.2f}
 
 Cash ${ACCOUNT_CASH:.2f}
 
-Open Trades {len(PAPER_TRADES)}
-"""
+Open Trades {len(PAPER_TRADES)}/{MAX_OPEN_TRADES}"""
 )
 
         time.sleep(PORTFOLIO_UPDATE_SECONDS)
@@ -394,15 +381,13 @@ def main():
     send(
 f"""Launch Sniper Started
 
-Mode: {"LIVE" if RUN_PURCHASE=="on" else "PAPER"}
+Mode {"LIVE" if RUN_PURCHASE=="on" else "PAPER"}
 
-Balance ${START_BALANCE}
-"""
+Balance ${START_BALANCE}"""
 )
 
-    threading.Thread(target=event_loop,daemon=True).start()
-
-    threading.Thread(target=portfolio,daemon=True).start()
+    threading.Thread(target=event_listener,daemon=True).start()
+    threading.Thread(target=portfolio_loop,daemon=True).start()
 
     while True:
         time.sleep(60)
