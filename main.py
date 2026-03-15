@@ -5,8 +5,10 @@ import threading
 import subprocess
 from typing import Optional, Dict, Any, Tuple
 
+
 def install(package: str):
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
 
 try:
     import requests
@@ -19,6 +21,7 @@ try:
 except Exception:
     install("web3")
     from web3 import Web3
+
 
 # -------------------------
 # ENV
@@ -65,6 +68,7 @@ GAS_LIMIT_SELL = int(os.getenv("GAS_LIMIT_SELL", "450000"))
 BUY_DEADLINE_SECONDS = int(os.getenv("BUY_DEADLINE_SECONDS", "180"))
 SELL_DEADLINE_SECONDS = int(os.getenv("SELL_DEADLINE_SECONDS", "180"))
 
+
 # -------------------------
 # WEB3
 # -------------------------
@@ -88,6 +92,7 @@ if PRIVATE_KEY:
         print(f"Loaded wallet: {ACCOUNT.address}")
     except Exception as e:
         raise RuntimeError(f"Bad PRIVATE_KEY: {e}")
+
 
 # -------------------------
 # CONSTANTS / ABIS
@@ -211,6 +216,7 @@ factory = w3.eth.contract(address=FACTORY, abi=FACTORY_ABI)
 router = w3.eth.contract(address=ROUTER, abi=ROUTER_ABI)
 eth_usd_feed = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=CHAINLINK_ETH_USD_ABI)
 
+
 # -------------------------
 # TELEGRAM
 # -------------------------
@@ -226,17 +232,20 @@ def send(msg: str):
             pass
     print(msg)
 
+
 # -------------------------
 # HELPERS
 # -------------------------
 def now_ts() -> float:
     return time.time()
 
+
 def safe_float(v: Any, default: float = 0.0) -> float:
     try:
         return float(v)
     except Exception:
         return default
+
 
 def safe_pct(value: Any, default: float = 999.0) -> float:
     try:
@@ -246,8 +255,18 @@ def safe_pct(value: Any, default: float = 999.0) -> float:
     except Exception:
         return default
 
+
+def safe_block_number(default: int = 0) -> int:
+    try:
+        return int(w3.eth.block_number)
+    except Exception as e:
+        print("safe_block_number error:", e)
+        return default
+
+
 def get_token_contract(token: str):
     return w3.eth.contract(address=Web3.to_checksum_address(token), abi=ERC20_ABI)
+
 
 def get_token_meta(token: str):
     try:
@@ -259,15 +278,22 @@ def get_token_meta(token: str):
     except Exception:
         return "Unknown", "UNK", 18
 
+
 def get_eth_usd_price() -> float:
-    data = eth_usd_feed.functions.latestRoundData().call()
-    return int(data[1]) / 10**8
+    try:
+        data = eth_usd_feed.functions.latestRoundData().call()
+        return int(data[1]) / 10**8
+    except Exception as e:
+        print("latestRoundData error:", e)
+        raise
+
 
 def usd_to_eth(usd_amount: float) -> float:
     eth_usd = get_eth_usd_price()
     if eth_usd <= 0:
         raise RuntimeError("ETH/USD price unavailable")
     return usd_amount / eth_usd
+
 
 def build_tx_params(wallet_address: str, nonce: int, gas: int, value: int = 0) -> dict:
     return {
@@ -278,6 +304,7 @@ def build_tx_params(wallet_address: str, nonce: int, gas: int, value: int = 0) -
         "gas": gas,
         "gasPrice": w3.eth.gas_price,
     }
+
 
 # -------------------------
 # SECURITY / TAX CHECK
@@ -291,6 +318,7 @@ def get_token_security(token: str) -> Optional[dict]:
         return result if isinstance(result, dict) else None
     except Exception:
         return None
+
 
 def passes_tax_and_sellability(token: str) -> Tuple[bool, str]:
     sec = get_token_security(token)
@@ -314,6 +342,7 @@ def passes_tax_and_sellability(token: str) -> Tuple[bool, str]:
 
     return True, f"buy tax {buy_tax:.2f}% | sell tax {sell_tax:.2f}%"
 
+
 # -------------------------
 # DEXSCREENER SNAPSHOT
 # -------------------------
@@ -325,10 +354,12 @@ def get_pair_snapshot(pair: str) -> Optional[Dict[str, Any]]:
         p = data.get("pair")
         if not p:
             return None
+
         created_ms = p.get("pairCreatedAt")
         age_seconds = None
         if created_ms:
             age_seconds = (now_ts() * 1000 - float(created_ms)) / 1000.0
+
         return {
             "pair": p.get("pairAddress"),
             "token": ((p.get("baseToken") or {}).get("address") or ""),
@@ -342,8 +373,10 @@ def get_pair_snapshot(pair: str) -> Optional[Dict[str, Any]]:
             "age_seconds": age_seconds,
             "url": p.get("url", ""),
         }
-    except Exception:
+    except Exception as e:
+        print("get_pair_snapshot error:", e)
         return None
+
 
 # -------------------------
 # LIVE BUY/SELL
@@ -351,8 +384,10 @@ def get_pair_snapshot(pair: str) -> Optional[Dict[str, Any]]:
 def approve_token_if_needed(token: str, amount_raw: int) -> bool:
     if not ACCOUNT:
         return False
+
     token_contract = get_token_contract(token)
     wallet = ACCOUNT.address
+
     try:
         allowance = int(token_contract.functions.allowance(wallet, ROUTER).call())
         if allowance >= amount_raw:
@@ -371,6 +406,7 @@ def approve_token_if_needed(token: str, amount_raw: int) -> bool:
     except Exception as e:
         send(f"❌ APPROVE ERROR\n{token}\n{e}")
         return False
+
 
 def execute_live_buy(token: str, pair: str, entry_liquidity_usd: float) -> Optional[dict]:
     if not ACCOUNT:
@@ -443,9 +479,11 @@ def execute_live_buy(token: str, pair: str, entry_liquidity_usd: float) -> Optio
         send(f"❌ LIVE BUY ERROR\n{token}\n{e}")
         return None
 
+
 def execute_live_sell(position: dict, current_price_usd: float, current_liquidity_usd: float):
     if not ACCOUNT:
         return
+
     token = position["token"]
     pair = position["pair"]
     symbol = position["symbol"]
@@ -497,10 +535,12 @@ def execute_live_sell(position: dict, current_price_usd: float, current_liquidit
     except Exception as e:
         send(f"❌ LIVE SELL ERROR\n{symbol}\n{token}\n{e}")
 
+
 # -------------------------
 # PAPER TRADE MODEL
 # -------------------------
 ACCOUNT_CASH = START_BALANCE
+
 
 class PaperTrade:
     def __init__(self, token: str, pair: str, symbol: str, entry_price: float, entry_liquidity_usd: float):
@@ -512,11 +552,13 @@ class PaperTrade:
         self.tokens = PURCHASE_AMOUNT_USD / entry_price if entry_price > 0 else 0.0
         self.opened = now_ts()
 
+
 PAPER_TRADES: Dict[str, PaperTrade] = {}
 LIVE_POSITIONS: Dict[str, dict] = {}
 SEEN_PAIRS = set()
 ACTIVE = set()
 LOCK = threading.Lock()
+
 
 # -------------------------
 # POSITION MONITORS
@@ -568,6 +610,7 @@ def monitor_paper_trade(token: str):
             PAPER_TRADES.pop(token, None)
             return
 
+
 def monitor_live_position(token: str):
     while token in LIVE_POSITIONS:
         time.sleep(POSITION_CHECK_SECONDS)
@@ -597,6 +640,7 @@ def monitor_live_position(token: str):
             execute_live_sell(pos, current_price, current_liq)
             LIVE_POSITIONS.pop(token, None)
             return
+
 
 # -------------------------
 # OPEN TRADE
@@ -638,6 +682,7 @@ def open_paper_trade(token: str, pair: str, snap: dict):
 
     threading.Thread(target=monitor_paper_trade, args=(token,), daemon=True).start()
 
+
 # -------------------------
 # PROCESS NEW PAIR
 # -------------------------
@@ -656,6 +701,7 @@ def qualifies_for_entry(snap: dict) -> bool:
     if snap["price_usd"] <= 0:
         return False
     return True
+
 
 def process_pair(token: str, pair: str):
     with LOCK:
@@ -719,46 +765,57 @@ def process_pair(token: str, pair: str):
         with LOCK:
             ACTIVE.discard(pair)
 
+
 # -------------------------
 # EVENT LISTENER
 # -------------------------
 def event_listener():
-    last_block = w3.eth.block_number
+    last_block = safe_block_number()
     send("Listening for new V2 pairs...")
 
     while True:
         try:
-            block = w3.eth.block_number
+            block = safe_block_number(last_block)
+
             if block > last_block:
-                events = factory.events.PairCreated.get_logs(
-                    from_block=last_block + 1,
-                    to_block=block
-                )
+                try:
+                    events = factory.events.PairCreated.get_logs(
+                        from_block=last_block + 1,
+                        to_block=block
+                    )
+                except Exception as e:
+                    print("PairCreated get_logs error:", e)
+                    time.sleep(3)
+                    continue
 
                 for e in events:
-                    token0 = e["args"]["token0"]
-                    token1 = e["args"]["token1"]
-                    pair = e["args"]["pair"]
+                    try:
+                        token0 = e["args"]["token0"]
+                        token1 = e["args"]["token1"]
+                        pair = e["args"]["pair"]
 
-                    token = None
-                    if token0.lower() == WETH.lower():
-                        token = token1
-                    elif token1.lower() == WETH.lower():
-                        token = token0
+                        token = None
+                        if token0.lower() == WETH.lower():
+                            token = token1
+                        elif token1.lower() == WETH.lower():
+                            token = token0
 
-                    if token:
-                        process_pair(
-                            Web3.to_checksum_address(token),
-                            Web3.to_checksum_address(pair)
-                        )
+                        if token:
+                            process_pair(
+                                Web3.to_checksum_address(token),
+                                Web3.to_checksum_address(pair)
+                            )
+                    except Exception as inner_e:
+                        print("event parse error:", inner_e)
 
                 last_block = block
 
             time.sleep(EVENT_POLL_SECONDS)
 
         except Exception as e:
-            print("event listener error", e)
-            time.sleep(3)
+            print("event listener outer error:", e)
+            time.sleep(5)
+
 
 # -------------------------
 # PORTFOLIO
@@ -788,6 +845,7 @@ def portfolio_loop():
 
         time.sleep(PORTFOLIO_UPDATE_SECONDS)
 
+
 # -------------------------
 # HEARTBEAT
 # -------------------------
@@ -796,13 +854,14 @@ def heartbeat_loop():
         send(
             f"💓 SCANNER HEARTBEAT\n\n"
             f"Connected YES\n"
-            f"Block {w3.eth.block_number}\n"
+            f"Block {safe_block_number()}\n"
             f"Mode {'LIVE' if RUN_PURCHASE == 'on' else 'PAPER'}\n"
             f"Paper Trades {len(PAPER_TRADES)}/{MAX_OPEN_TRADES}\n"
             f"Live Positions {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}\n"
             f"Seen Pairs {len(SEEN_PAIRS)}"
         )
         time.sleep(HEARTBEAT_SECONDS)
+
 
 # -------------------------
 # MAIN
@@ -826,6 +885,7 @@ def main():
 
     while True:
         time.sleep(60)
+
 
 if __name__ == "__main__":
     main()
