@@ -21,7 +21,7 @@ except Exception:
 import os
 import time
 import threading
-from collections import defaultdict, deque
+from collections import defaultdict
 
 
 # -------------------------
@@ -36,8 +36,8 @@ RUN_PURCHASE = os.getenv("RUN_PURCHASE", "off").lower()
 
 PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD", "50"))
 
-MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY", "1.0"))
-MAX_ETH_LIQUIDITY = float(os.getenv("MAX_ETH_LIQUIDITY", "60"))
+MIN_ETH_LIQUIDITY = float(os.getenv("MIN_ETH_LIQUIDITY", "0.75"))
+MAX_ETH_LIQUIDITY = float(os.getenv("MAX_ETH_LIQUIDITY", "80"))
 
 TRACK_SECONDS = int(os.getenv("TRACK_SECONDS", "45"))
 PAIR_POLL_SECONDS = float(os.getenv("PAIR_POLL_SECONDS", "1.5"))
@@ -45,15 +45,26 @@ BLOCK_POLL_SECONDS = float(os.getenv("BLOCK_POLL_SECONDS", "2"))
 
 MONEY_MIN_BUYS = int(os.getenv("MONEY_MIN_BUYS", "2"))
 MONEY_MIN_UNIQUE_BUYERS = int(os.getenv("MONEY_MIN_UNIQUE_BUYERS", "2"))
-MONEY_MIN_BUY_ETH = float(os.getenv("MONEY_MIN_BUY_ETH", "0.15"))
-MONEY_MIN_BUYER_VELOCITY = float(os.getenv("MONEY_MIN_BUYER_VELOCITY", "0.8"))
+MONEY_MIN_BUY_ETH = float(os.getenv("MONEY_MIN_BUY_ETH", "0.12"))
+MONEY_MIN_BUYER_VELOCITY = float(os.getenv("MONEY_MIN_BUYER_VELOCITY", "0.7"))
+MAX_TOP_BUYER_SHARE = float(os.getenv("MAX_TOP_BUYER_SHARE", "0.85"))
 
-MAX_TOP_BUYER_SHARE = float(os.getenv("MAX_TOP_BUYER_SHARE", "0.80"))
+# momentum spike detector
+ENABLE_MOMENTUM_SPIKE = os.getenv("ENABLE_MOMENTUM_SPIKE", "true").lower() == "true"
+MOMENTUM_LOOKBACK_SECONDS = int(os.getenv("MOMENTUM_LOOKBACK_SECONDS", "20"))
+MOMENTUM_SPIKE_MULTIPLIER = float(os.getenv("MOMENTUM_SPIKE_MULTIPLIER", "3.0"))
 
 # paper trade settings
 PAPER_TRADE_HOLD_SECONDS = int(os.getenv("PAPER_TRADE_HOLD_SECONDS", "180"))
 PAPER_MIN_PROFIT_PCT = float(os.getenv("PAPER_MIN_PROFIT_PCT", "15"))
 PAPER_STOP_LOSS_PCT = float(os.getenv("PAPER_STOP_LOSS_PCT", "-15"))
+
+# DexScreener confirmation
+USE_DEXSCREENER = os.getenv("USE_DEXSCREENER", "true").lower() == "true"
+DEXSCREENER_TIMEOUT = int(os.getenv("DEXSCREENER_TIMEOUT", "10"))
+DEXS_MIN_LIQ_USD = float(os.getenv("DEXS_MIN_LIQ_USD", "2000"))
+DEXS_MIN_BUYS_5M = int(os.getenv("DEXS_MIN_BUYS_5M", "0"))
+DEXS_REQUIRE_PAIR_FOUND = os.getenv("DEXS_REQUIRE_PAIR_FOUND", "false").lower() == "true"
 
 # -------------------------
 # WEB3
@@ -198,8 +209,6 @@ def monitor_paper_trade(token: str):
         if not trade:
             return
 
-    # very simple paper exit approximation:
-    # use liquidity change as proxy since full quote routing is not implemented here
     current_liq = get_liquidity(trade.pair)
     if current_liq <= 0:
         exit_eth = trade.entry * 0.50
@@ -207,8 +216,6 @@ def monitor_paper_trade(token: str):
     else:
         entry_liq = max(trade.entry, 0.0001)
         ratio = current_liq / entry_liq
-
-        # clamp rough estimate
         ratio = max(0.25, min(ratio, 3.0))
         exit_eth = trade.entry * ratio
 
@@ -236,6 +243,58 @@ def remember_wallet(wallet: str, profit_pct: float):
 
 def wallet_is_smart(wallet: str) -> bool:
     return bool(wallet) and wallet.lower() in SMART_WALLETS
+
+
+# -------------------------
+# DEXSCREENER
+# -------------------------
+def fetch_dexscreener_by_pair(pair: str) -> dict:
+    if not USE_DEXSCREENER:
+        return {}
+
+    url = f"https://api.dexscreener.com/latest/dex/pairs/ethereum/{pair}"
+    try:
+        r = requests.get(url, timeout=DEXSCREENER_TIMEOUT)
+        data = r.json()
+        pairs = data.get("pairs") or []
+        if not pairs:
+            return {}
+        p = pairs[0]
+        return {
+            "pair_address": p.get("pairAddress", ""),
+            "base_symbol": ((p.get("baseToken") or {}).get("symbol") or ""),
+            "quote_symbol": ((p.get("quoteToken") or {}).get("symbol") or ""),
+            "price_usd": p.get("priceUsd"),
+            "fdv": p.get("fdv"),
+            "liquidity_usd": ((p.get("liquidity") or {}).get("usd")),
+            "txns_5m_buys": (((p.get("txns") or {}).get("m5") or {}).get("buys")),
+            "txns_5m_sells": (((p.get("txns") or {}).get("m5") or {}).get("sells")),
+            "volume_5m": ((p.get("volume") or {}).get("m5")),
+            "price_change_5m": ((p.get("priceChange") or {}).get("m5")),
+            "url": p.get("url", ""),
+        }
+    except Exception as e:
+        print("dexscreener error:", e)
+        return {}
+
+
+def dexscreener_passes(ds: dict) -> bool:
+    if not USE_DEXSCREENER:
+        return True
+
+    if not ds:
+        return not DEXS_REQUIRE_PAIR_FOUND
+
+    liq_usd = float(ds.get("liquidity_usd") or 0.0)
+    buys_5m = int(ds.get("txns_5m_buys") or 0)
+
+    if liq_usd < DEXS_MIN_LIQ_USD:
+        return False
+
+    if buys_5m < DEXS_MIN_BUYS_5M:
+        return False
+
+    return True
 
 
 # -------------------------
@@ -355,7 +414,6 @@ def parse_swap_direction(args: dict, token0: str, token1: str):
     amount0_out = int(args.get("amount0Out", 0))
     amount1_out = int(args.get("amount1Out", 0))
 
-    # WETH is token0
     if token0.lower() == WETH.lower():
         if amount0_in > 0 and amount1_out > 0:
             eth_amount = float(w3.from_wei(amount0_in, "ether"))
@@ -366,7 +424,6 @@ def parse_swap_direction(args: dict, token0: str, token1: str):
             seller = args.get("sender")
             return "sell", eth_amount, str(seller) if seller else ""
 
-    # WETH is token1
     if token1.lower() == WETH.lower():
         if amount1_in > 0 and amount0_out > 0:
             eth_amount = float(w3.from_wei(amount1_in, "ether"))
@@ -396,6 +453,7 @@ def process_pair(token: str, pair: str):
     def worker():
         try:
             liquidity = get_liquidity(pair)
+            print(f"Tracking pair {pair} | liquidity {liquidity:.4f} ETH")
 
             if liquidity < MIN_ETH_LIQUIDITY or liquidity > MAX_ETH_LIQUIDITY:
                 return
@@ -413,6 +471,9 @@ def process_pair(token: str, pair: str):
             sell_eth = 0.0
             buy_count = 0
             sell_count = 0
+
+            # for momentum spike
+            recent_unique_buyer_times = deque()
 
             start = now_ts()
             start_block = w3.eth.block_number
@@ -440,14 +501,23 @@ def process_pair(token: str, pair: str):
                                 buy_eth += eth_amount
                                 if wallet:
                                     wallet = wallet.lower()
+                                    is_new = wallet not in buyers
                                     buyers.add(wallet)
                                     buyer_counts[wallet] += 1
+
+                                    if is_new:
+                                        recent_unique_buyer_times.append(now_ts())
+
                                     if wallet_is_smart(wallet):
                                         smart_buyers.add(wallet)
 
                             elif side == "sell":
                                 sell_count += 1
                                 sell_eth += eth_amount
+
+                        cutoff = now_ts() - MOMENTUM_LOOKBACK_SECONDS
+                        while recent_unique_buyer_times and recent_unique_buyer_times[0] < cutoff:
+                            recent_unique_buyer_times.popleft()
 
                 except Exception as e:
                     print(f"swap tracking error for {pair}: {e}")
@@ -456,6 +526,12 @@ def process_pair(token: str, pair: str):
 
             unique = len(buyers)
             velocity = unique / max(TRACK_SECONDS / 60.0, 0.01)
+
+            spike_velocity = len(recent_unique_buyer_times) / max(MOMENTUM_LOOKBACK_SECONDS / 60.0, 0.01)
+            momentum_spike = ENABLE_MOMENTUM_SPIKE and spike_velocity >= max(
+                MONEY_MIN_BUYER_VELOCITY * MOMENTUM_SPIKE_MULTIPLIER,
+                3.0
+            )
 
             top_buyer_share = 0.0
             if buy_count > 0 and buyer_counts:
@@ -470,14 +546,31 @@ def process_pair(token: str, pair: str):
             if buy_eth < MONEY_MIN_BUY_ETH:
                 return
 
-            if velocity < MONEY_MIN_BUYER_VELOCITY:
+            if velocity < MONEY_MIN_BUYER_VELOCITY and not momentum_spike:
                 return
 
             if top_buyer_share > MAX_TOP_BUYER_SHARE:
                 return
 
+            ds = fetch_dexscreener_by_pair(pair)
+            if not dexscreener_passes(ds):
+                return
+
             smart_detected = len(smart_buyers) > 0
             mode = "🧪 WOULD BUY" if RUN_PURCHASE != "on" else "🟢 BUY"
+
+            ds_text = ""
+            if ds:
+                ds_text = f"""
+
+DexScreener
+Liquidity USD: {float(ds.get('liquidity_usd') or 0):,.0f}
+Buys 5m: {int(ds.get('txns_5m_buys') or 0)}
+Sells 5m: {int(ds.get('txns_5m_sells') or 0)}
+Volume 5m: {float(ds.get('volume_5m') or 0):,.0f}
+Price Change 5m: {float(ds.get('price_change_5m') or 0):.2f}%
+FDV: {float(ds.get('fdv') or 0):,.0f}
+"""
 
             send(
                 f"""{mode}
@@ -491,8 +584,10 @@ Buy ETH: {buy_eth:.3f}
 Sell ETH: {sell_eth:.3f}
 Unique buyers: {unique}
 Velocity: {velocity:.2f}/min
+Spike velocity: {spike_velocity:.2f}/min
+Momentum spike: {format_bool(momentum_spike)}
 Top buyer share: {top_buyer_share:.0%}
-Smart wallets: {"YES" if smart_detected else "NO"}
+Smart wallets: {"YES" if smart_detected else "NO"}{ds_text}
 
 Token
 {token}
@@ -509,7 +604,6 @@ DexScreener
             )
 
             if RUN_PURCHASE != "on":
-                # use buy_eth as rough entry strength instead of raw pool liquidity
                 rough_entry = max(min(buy_eth, 2.0), 0.05)
                 open_paper_trade(token, name, symbol, rough_entry, pair)
 
@@ -565,6 +659,16 @@ MONEY_MIN_BUY_ETH={MONEY_MIN_BUY_ETH}
 MONEY_MIN_BUYER_VELOCITY={MONEY_MIN_BUYER_VELOCITY}
 MAX_TOP_BUYER_SHARE={MAX_TOP_BUYER_SHARE}
 TRACK_SECONDS={TRACK_SECONDS}
+
+DexScreener
+USE_DEXSCREENER={format_bool(USE_DEXSCREENER)}
+DEXS_MIN_LIQ_USD={DEXS_MIN_LIQ_USD}
+DEXS_MIN_BUYS_5M={DEXS_MIN_BUYS_5M}
+
+Momentum Spike
+ENABLE_MOMENTUM_SPIKE={format_bool(ENABLE_MOMENTUM_SPIKE)}
+MOMENTUM_LOOKBACK_SECONDS={MOMENTUM_LOOKBACK_SECONDS}
+MOMENTUM_SPIKE_MULTIPLIER={MOMENTUM_SPIKE_MULTIPLIER}
 """
     )
 
@@ -581,7 +685,7 @@ TRACK_SECONDS={TRACK_SECONDS}
                 )
 
                 if events:
-                    print(f"Found {len(events)} new pair(s) between {last_block+1} and {block}")
+                    print(f"Found {len(events)} new pair(s) between {last_block + 1} and {block}")
 
                 for e in events:
                     handle_event(e)
