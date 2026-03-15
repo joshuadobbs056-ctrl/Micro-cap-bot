@@ -773,40 +773,49 @@ def event_listener():
     last_block = safe_block_number()
     send("Listening for new V2 pairs...")
 
+    max_log_range = 10  # free-tier limit
+
     while True:
         try:
             block = safe_block_number(last_block)
 
             if block > last_block:
-                try:
-                    events = factory.events.PairCreated.get_logs(
-                        from_block=last_block + 1,
-                        to_block=block
-                    )
-                except Exception as e:
-                    print("PairCreated get_logs error:", e)
-                    time.sleep(3)
-                    continue
+                start_block = last_block + 1
 
-                for e in events:
+                while start_block <= block:
+                    end_block = min(start_block + max_log_range - 1, block)
+
                     try:
-                        token0 = e["args"]["token0"]
-                        token1 = e["args"]["token1"]
-                        pair = e["args"]["pair"]
+                        events = factory.events.PairCreated.get_logs(
+                            from_block=start_block,
+                            to_block=end_block
+                        )
+                    except Exception as e:
+                        print(f"PairCreated get_logs error [{start_block}-{end_block}]:", e)
+                        time.sleep(2)
+                        break
 
-                        token = None
-                        if token0.lower() == WETH.lower():
-                            token = token1
-                        elif token1.lower() == WETH.lower():
-                            token = token0
+                    for e in events:
+                        try:
+                            token0 = e["args"]["token0"]
+                            token1 = e["args"]["token1"]
+                            pair = e["args"]["pair"]
 
-                        if token:
-                            process_pair(
-                                Web3.to_checksum_address(token),
-                                Web3.to_checksum_address(pair)
-                            )
-                    except Exception as inner_e:
-                        print("event parse error:", inner_e)
+                            token = None
+                            if token0.lower() == WETH.lower():
+                                token = token1
+                            elif token1.lower() == WETH.lower():
+                                token = token0
+
+                            if token:
+                                process_pair(
+                                    Web3.to_checksum_address(token),
+                                    Web3.to_checksum_address(pair)
+                                )
+                        except Exception as inner_e:
+                            print("event parse error:", inner_e)
+
+                    start_block = end_block + 1
 
                 last_block = block
 
