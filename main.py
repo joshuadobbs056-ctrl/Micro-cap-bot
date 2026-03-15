@@ -37,21 +37,21 @@ START_BALANCE = float(os.getenv("START_BALANCE", "2000"))
 PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD", "50"))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))
 
-PORTFOLIO_UPDATE_SECONDS = int(os.getenv("PORTFOLIO_UPDATE_SECONDS", "30"))
-HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "300"))
-EVENT_POLL_SECONDS = float(os.getenv("EVENT_POLL_SECONDS", "5"))
-DISCOVERY_WAIT_SECONDS = int(os.getenv("DISCOVERY_WAIT_SECONDS", "15"))
+PORTFOLIO_UPDATE_SECONDS = int(os.getenv("PORTFOLIO_UPDATE_SECONDS", "60"))
+HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "600"))
+EVENT_POLL_SECONDS = float(os.getenv("EVENT_POLL_SECONDS", "10"))
+DISCOVERY_WAIT_SECONDS = int(os.getenv("DISCOVERY_WAIT_SECONDS", "10"))
 DISCOVERY_POLL_SECONDS = float(os.getenv("DISCOVERY_POLL_SECONDS", "3"))
 POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "20"))
 
 # earliest launch only
-MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "300"))  # 5 min
+MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "900"))  # 15 min
 
 # entry criteria
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "15000"))
-MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "5000"))
-MIN_SELLS_5M = int(os.getenv("MIN_SELLS_5M", "1"))
-MIN_BUYS_5M = int(os.getenv("MIN_BUYS_5M", "2"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "3000"))
+MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "1000"))
+MIN_SELLS_5M = int(os.getenv("MIN_SELLS_5M", "0"))
+MIN_BUYS_5M = int(os.getenv("MIN_BUYS_5M", "1"))
 
 # tax / sellability filter
 MAX_SELL_TAX_PCT = float(os.getenv("MAX_SELL_TAX_PCT", "10"))
@@ -73,6 +73,9 @@ MAX_LOG_RANGE = int(os.getenv("MAX_LOG_RANGE", "10"))
 RPC_BACKOFF_START_SECONDS = int(os.getenv("RPC_BACKOFF_START_SECONDS", "2"))
 RPC_BACKOFF_MAX_SECONDS = int(os.getenv("RPC_BACKOFF_MAX_SECONDS", "30"))
 
+# optional hard cap so listener threads do not get bogged down
+MAX_ACTIVE_POOL_THREADS = int(os.getenv("MAX_ACTIVE_POOL_THREADS", "100"))
+
 
 # -------------------------
 # WEB3
@@ -80,7 +83,9 @@ RPC_BACKOFF_MAX_SECONDS = int(os.getenv("RPC_BACKOFF_MAX_SECONDS", "30"))
 if not NODE:
     raise RuntimeError("NODE missing")
 
+# HTTPS is safer for this threaded scanner.
 if NODE.startswith("ws"):
+    print("⚠️ NODE is websocket. HTTPS is recommended for this threaded scanner.")
     w3 = Web3(Web3.LegacyWebSocketProvider(NODE))
 else:
     w3 = Web3(Web3.HTTPProvider(NODE))
@@ -585,6 +590,7 @@ LIVE_POSITIONS: Dict[str, dict] = {}
 SEEN_POOLS = set()
 ACTIVE_POOLS = set()
 LOCK = threading.Lock()
+POOL_THREAD_SEMAPHORE = threading.BoundedSemaphore(MAX_ACTIVE_POOL_THREADS)
 
 
 # -------------------------
@@ -731,12 +737,17 @@ def qualifies_for_entry(snap: dict) -> bool:
 
 
 def process_pool(token: str, pair: str, source: str):
-    with LOCK:
-        if pair in ACTIVE_POOLS or pair in SEEN_POOLS:
-            return
-        ACTIVE_POOLS.add(pair)
-
+    acquired = False
     try:
+        acquired = POOL_THREAD_SEMAPHORE.acquire(timeout=1)
+        if not acquired:
+            return
+
+        with LOCK:
+            if pair in ACTIVE_POOLS or pair in SEEN_POOLS:
+                return
+            ACTIVE_POOLS.add(pair)
+
         snap = None
         started = now_ts()
 
@@ -793,6 +804,8 @@ def process_pool(token: str, pair: str, source: str):
     finally:
         with LOCK:
             ACTIVE_POOLS.discard(pair)
+        if acquired:
+            POOL_THREAD_SEMAPHORE.release()
 
 
 # -------------------------
@@ -854,12 +867,25 @@ def process_log_range_with_backoff(contract, event_name: str, start_block: int, 
                 backoff_seconds = min(backoff_seconds * 2, RPC_BACKOFF_MAX_SECONDS)
                 continue
 
+            if "cannot call recv" in msg or "Normal Closure" in msg:
+                time.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 2, RPC_BACKOFF_MAX_SECONDS)
+                continue
+
             if "10 block range" in msg or "up to a 10 block range" in msg:
                 time.sleep(2)
                 return []
 
             time.sleep(2)
             return []
+
+
+def dispatch_pool_thread(token: str, pair: str, source: str):
+    threading.Thread(
+        target=process_pool,
+        args=(token, pair, source),
+        daemon=True,
+    ).start()
 
 
 # -------------------------
@@ -884,7 +910,7 @@ def v2_event_listener():
                         parsed = parse_v2_event(e)
                         if parsed:
                             token, pair, source = parsed
-                            process_pool(token, pair, source)
+                            dispatch_pool_thread(token, pair, source)
 
                     start_block = end_block + 1
 
@@ -916,7 +942,7 @@ def v3_event_listener():
                         parsed = parse_v3_event(e)
                         if parsed:
                             token, pair, source = parsed
-                            process_pool(token, pair, source)
+                            dispatch_pool_thread(token, pair, source)
 
                     start_block = end_block + 1
 
@@ -971,6 +997,7 @@ def heartbeat_loop():
             f"Paper Trades {len(PAPER_TRADES)}/{MAX_OPEN_TRADES}\n"
             f"Live Positions {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}\n"
             f"Seen Pools {len(SEEN_POOLS)}\n"
+            f"Active Pool Threads {len(ACTIVE_POOLS)}\n"
             f"V2 ON\n"
             f"V3 ON"
         )
