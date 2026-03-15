@@ -83,12 +83,16 @@ MAX_ACTIVE_POOL_THREADS = int(os.getenv("MAX_ACTIVE_POOL_THREADS", "100"))
 if not NODE:
     raise RuntimeError("NODE missing")
 
-# HTTPS is safer for this threaded scanner.
-if NODE.startswith("ws"):
-    print("⚠️ NODE is websocket. HTTPS is recommended for this threaded scanner.")
-    w3 = Web3(Web3.LegacyWebSocketProvider(NODE))
-else:
-    w3 = Web3(Web3.HTTPProvider(NODE))
+# Force HTTP provider for this threaded scanner.
+# WebSocket providers can throw recv/coroutine errors when multiple listeners run.
+if NODE.startswith("wss://"):
+    NODE = NODE.replace("wss://", "https://", 1)
+    print("Converted WSS node to HTTPS for threaded scanner.")
+elif NODE.startswith("ws://"):
+    NODE = NODE.replace("ws://", "http://", 1)
+    print("Converted WS node to HTTP for threaded scanner.")
+
+w3 = Web3(Web3.HTTPProvider(NODE, request_kwargs={"timeout": 30}))
 
 if not w3.is_connected():
     raise RuntimeError("Node connection failed")
@@ -230,7 +234,6 @@ CHAINLINK_ETH_USD_ABI = [
             {"internalType": "uint80", "name": "roundId", "type": "uint80"},
             {"internalType": "int256", "name": "answer", "type": "int256"},
             {"internalType": "uint256", "name": "startedAt", "type": "uint256"},
-            {"internalType": "uint256", "name": "updatedAt", "type": "uint256"},
             {"internalType": "uint80", "name": "answeredInRound", "type": "uint80"},
         ],
         "stateMutability": "view",
@@ -378,7 +381,13 @@ def get_pair_snapshot(pair: str) -> Optional[Dict[str, Any]]:
         url = f"https://api.dexscreener.com/latest/dex/pairs/ethereum/{pair}"
         r = requests.get(url, timeout=10)
         data = r.json()
+
         p = data.get("pair")
+        if not p:
+            pairs = data.get("pairs") or []
+            if pairs:
+                p = pairs[0]
+
         if not p:
             return None
 
@@ -867,14 +876,14 @@ def process_log_range_with_backoff(contract, event_name: str, start_block: int, 
                 backoff_seconds = min(backoff_seconds * 2, RPC_BACKOFF_MAX_SECONDS)
                 continue
 
-            if "cannot call recv" in msg or "Normal Closure" in msg:
-                time.sleep(backoff_seconds)
-                backoff_seconds = min(backoff_seconds * 2, RPC_BACKOFF_MAX_SECONDS)
-                continue
-
             if "10 block range" in msg or "up to a 10 block range" in msg:
                 time.sleep(2)
                 return []
+
+            if "timed out" in msg.lower() or "timeout" in msg.lower():
+                time.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 2, RPC_BACKOFF_MAX_SECONDS)
+                continue
 
             time.sleep(2)
             return []
@@ -1015,7 +1024,7 @@ def main():
         f"Buy Size ${PURCHASE_AMOUNT_USD:.2f}\n"
         f"Max Open Trades {MAX_OPEN_TRADES}\n"
         f"Age Limit {MAX_TOKEN_AGE_SECONDS}s\n"
-        f"Entry Rules: volume there and sells exist\n"
+        f"Entry Rules: volume there and sells >= {MIN_SELLS_5M}\n"
         f"Security Rules: sell tax <= {MAX_SELL_TAX_PCT:.2f}% | buy tax <= {MAX_BUY_TAX_PCT:.2f}%\n"
         f"Exit Rule: liquidity drop {LIQUIDITY_DROP_EXIT_PCT:.0f}%\n"
         f"Discovery: V2 + V3"
