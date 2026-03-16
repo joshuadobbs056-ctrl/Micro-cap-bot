@@ -3,7 +3,7 @@ import sys
 import time
 import threading
 import subprocess
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 
 def install(package: str):
@@ -40,18 +40,18 @@ MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))
 PORTFOLIO_UPDATE_SECONDS = int(os.getenv("PORTFOLIO_UPDATE_SECONDS", "60"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "600"))
 EVENT_POLL_SECONDS = float(os.getenv("EVENT_POLL_SECONDS", "10"))
-DISCOVERY_WAIT_SECONDS = int(os.getenv("DISCOVERY_WAIT_SECONDS", "10"))
+DISCOVERY_WAIT_SECONDS = int(os.getenv("DISCOVERY_WAIT_SECONDS", "20"))
 DISCOVERY_POLL_SECONDS = float(os.getenv("DISCOVERY_POLL_SECONDS", "3"))
 POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "20"))
 
 # scan recent blocks on startup so the scanner can prove detection quickly
 STARTUP_LOOKBACK_BLOCKS = int(os.getenv("STARTUP_LOOKBACK_BLOCKS", "250"))
 
-# earliest launch only
-MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "900"))  # 15 min
+# widened age window so recent pools can still qualify later
+MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "3600"))  # 60 min
 
 # entry criteria
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "20000"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))
 MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "1000"))
 MIN_SELLS_5M = int(os.getenv("MIN_SELLS_5M", "0"))
 MIN_BUYS_5M = int(os.getenv("MIN_BUYS_5M", "1"))
@@ -90,6 +90,11 @@ RPC_BACKOFF_MAX_SECONDS = int(os.getenv("RPC_BACKOFF_MAX_SECONDS", "30"))
 
 # optional hard cap so listener threads do not get bogged down
 MAX_ACTIVE_POOL_THREADS = int(os.getenv("MAX_ACTIVE_POOL_THREADS", "100"))
+
+# recent pool rescanner
+RECENT_POOL_RESCAN_SECONDS = int(os.getenv("RECENT_POOL_RESCAN_SECONDS", "15"))
+RECENT_POOL_RECHECK_COOLDOWN_SECONDS = int(os.getenv("RECENT_POOL_RECHECK_COOLDOWN_SECONDS", "20"))
+RECENT_POOL_MAX_TRACKED = int(os.getenv("RECENT_POOL_MAX_TRACKED", "2000"))
 
 
 # -------------------------
@@ -628,8 +633,13 @@ class PaperTrade:
 
 PAPER_TRADES: Dict[str, PaperTrade] = {}
 LIVE_POSITIONS: Dict[str, dict] = {}
-SEEN_POOLS = set()
+
 ACTIVE_POOLS = set()
+ALERTED_POOLS = set()
+TRADED_POOLS = set()
+
+RECENT_POOLS: Dict[str, Dict[str, Any]] = {}
+
 LOCK = threading.Lock()
 POOL_THREAD_SEMAPHORE = threading.BoundedSemaphore(MAX_ACTIVE_POOL_THREADS)
 
@@ -710,6 +720,48 @@ def get_portfolio_mark_value(trade: PaperTrade) -> float:
         value *= (1.0 - PAPER_STALE_MARKDOWN_PCT / 100.0)
 
     return value
+
+
+# -------------------------
+# RECENT POOL TRACKING
+# -------------------------
+def register_recent_pool(token: str, pair: str, source: str):
+    with LOCK:
+        if pair not in RECENT_POOLS and len(RECENT_POOLS) >= RECENT_POOL_MAX_TRACKED:
+            oldest_pair = min(
+                RECENT_POOLS.keys(),
+                key=lambda p: RECENT_POOLS[p].get("first_seen_ts", now_ts())
+            )
+            RECENT_POOLS.pop(oldest_pair, None)
+
+        RECENT_POOLS[pair] = {
+            "token": Web3.to_checksum_address(token),
+            "pair": Web3.to_checksum_address(pair),
+            "source": source,
+            "first_seen_ts": RECENT_POOLS.get(pair, {}).get("first_seen_ts", now_ts()),
+            "last_attempt_ts": RECENT_POOLS.get(pair, {}).get("last_attempt_ts", 0.0),
+            "last_snapshot_ts": RECENT_POOLS.get(pair, {}).get("last_snapshot_ts", 0.0),
+        }
+
+
+def cleanup_recent_pools():
+    cutoff = now_ts() - MAX_TOKEN_AGE_SECONDS - 300
+    with LOCK:
+        stale_pairs = []
+        for pair, meta in RECENT_POOLS.items():
+            first_seen_ts = meta.get("first_seen_ts", 0.0)
+            if first_seen_ts and first_seen_ts < cutoff:
+                stale_pairs.append(pair)
+
+        for pair in stale_pairs:
+            RECENT_POOLS.pop(pair, None)
+
+
+def get_recent_pool_batch() -> List[Tuple[str, Dict[str, Any]]]:
+    with LOCK:
+        items = list(RECENT_POOLS.items())
+    items.sort(key=lambda x: x[1].get("first_seen_ts", 0.0), reverse=True)
+    return items
 
 
 # -------------------------
@@ -889,16 +941,16 @@ def monitor_live_position(token: str):
 # -------------------------
 # OPEN TRADE
 # -------------------------
-def open_paper_trade(token: str, pair: str, snap: dict):
+def open_paper_trade(token: str, pair: str, snap: dict) -> bool:
     global ACCOUNT_CASH
 
     if len(PAPER_TRADES) >= MAX_OPEN_TRADES:
         send(f"⚠️ TRADE SKIPPED\nReason: max open trades reached\nOpen Trades {len(PAPER_TRADES)}/{MAX_OPEN_TRADES}")
-        return
+        return False
 
     if ACCOUNT_CASH < PURCHASE_AMOUNT_USD:
         send(f"⚠️ TRADE SKIPPED\nReason: insufficient balance\nCash ${ACCOUNT_CASH:.2f}\nRequired ${PURCHASE_AMOUNT_USD:.2f}")
-        return
+        return False
 
     symbol = snap["symbol"] or "UNK"
     price = snap["price_usd"]
@@ -906,7 +958,7 @@ def open_paper_trade(token: str, pair: str, snap: dict):
 
     if price <= 0:
         send(f"⚠️ TRADE SKIPPED\n{symbol}\nReason: no entry price")
-        return
+        return False
 
     trade = PaperTrade(token, pair, symbol, price, liq)
     PAPER_TRADES[token] = trade
@@ -925,10 +977,11 @@ def open_paper_trade(token: str, pair: str, snap: dict):
     )
 
     threading.Thread(target=monitor_paper_trade, args=(token,), daemon=True).start()
+    return True
 
 
 # -------------------------
-# PROCESS NEW POOL
+# PROCESS POOL
 # -------------------------
 def qualifies_for_entry(snap: dict) -> bool:
     age = snap["age_seconds"]
@@ -955,7 +1008,7 @@ def process_pool(token: str, pair: str, source: str):
             return
 
         with LOCK:
-            if pair in ACTIVE_POOLS or pair in SEEN_POOLS:
+            if pair in ACTIVE_POOLS or pair in TRADED_POOLS:
                 return
             ACTIVE_POOLS.add(pair)
 
@@ -967,6 +1020,9 @@ def process_pool(token: str, pair: str, source: str):
             if snap and qualifies_for_entry(snap):
                 break
             time.sleep(DISCOVERY_POLL_SECONDS)
+
+        if not snap:
+            snap = get_pair_snapshot(pair)
 
         if not snap or not qualifies_for_entry(snap):
             return
@@ -983,34 +1039,44 @@ def process_pool(token: str, pair: str, source: str):
             return
 
         age = snap["age_seconds"] or 0
-        send(
-            f"🚀 NEW LAUNCH DETECTED\n\n"
-            f"Source {source}\n"
-            f"{snap['symbol']}\n"
-            f"Token\n{token}\n\n"
-            f"Pair\n{pair}\n\n"
-            f"Age {age:.0f}s\n"
-            f"Price ${snap['price_usd']:.10f}\n"
-            f"Liquidity ${snap['liquidity_usd']:,.0f}\n"
-            f"Volume 5m ${snap['volume_5m']:,.0f}\n"
-            f"Buys 5m {snap['buys_5m']}\n"
-            f"Sells 5m {snap['sells_5m']}\n"
-            f"Security: {security_reason}"
-        )
 
+        should_alert = False
         with LOCK:
-            SEEN_POOLS.add(pair)
+            if pair not in ALERTED_POOLS:
+                ALERTED_POOLS.add(pair)
+                should_alert = True
+
+        if should_alert:
+            send(
+                f"🚀 NEW LAUNCH DETECTED\n\n"
+                f"Source {source}\n"
+                f"{snap['symbol']}\n"
+                f"Token\n{token}\n\n"
+                f"Pair\n{pair}\n\n"
+                f"Age {age:.0f}s\n"
+                f"Price ${snap['price_usd']:.10f}\n"
+                f"Liquidity ${snap['liquidity_usd']:,.0f}\n"
+                f"Volume 5m ${snap['volume_5m']:,.0f}\n"
+                f"Buys 5m {snap['buys_5m']}\n"
+                f"Sells 5m {snap['sells_5m']}\n"
+                f"Security: {security_reason}"
+            )
 
         if RUN_PURCHASE == "on":
             if len(LIVE_POSITIONS) >= MAX_OPEN_TRADES:
-                send(f"⚠️ LIVE TRADE SKIPPED\nReason: max open trades reached\nOpen Trades {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}")
                 return
+
             pos = execute_live_buy(token, pair, snap["liquidity_usd"], snap["price_usd"])
             if pos:
                 LIVE_POSITIONS[token] = pos
+                with LOCK:
+                    TRADED_POOLS.add(pair)
                 threading.Thread(target=monitor_live_position, args=(token,), daemon=True).start()
         else:
-            open_paper_trade(token, pair, snap)
+            opened = open_paper_trade(token, pair, snap)
+            if opened:
+                with LOCK:
+                    TRADED_POOLS.add(pair)
 
     finally:
         with LOCK:
@@ -1092,6 +1158,7 @@ def process_log_range_with_backoff(contract, event_name: str, start_block: int, 
 
 
 def dispatch_pool_thread(token: str, pair: str, source: str):
+    register_recent_pool(token, pair, source)
     threading.Thread(
         target=process_pool,
         args=(token, pair, source),
@@ -1167,6 +1234,43 @@ def v3_event_listener():
 
 
 # -------------------------
+# RECENT POOL RESCANNER
+# -------------------------
+def recent_pool_rescan_loop():
+    send("Recent pool rescanner ON")
+
+    while True:
+        try:
+            cleanup_recent_pools()
+            items = get_recent_pool_batch()
+
+            for pair, meta in items:
+                token = meta["token"]
+                source = meta["source"]
+                last_attempt_ts = safe_float(meta.get("last_attempt_ts"), 0.0)
+
+                if now_ts() - last_attempt_ts < RECENT_POOL_RECHECK_COOLDOWN_SECONDS:
+                    continue
+
+                with LOCK:
+                    if pair in TRADED_POOLS:
+                        continue
+                    if pair in ACTIVE_POOLS:
+                        continue
+                    if pair not in RECENT_POOLS:
+                        continue
+                    RECENT_POOLS[pair]["last_attempt_ts"] = now_ts()
+
+                dispatch_pool_thread(token, pair, source)
+
+            time.sleep(RECENT_POOL_RESCAN_SECONDS)
+
+        except Exception as e:
+            print("recent_pool_rescan_loop error:", e)
+            time.sleep(5)
+
+
+# -------------------------
 # PORTFOLIO
 # -------------------------
 def portfolio_loop():
@@ -1210,10 +1314,13 @@ def heartbeat_loop():
             f"Mode {'LIVE' if RUN_PURCHASE == 'on' else 'PAPER'}\n"
             f"Paper Trades {len(PAPER_TRADES)}/{MAX_OPEN_TRADES}\n"
             f"Live Positions {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}\n"
-            f"Seen Pools {len(SEEN_POOLS)}\n"
+            f"Tracked Recent Pools {len(RECENT_POOLS)}\n"
+            f"Alerted Pools {len(ALERTED_POOLS)}\n"
+            f"Traded Pools {len(TRADED_POOLS)}\n"
             f"Active Pool Threads {len(ACTIVE_POOLS)}\n"
             f"V2 ON\n"
-            f"V3 ON"
+            f"V3 ON\n"
+            f"Recent Rescan ON"
         )
         time.sleep(HEARTBEAT_SECONDS)
 
@@ -1229,16 +1336,20 @@ def main():
         f"Buy Size ${PURCHASE_AMOUNT_USD:.2f}\n"
         f"Max Open Trades {MAX_OPEN_TRADES}\n"
         f"Age Limit {MAX_TOKEN_AGE_SECONDS}s\n"
+        f"Min Liquidity ${MIN_LIQUIDITY_USD:,.0f}\n"
+        f"Min Volume 5m ${MIN_VOLUME_5M_USD:,.0f}\n"
         f"Entry Rules: volume there and sells >= {MIN_SELLS_5M}\n"
         f"Security Rules: sell tax <= {MAX_SELL_TAX_PCT:.2f}% | buy tax <= {MAX_BUY_TAX_PCT:.2f}%\n"
         f"Exit Rules: trail arm {TRAIL_ARM_PCT:.0f}% | trail drop {TRAIL_DROP_PCT:.0f}% | liquidity drop {LIQUIDITY_DROP_EXIT_PCT:.0f}%\n"
         f"Paper Exit Model: haircut {PAPER_EXIT_HAIRCUT_PCT:.0f}% | cap {PAPER_EXIT_MAX_BUYSIDE_SHARE * 100:.0f}% buy-side\n"
-        f"Discovery: V2 + V3\n"
-        f"Startup Lookback {STARTUP_LOOKBACK_BLOCKS} blocks"
+        f"Discovery: V2 + V3 + Recent Pool Rescan\n"
+        f"Startup Lookback {STARTUP_LOOKBACK_BLOCKS} blocks\n"
+        f"Recent Pool Rescan Every {RECENT_POOL_RESCAN_SECONDS}s"
     )
 
     threading.Thread(target=v2_event_listener, daemon=True).start()
     threading.Thread(target=v3_event_listener, daemon=True).start()
+    threading.Thread(target=recent_pool_rescan_loop, daemon=True).start()
     threading.Thread(target=portfolio_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
 
