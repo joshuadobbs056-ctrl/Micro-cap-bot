@@ -50,6 +50,7 @@ EVENT_POLL_SECONDS = float(os.getenv("EVENT_POLL_SECONDS", "10"))
 DISCOVERY_WAIT_SECONDS = int(os.getenv("DISCOVERY_WAIT_SECONDS", "45"))
 DISCOVERY_POLL_SECONDS = float(os.getenv("DISCOVERY_POLL_SECONDS", "2"))
 POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "20"))
+LIVE_ACCOUNT_UPDATE_SECONDS = int(os.getenv("LIVE_ACCOUNT_UPDATE_SECONDS", "60"))
 
 # scan recent blocks on startup so the scanner can prove detection quickly
 STARTUP_LOOKBACK_BLOCKS = int(os.getenv("STARTUP_LOOKBACK_BLOCKS", "250"))
@@ -557,6 +558,80 @@ def should_log_pair_reason(pair: str) -> bool:
     return False
 
 
+def get_live_position_metrics(pos: dict) -> Dict[str, float]:
+    decimals = int(pos.get("decimals", 18))
+    token_amount_raw = int(pos.get("token_amount_raw", 0))
+    token_amount = token_amount_raw / (10 ** decimals) if decimals >= 0 else 0.0
+
+    entry_value_usd = safe_float(pos.get("entry_value_usd"), PURCHASE_AMOUNT_USD)
+    current_price = safe_float(pos.get("current_price_usd"), 0.0)
+    peak_price = safe_float(pos.get("peak_price"), 0.0)
+
+    current_value_usd = token_amount * current_price if current_price > 0 else 0.0
+    pnl_usd = current_value_usd - entry_value_usd
+    pnl_pct = ((pnl_usd / entry_value_usd) * 100.0) if entry_value_usd > 0 else 0.0
+
+    peak_value_usd = token_amount * peak_price if peak_price > 0 else 0.0
+    peak_pnl_usd = peak_value_usd - entry_value_usd
+    peak_pnl_pct = ((peak_pnl_usd / entry_value_usd) * 100.0) if entry_value_usd > 0 else 0.0
+
+    return {
+        "token_amount": token_amount,
+        "entry_value_usd": entry_value_usd,
+        "current_value_usd": current_value_usd,
+        "pnl_usd": pnl_usd,
+        "pnl_pct": pnl_pct,
+        "peak_value_usd": peak_value_usd,
+        "peak_pnl_usd": peak_pnl_usd,
+        "peak_pnl_pct": peak_pnl_pct,
+    }
+
+
+def get_live_account_snapshot() -> Dict[str, float]:
+    eth_usd = 0.0
+    try:
+        eth_usd = get_eth_usd_price()
+    except Exception:
+        eth_usd = 0.0
+
+    wallet_eth = 0.0
+    cash_value_usd = 0.0
+
+    if ACCOUNT:
+        try:
+            wallet_balance_wei = int(w3.eth.get_balance(ACCOUNT.address))
+            wallet_eth = wei_to_eth(wallet_balance_wei)
+            if eth_usd > 0:
+                cash_value_usd = wallet_eth * eth_usd
+        except Exception:
+            wallet_eth = 0.0
+            cash_value_usd = 0.0
+
+    open_position_value_usd = 0.0
+    unrealized_pnl_usd = 0.0
+    invested_value_usd = 0.0
+
+    for pos in LIVE_POSITIONS.values():
+        m = get_live_position_metrics(pos)
+        open_position_value_usd += m["current_value_usd"]
+        unrealized_pnl_usd += m["pnl_usd"]
+        invested_value_usd += m["entry_value_usd"]
+
+    total_equity_usd = cash_value_usd + open_position_value_usd
+    unrealized_pnl_pct = ((unrealized_pnl_usd / invested_value_usd) * 100.0) if invested_value_usd > 0 else 0.0
+
+    return {
+        "wallet_eth": wallet_eth,
+        "eth_usd": eth_usd,
+        "cash_value_usd": cash_value_usd,
+        "open_position_value_usd": open_position_value_usd,
+        "total_equity_usd": total_equity_usd,
+        "unrealized_pnl_usd": unrealized_pnl_usd,
+        "unrealized_pnl_pct": unrealized_pnl_pct,
+        "invested_value_usd": invested_value_usd,
+    }
+
+
 # -------------------------
 # SECURITY / TAX CHECK
 # -------------------------
@@ -850,6 +925,9 @@ def execute_live_buy_v2(
             "opened": now_ts(),
             "peak_price": entry_price if entry_price > 0 else 0.0,
             "source": "V2",
+            "entry_value_usd": PURCHASE_AMOUNT_USD,
+            "current_price_usd": entry_price if entry_price > 0 else 0.0,
+            "current_liquidity_usd": entry_liquidity_usd,
         }
 
     except Exception as e:
@@ -1027,6 +1105,9 @@ def execute_live_buy_v3(
             "opened": now_ts(),
             "peak_price": entry_price if entry_price > 0 else 0.0,
             "source": f"V3:{fee_used}",
+            "entry_value_usd": PURCHASE_AMOUNT_USD,
+            "current_price_usd": entry_price if entry_price > 0 else 0.0,
+            "current_liquidity_usd": entry_liquidity_usd,
         }
 
     except Exception as e:
@@ -1064,6 +1145,7 @@ def execute_live_sell_v2(position: dict, current_price_usd: float, current_liqui
     symbol = position["symbol"]
     amount_raw = position["token_amount_raw"]
     wallet = ACCOUNT.address
+    m = get_live_position_metrics(position)
 
     try:
         if amount_raw <= 0:
@@ -1107,8 +1189,14 @@ def execute_live_sell_v2(position: dict, current_price_usd: float, current_liqui
                 f"{symbol}\n"
                 f"Token\n{token}\n\n"
                 f"Pair\n{pair}\n\n"
+                f"Tokens Held {m['token_amount']:,.6f}\n"
+                f"Entry Value ${m['entry_value_usd']:.2f}\n"
+                f"Current Value ${m['current_value_usd']:.2f}\n"
+                f"PnL ${m['pnl_usd']:.2f}\n"
+                f"PnL {m['pnl_pct']:.2f}%\n\n"
                 f"Current Price ${current_price_usd:.10f}\n"
                 f"Current Liquidity ${current_liquidity_usd:,.0f}\n"
+                f"Open Orders {max(len(LIVE_POSITIONS) - 1, 0)}/{MAX_OPEN_TRADES}\n"
                 f"Reason: {reason}\n"
                 f"Tx {tx_hash.hex()}"
             )
@@ -1119,6 +1207,11 @@ def execute_live_sell_v2(position: dict, current_price_usd: float, current_liqui
             f"{symbol}\n"
             f"Token\n{token}\n\n"
             f"Pair\n{pair}\n\n"
+            f"Tokens Held {m['token_amount']:,.6f}\n"
+            f"Entry Value ${m['entry_value_usd']:.2f}\n"
+            f"Current Value ${m['current_value_usd']:.2f}\n"
+            f"PnL ${m['pnl_usd']:.2f}\n"
+            f"PnL {m['pnl_pct']:.2f}%\n"
             f"Tx {tx_hash.hex()}"
         )
         return False
@@ -1139,6 +1232,7 @@ def execute_live_sell_v3(position: dict, current_price_usd: float, current_liqui
     wallet = ACCOUNT.address
     source = str(position.get("source", "V3"))
     fee = get_v3_fee_from_source(source)
+    m = get_live_position_metrics(position)
 
     try:
         if amount_raw <= 0:
@@ -1146,8 +1240,6 @@ def execute_live_sell_v3(position: dict, current_price_usd: float, current_liqui
         if not approve_token_if_needed(token, amount_raw, V3_ROUTER):
             return False
 
-        quote_ok, expected_out, amount_out_min, quote_reason = get_v3_quote(amount_raw, WETH, fee)
-        # Above won't work because tokenIn must be token, tokenOut WETH. So re-quote properly:
         try:
             expected_eth_out = int(
                 v3_quoter.functions.quoteExactInputSingle(
@@ -1208,9 +1300,15 @@ def execute_live_sell_v3(position: dict, current_price_usd: float, current_liqui
                 f"{symbol}\n"
                 f"Token\n{token}\n\n"
                 f"Pair\n{pair}\n\n"
+                f"Tokens Held {m['token_amount']:,.6f}\n"
+                f"Entry Value ${m['entry_value_usd']:.2f}\n"
+                f"Current Value ${m['current_value_usd']:.2f}\n"
+                f"PnL ${m['pnl_usd']:.2f}\n"
+                f"PnL {m['pnl_pct']:.2f}%\n\n"
                 f"Fee Tier {fee}\n"
                 f"Current Price ${current_price_usd:.10f}\n"
                 f"Current Liquidity ${current_liquidity_usd:,.0f}\n"
+                f"Open Orders {max(len(LIVE_POSITIONS) - 1, 0)}/{MAX_OPEN_TRADES}\n"
                 f"Reason: {reason}\n"
                 f"Tx {tx_hash.hex()}"
             )
@@ -1221,6 +1319,11 @@ def execute_live_sell_v3(position: dict, current_price_usd: float, current_liqui
             f"{symbol}\n"
             f"Token\n{token}\n\n"
             f"Pair\n{pair}\n\n"
+            f"Tokens Held {m['token_amount']:,.6f}\n"
+            f"Entry Value ${m['entry_value_usd']:.2f}\n"
+            f"Current Value ${m['current_value_usd']:.2f}\n"
+            f"PnL ${m['pnl_usd']:.2f}\n"
+            f"PnL {m['pnl_pct']:.2f}%\n"
             f"Tx {tx_hash.hex()}"
         )
         return False
@@ -1515,10 +1618,14 @@ def monitor_live_position(token: str):
         entry_price = safe_float(pos.get("entry_price"))
         exit_floor = pos["entry_liquidity_usd"] * (1 - LIQUIDITY_DROP_EXIT_PCT / 100.0)
 
+        pos["current_price_usd"] = current_price
+        pos["current_liquidity_usd"] = current_liq
+
         if current_price > pos.get("peak_price", 0.0):
             pos["peak_price"] = current_price
 
         peak_price = safe_float(pos.get("peak_price"))
+        m = get_live_position_metrics(pos)
 
         send(
             f"📊 LIVE POSITION UPDATE\n\n"
@@ -1526,9 +1633,17 @@ def monitor_live_position(token: str):
             f"Token\n{pos['token']}\n\n"
             f"Entry Price ${entry_price:.10f}\n"
             f"Current Price ${current_price:.10f}\n"
-            f"Peak Price ${peak_price:.10f}\n"
+            f"Peak Price ${peak_price:.10f}\n\n"
+            f"Tokens Held {m['token_amount']:,.6f}\n"
+            f"Entry Value ${m['entry_value_usd']:.2f}\n"
+            f"Current Value ${m['current_value_usd']:.2f}\n"
+            f"PnL ${m['pnl_usd']:.2f}\n"
+            f"PnL {m['pnl_pct']:.2f}%\n"
+            f"Peak PnL ${m['peak_pnl_usd']:.2f}\n"
+            f"Peak PnL {m['peak_pnl_pct']:.2f}%\n\n"
             f"Entry Liquidity ${pos['entry_liquidity_usd']:,.0f}\n"
-            f"Current Liquidity ${current_liq:,.0f}"
+            f"Current Liquidity ${current_liq:,.0f}\n"
+            f"Open Orders {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}"
         )
 
         if entry_price > 0 and current_price > 0 and peak_price > 0:
@@ -1969,11 +2084,57 @@ def portfolio_loop():
         time.sleep(PORTFOLIO_UPDATE_SECONDS)
 
 
+def live_account_loop():
+    while True:
+        if RUN_PURCHASE == "on":
+            for token, pos in list(LIVE_POSITIONS.items()):
+                try:
+                    snap = get_pair_snapshot(pos["pair"])
+                    if not snap:
+                        continue
+                    pos["current_price_usd"] = safe_float(snap.get("price_usd"))
+                    pos["current_liquidity_usd"] = safe_float(snap.get("liquidity_usd"))
+                    current_price = safe_float(pos.get("current_price_usd"))
+                    if current_price > safe_float(pos.get("peak_price"), 0.0):
+                        pos["peak_price"] = current_price
+                except Exception:
+                    pass
+
+            live = get_live_account_snapshot()
+
+            send(
+                f"📈 LIVE ACCOUNT STATUS\n\n"
+                f"Wallet ETH {live['wallet_eth']:.6f}\n"
+                f"ETH USD ${live['eth_usd']:.2f}\n\n"
+                f"Cash Value ${live['cash_value_usd']:.2f}\n"
+                f"Open Position Value ${live['open_position_value_usd']:.2f}\n"
+                f"Total Equity ${live['total_equity_usd']:.2f}\n\n"
+                f"Unrealized PnL ${live['unrealized_pnl_usd']:.2f}\n"
+                f"Unrealized PnL {live['unrealized_pnl_pct']:.2f}%\n\n"
+                f"Open Orders {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}"
+            )
+
+        time.sleep(LIVE_ACCOUNT_UPDATE_SECONDS)
+
+
 # -------------------------
 # HEARTBEAT
 # -------------------------
 def heartbeat_loop():
     while True:
+        live = get_live_account_snapshot() if RUN_PURCHASE == "on" else None
+
+        extra = ""
+        if live is not None:
+            extra = (
+                f"\nWallet ETH {live['wallet_eth']:.6f}"
+                f"\nCash Value ${live['cash_value_usd']:.2f}"
+                f"\nOpen Position Value ${live['open_position_value_usd']:.2f}"
+                f"\nTotal Live Equity ${live['total_equity_usd']:.2f}"
+                f"\nLive Unrealized PnL ${live['unrealized_pnl_usd']:.2f}"
+                f"\nLive Unrealized PnL {live['unrealized_pnl_pct']:.2f}%"
+            )
+
         send(
             f"💓 SCANNER HEARTBEAT\n\n"
             f"Connected YES\n"
@@ -1988,6 +2149,7 @@ def heartbeat_loop():
             f"V2 ON\n"
             f"V3 ON\n"
             f"Recent Rescan ON"
+            f"{extra}"
         )
         time.sleep(HEARTBEAT_SECONDS)
 
@@ -2011,13 +2173,15 @@ def main():
         f"Paper Exit Model: haircut {PAPER_EXIT_HAIRCUT_PCT:.0f}% | cap {PAPER_EXIT_MAX_BUYSIDE_SHARE * 100:.0f}% buy-side\n"
         f"Discovery: V2 + V3 + Recent Pool Rescan\n"
         f"Startup Lookback {STARTUP_LOOKBACK_BLOCKS} blocks\n"
-        f"Recent Pool Rescan Every {RECENT_POOL_RESCAN_SECONDS}s"
+        f"Recent Pool Rescan Every {RECENT_POOL_RESCAN_SECONDS}s\n"
+        f"Live Account Updates Every {LIVE_ACCOUNT_UPDATE_SECONDS}s"
     )
 
     threading.Thread(target=v2_event_listener, daemon=True).start()
     threading.Thread(target=v3_event_listener, daemon=True).start()
     threading.Thread(target=recent_pool_rescan_loop, daemon=True).start()
     threading.Thread(target=portfolio_loop, daemon=True).start()
+    threading.Thread(target=live_account_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
 
     while True:
