@@ -69,6 +69,16 @@ MIN_BUYS_5M = int(os.getenv("MIN_BUYS_5M", "3"))
 MAX_SELL_TAX_PCT = float(os.getenv("MAX_SELL_TAX_PCT", "12"))
 MAX_BUY_TAX_PCT = float(os.getenv("MAX_BUY_TAX_PCT", "15"))
 
+# stronger anti-honeypot gate
+ANTI_HP_ENABLED = os.getenv("ANTI_HP_ENABLED", "on").strip().lower()
+HONEYPOT_IS_ENABLED = os.getenv("HONEYPOT_IS_ENABLED", "on").strip().lower()
+HONEYPOT_MAX_SELL_TAX_PCT = float(os.getenv("HONEYPOT_MAX_SELL_TAX_PCT", "10"))
+BYTECODE_MAX_RISK_SCORE = int(os.getenv("BYTECODE_MAX_RISK_SCORE", "35"))
+STRICT_OWNER_CHECK = os.getenv("STRICT_OWNER_CHECK", "off").strip().lower()  # on/off
+STRICT_LP_LOCK_CHECK = os.getenv("STRICT_LP_LOCK_CHECK", "off").strip().lower()  # on/off
+MIN_BURNED_OR_LOCKED_LP_PCT = float(os.getenv("MIN_BURNED_OR_LOCKED_LP_PCT", "90"))
+BEHAVIOR_BUY_ONLY_THRESHOLD = int(os.getenv("BEHAVIOR_BUY_ONLY_THRESHOLD", "25"))
+
 # exit rules
 LIQUIDITY_DROP_EXIT_PCT = float(os.getenv("LIQUIDITY_DROP_EXIT_PCT", "30"))
 
@@ -158,6 +168,32 @@ V3_ROUTER = Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564
 V3_QUOTER = Web3.to_checksum_address("0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6")
 CHAINLINK_ETH_USD = Web3.to_checksum_address("0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419")
 
+DEAD_ADDRESS = Web3.to_checksum_address("0x000000000000000000000000000000000000dEaD")
+ZERO_ADDRESS = Web3.to_checksum_address("0x0000000000000000000000000000000000000000")
+
+KNOWN_LOCKER_ADDRESSES = {
+    "0x663A5C229c09b049E36dCc11aB7e8b8e4fC0e7F1".lower(),  # placeholder-safe allowlist slot
+    "0x71B5759d73262FBb223956913ecF4ecC51057641".lower(),  # placeholder-safe allowlist slot
+}
+
+SUSPICIOUS_SELECTORS = {
+    "owner()": "8da5cb5b",
+    "renounceOwnership()": "715018a6",
+    "transferOwnership(address)": "f2fde38b",
+    "blacklist(address)": "f9f92be4",
+    "setBlacklist(address,bool)": "0ecb93c0",
+    "excludeFromFees(address,bool)": "c6a577f6",
+    "setTradingEnabled(bool)": "3f4ba83a",
+    "setSwapEnabled(bool)": "6e0620d6",
+    "setSellTax(uint256)": "4a1c5a2d",
+    "setFees(uint256,uint256)": "3e0f4b17",
+    "setMaxTxAmount(uint256)": "4019cfa9",
+    "setMaxWalletSize(uint256)": "ec28438a",
+    "upgradeTo(address)": "3659cfe6",
+    "implementation()": "5c60da1b",
+}
+EIP1967_IMPL_SLOT_HEX = "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
 V2_FACTORY_ABI = [
     {
         "anonymous": False,
@@ -228,6 +264,47 @@ ERC20_ABI = [
         "outputs": [{"type": "bool"}],
         "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}],
         "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
+OWNER_ABI = [
+    {
+        "name": "owner",
+        "outputs": [{"type": "address"}],
+        "inputs": [],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
+PAIR_TOKEN_ABI = [
+    {
+        "name": "totalSupply",
+        "outputs": [{"type": "uint256"}],
+        "inputs": [],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "name": "balanceOf",
+        "outputs": [{"type": "uint256"}],
+        "inputs": [{"name": "owner", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "name": "token0",
+        "outputs": [{"type": "address"}],
+        "inputs": [],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "name": "token1",
+        "outputs": [{"type": "address"}],
+        "inputs": [],
+        "stateMutability": "view",
         "type": "function",
     },
 ]
@@ -382,6 +459,14 @@ def safe_block_number(default: int = 0) -> int:
 
 def get_token_contract(token: str):
     return w3.eth.contract(address=Web3.to_checksum_address(token), abi=ERC20_ABI)
+
+
+def get_owner_contract(token: str):
+    return w3.eth.contract(address=Web3.to_checksum_address(token), abi=OWNER_ABI)
+
+
+def get_pair_contract(pair: str):
+    return w3.eth.contract(address=Web3.to_checksum_address(pair), abi=PAIR_TOKEN_ABI)
 
 
 def get_token_meta(token: str):
@@ -579,7 +664,13 @@ def preflight_sellability_check(token: str, source: str, buy_size_usd: float) ->
         if not sell_ok or expected_back <= 0:
             return False, f"sell preflight failed: {sell_reason}"
 
-        return True, f"V3 roundtrip ok fee={fee_used}"
+        roundtrip_loss_pct = 0.0
+        if amount_in_wei > 0:
+            roundtrip_loss_pct = max(0.0, (1.0 - (expected_back / amount_in_wei)) * 100.0)
+        if roundtrip_loss_pct > HONEYPOT_MAX_SELL_TAX_PCT:
+            return False, f"V3 roundtrip loss too high: {roundtrip_loss_pct:.2f}% fee={fee_used}"
+
+        return True, f"V3 roundtrip ok fee={fee_used} | est loss {roundtrip_loss_pct:.2f}%"
 
     ok, expected_out, _, reason = get_v2_quote(amount_in_wei, token)
     if not ok or expected_out <= 0:
@@ -589,7 +680,13 @@ def preflight_sellability_check(token: str, source: str, buy_size_usd: float) ->
     if not sell_ok or expected_back <= 0:
         return False, f"sell preflight failed: {sell_reason}"
 
-    return True, "V2 roundtrip ok"
+    roundtrip_loss_pct = 0.0
+    if amount_in_wei > 0:
+        roundtrip_loss_pct = max(0.0, (1.0 - (expected_back / amount_in_wei)) * 100.0)
+    if roundtrip_loss_pct > HONEYPOT_MAX_SELL_TAX_PCT:
+        return False, f"V2 roundtrip loss too high: {roundtrip_loss_pct:.2f}%"
+
+    return True, f"V2 roundtrip ok | est loss {roundtrip_loss_pct:.2f}%"
 
 
 def get_live_buy_block_reason(snap: dict) -> Optional[str]:
@@ -736,6 +833,15 @@ def passes_tax_and_sellability(token: str) -> Tuple[bool, str]:
     if sec.get("cannot_sell_all") == "1":
         return False, "cannot sell all flagged"
 
+    if sec.get("hidden_owner") == "1":
+        return False, "hidden owner flagged"
+
+    if sec.get("slippage_modifiable") == "1":
+        return False, "modifiable tax flagged"
+
+    if sec.get("is_blacklisted") == "1":
+        return False, "blacklist flagged"
+
     sell_tax_raw = sec.get("sell_tax")
     buy_tax_raw = sec.get("buy_tax")
 
@@ -752,6 +858,200 @@ def passes_tax_and_sellability(token: str) -> Tuple[bool, str]:
     buy_text = "unknown" if buy_tax < 0 else f"{buy_tax:.2f}%"
 
     return True, f"buy tax {buy_text} | sell tax {sell_text}"
+
+
+def get_honeypot_is(token: str, pair: Optional[str] = None) -> Optional[dict]:
+    if HONEYPOT_IS_ENABLED != "on":
+        return None
+
+    try:
+        params = {"address": token}
+        if pair:
+            params["pair"] = pair
+
+        r = SESSION.get("https://api.honeypot.is/v2/IsHoneypot", params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+
+        body = (r.text or "").strip()
+        if not body:
+            return None
+
+        data = r.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def passes_honeypot_is(token: str, pair: Optional[str] = None) -> Tuple[bool, str]:
+    data = get_honeypot_is(token, pair)
+    if not data:
+        return True, "honeypot.is unavailable"
+
+    if data.get("honeypotResult", {}).get("isHoneypot") is True:
+        return False, "honeypot.is flagged"
+
+    if data.get("simulationSuccess") is False:
+        return False, "honeypot.is simulation failed"
+
+    summary = data.get("summary") or {}
+    flags = summary.get("flags") or []
+    flag_text = ",".join(flags) if flags else "none"
+
+    buy_tax = safe_pct((data.get("simulationResult") or {}).get("buyTax"), default=-1.0)
+    sell_tax = safe_pct((data.get("simulationResult") or {}).get("sellTax"), default=-1.0)
+    transfer_tax = safe_pct((data.get("simulationResult") or {}).get("transferTax"), default=-1.0)
+
+    if sell_tax >= 0 and sell_tax > HONEYPOT_MAX_SELL_TAX_PCT:
+        return False, f"honeypot.is sell tax too high: {sell_tax:.2f}%"
+
+    if buy_tax >= 0 and buy_tax > MAX_BUY_TAX_PCT:
+        return False, f"honeypot.is buy tax too high: {buy_tax:.2f}%"
+
+    if transfer_tax >= 0 and transfer_tax > HONEYPOT_MAX_SELL_TAX_PCT:
+        return False, f"honeypot.is transfer tax too high: {transfer_tax:.2f}%"
+
+    sell_text = "unknown" if sell_tax < 0 else f"{sell_tax:.2f}%"
+    buy_text = "unknown" if buy_tax < 0 else f"{buy_tax:.2f}%"
+
+    return True, f"honeypot.is buy {buy_text} | sell {sell_text} | flags {flag_text}"
+
+
+def get_bytecode_risk(token: str) -> Tuple[int, List[str]]:
+    flags: List[str] = []
+    score = 0
+    try:
+        code_hex = w3.eth.get_code(Web3.to_checksum_address(token)).hex().lower()
+        if code_hex in ("", "0x"):
+            return 100, ["no bytecode"]
+
+        for label, selector in SUSPICIOUS_SELECTORS.items():
+            if selector in code_hex:
+                flags.append(label)
+                if label in ("blacklist(address)", "setBlacklist(address,bool)", "upgradeTo(address)", "implementation()"):
+                    score += 12
+                else:
+                    score += 5
+
+        if "f4" in code_hex:
+            flags.append("delegatecall-present")
+            score += 8
+
+        if EIP1967_IMPL_SLOT_HEX in code_hex:
+            flags.append("eip1967-proxy-pattern")
+            score += 18
+
+        if "8da5cb5b" in code_hex and any(x.startswith("set") for x in flags):
+            flags.append("owner-admin-surface")
+            score += 8
+
+        return score, sorted(set(flags))
+    except Exception as e:
+        return 0, [f"bytecode-scan-error:{e}"]
+
+
+def get_owner_status(token: str) -> Tuple[Optional[str], str]:
+    try:
+        c = get_owner_contract(token)
+        owner = c.functions.owner().call()
+        owner = Web3.to_checksum_address(owner)
+        if owner == ZERO_ADDRESS:
+            return owner, "renounced"
+        return owner, "active"
+    except Exception:
+        return None, "unknown"
+
+
+def get_lp_status(pair: str) -> Tuple[bool, str]:
+    try:
+        c = get_pair_contract(pair)
+        total_supply = int(c.functions.totalSupply().call())
+        if total_supply <= 0:
+            return True, "lp unknown"
+
+        burned = 0
+        locked = 0
+
+        try:
+            burned += int(c.functions.balanceOf(DEAD_ADDRESS).call())
+        except Exception:
+            pass
+
+        try:
+            burned += int(c.functions.balanceOf(ZERO_ADDRESS).call())
+        except Exception:
+            pass
+
+        for locker in KNOWN_LOCKER_ADDRESSES:
+            try:
+                locked += int(c.functions.balanceOf(Web3.to_checksum_address(locker)).call())
+            except Exception:
+                pass
+
+        protected_pct = ((burned + locked) / total_supply) * 100.0 if total_supply > 0 else 0.0
+        detail = f"lp protected {protected_pct:.2f}%"
+
+        if STRICT_LP_LOCK_CHECK == "on" and protected_pct < MIN_BURNED_OR_LOCKED_LP_PCT:
+            return False, f"{detail} < {MIN_BURNED_OR_LOCKED_LP_PCT:.2f}%"
+
+        return True, detail
+    except Exception as e:
+        return True, f"lp unknown: {e}"
+
+
+def passes_behavioral_filter(snap: dict) -> Tuple[bool, str]:
+    buys = int(snap.get("buys_5m") or 0)
+    sells = int(snap.get("sells_5m") or 0)
+
+    if buys >= BEHAVIOR_BUY_ONLY_THRESHOLD and sells == 0:
+        return False, f"buys-only pattern: {buys} buys and 0 sells"
+
+    return True, f"behavior ok buys={buys} sells={sells}"
+
+
+def anti_honeypot_gate(token: str, pair: str, source: str, snap: dict) -> Tuple[bool, str]:
+    if ANTI_HP_ENABLED != "on":
+        return True, "anti-hp disabled"
+
+    token = Web3.to_checksum_address(token)
+    pair = Web3.to_checksum_address(pair)
+
+    ok, sec_reason = passes_tax_and_sellability(token)
+    if not ok:
+        return False, sec_reason
+
+    ok, hp_reason = passes_honeypot_is(token, pair)
+    if not ok:
+        return False, hp_reason
+
+    score, flags = get_bytecode_risk(token)
+    if score >= BYTECODE_MAX_RISK_SCORE:
+        return False, f"bytecode risk {score} >= {BYTECODE_MAX_RISK_SCORE} | {', '.join(flags[:8])}"
+
+    owner, owner_state = get_owner_status(token)
+    if STRICT_OWNER_CHECK == "on" and owner_state != "renounced":
+        return False, f"owner not renounced ({owner_state})"
+
+    lp_ok, lp_reason = get_lp_status(pair)
+    if not lp_ok:
+        return False, lp_reason
+
+    behavior_ok, behavior_reason = passes_behavioral_filter(snap)
+    if not behavior_ok:
+        return False, behavior_reason
+
+    preflight_ok, preflight_reason = preflight_sellability_check(token, source, PURCHASE_AMOUNT_USD)
+    if not preflight_ok:
+        return False, preflight_reason
+
+    owner_text = owner_state if owner is None else f"{owner_state}:{owner}"
+    flag_text = "none" if not flags else ",".join(flags[:6])
+
+    return True, (
+        f"{sec_reason} | {hp_reason} | "
+        f"bytecode risk {score} ({flag_text}) | "
+        f"owner {owner_text} | {lp_reason} | {behavior_reason} | {preflight_reason}"
+    )
 
 
 # -------------------------
@@ -1918,25 +2218,15 @@ def process_pool(token: str, pair: str, source: str):
                 )
             return
 
-        ok, security_reason = passes_tax_and_sellability(token)
-        if not ok:
+        gate_ok, gate_reason = anti_honeypot_gate(token, pair, source, snap)
+        if not gate_ok:
             send(
                 f"⚠️ TRADE SKIPPED\n\n"
                 f"Source {source}\n"
+                f"{snap.get('symbol', 'UNK')}\n"
                 f"Token\n{token}\n\n"
                 f"Pair\n{pair}\n\n"
-                f"Reason: {security_reason}"
-            )
-            return
-
-        sell_ok, sell_reason = preflight_sellability_check(token, source, PURCHASE_AMOUNT_USD)
-        if not sell_ok:
-            send(
-                f"⚠️ TRADE SKIPPED\n\n"
-                f"Source {source}\n"
-                f"Token\n{token}\n\n"
-                f"Pair\n{pair}\n\n"
-                f"Reason: {sell_reason}"
+                f"Reason: {gate_reason}"
             )
             return
 
@@ -1961,8 +2251,7 @@ def process_pool(token: str, pair: str, source: str):
                 f"Volume 5m ${snap['volume_5m']:,.0f}\n"
                 f"Buys 5m {snap['buys_5m']}\n"
                 f"Sells 5m {snap['sells_5m']}\n"
-                f"Security: {security_reason}\n"
-                f"Preflight: {sell_reason}"
+                f"Security: {gate_reason}"
             )
 
         if RUN_PURCHASE == "on":
@@ -2298,6 +2587,8 @@ def main():
         f"Min Volume 5m ${MIN_VOLUME_5M_USD:,.0f}\n"
         f"Entry Rules: buys >= {MIN_BUYS_5M} | sells >= {MIN_SELLS_5M}\n"
         f"Security Rules: sell tax <= {MAX_SELL_TAX_PCT:.2f}% | buy tax <= {MAX_BUY_TAX_PCT:.2f}%\n"
+        f"Anti-HP: {ANTI_HP_ENABLED.upper()} | Honeypot.is {HONEYPOT_IS_ENABLED.upper()} | Bytecode Max Risk {BYTECODE_MAX_RISK_SCORE}\n"
+        f"Strict Owner Check {STRICT_OWNER_CHECK.upper()} | Strict LP Lock Check {STRICT_LP_LOCK_CHECK.upper()}\n"
         f"Exit Rules: trail arm {TRAIL_ARM_PCT:.0f}% | trail drop {TRAIL_DROP_PCT:.0f}% | liquidity drop {LIQUIDITY_DROP_EXIT_PCT:.0f}%\n"
         f"Paper Exit Model: haircut {PAPER_EXIT_HAIRCUT_PCT:.0f}% | cap {PAPER_EXIT_MAX_BUYSIDE_SHARE * 100:.0f}% buy-side\n"
         f"Sell Preflight ON\n"
