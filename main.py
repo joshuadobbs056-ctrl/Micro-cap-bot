@@ -60,8 +60,12 @@ MIN_BUYS_5M = int(os.getenv("MIN_BUYS_5M", "1"))
 MAX_SELL_TAX_PCT = float(os.getenv("MAX_SELL_TAX_PCT", "10"))
 MAX_BUY_TAX_PCT = float(os.getenv("MAX_BUY_TAX_PCT", "15"))
 
-# exit criteria - ONLY liquidity drop
+# exit rules
 LIQUIDITY_DROP_EXIT_PCT = float(os.getenv("LIQUIDITY_DROP_EXIT_PCT", "25"))
+
+# trailing exit
+TRAIL_ARM_PCT = float(os.getenv("TRAIL_ARM_PCT", "20"))
+TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "15"))
 
 # paper exit simulation
 PAPER_EXIT_HAIRCUT_PCT = float(os.getenv("PAPER_EXIT_HAIRCUT_PCT", "30"))
@@ -464,7 +468,7 @@ def approve_token_if_needed(token: str, amount_raw: int) -> bool:
         return False
 
 
-def execute_live_buy(token: str, pair: str, entry_liquidity_usd: float) -> Optional[dict]:
+def execute_live_buy(token: str, pair: str, entry_liquidity_usd: float, entry_price: float) -> Optional[dict]:
     if not ACCOUNT:
         send("⚠️ LIVE BUY SKIPPED\nReason: PRIVATE_KEY not loaded")
         return None
@@ -515,6 +519,7 @@ def execute_live_buy(token: str, pair: str, entry_liquidity_usd: float) -> Optio
             f"{symbol}\n"
             f"Token\n{token}\n\n"
             f"Pair\n{pair}\n\n"
+            f"Entry Price ${entry_price:.10f}\n"
             f"Buy Size ${PURCHASE_AMOUNT_USD:.2f}\n"
             f"Approx ETH {eth_amount:.6f}\n"
             f"Tokens {token_amount:,.6f}"
@@ -524,11 +529,12 @@ def execute_live_buy(token: str, pair: str, entry_liquidity_usd: float) -> Optio
             "token": token,
             "pair": pair,
             "symbol": symbol,
-            "entry_price": 0.0,
+            "entry_price": entry_price,
             "entry_liquidity_usd": entry_liquidity_usd,
             "token_amount_raw": token_amount_raw,
             "decimals": decimals,
             "opened": now_ts(),
+            "peak_price": entry_price if entry_price > 0 else 0.0,
         }
 
     except Exception as e:
@@ -536,9 +542,9 @@ def execute_live_buy(token: str, pair: str, entry_liquidity_usd: float) -> Optio
         return None
 
 
-def execute_live_sell(position: dict, current_price_usd: float, current_liquidity_usd: float):
+def execute_live_sell(position: dict, current_price_usd: float, current_liquidity_usd: float, reason: str) -> bool:
     if not ACCOUNT:
-        return
+        return False
 
     token = position["token"]
     pair = position["pair"]
@@ -548,9 +554,9 @@ def execute_live_sell(position: dict, current_price_usd: float, current_liquidit
 
     try:
         if amount_raw <= 0:
-            return
+            return False
         if not approve_token_if_needed(token, amount_raw):
-            return
+            return False
 
         path = [token, WETH]
         try:
@@ -558,7 +564,6 @@ def execute_live_sell(position: dict, current_price_usd: float, current_liquidit
             expected_eth_out = int(amounts_out[-1])
             amount_out_min = int(expected_eth_out * (10000 - SLIPPAGE_BPS) / 10000)
         except Exception:
-            expected_eth_out = 0
             amount_out_min = 0
 
         nonce = w3.eth.get_transaction_count(wallet, "pending")
@@ -584,12 +589,16 @@ def execute_live_sell(position: dict, current_price_usd: float, current_liquidit
                 f"Pair\n{pair}\n\n"
                 f"Current Price ${current_price_usd:.10f}\n"
                 f"Current Liquidity ${current_liquidity_usd:,.0f}\n"
-                f"Reason: liquidity dropped {LIQUIDITY_DROP_EXIT_PCT:.0f}%"
+                f"Reason: {reason}"
             )
-        else:
-            send(f"❌ LIVE SELL FAILED\n{symbol}\n{token}")
+            return True
+
+        send(f"❌ LIVE SELL FAILED\n{symbol}\n{token}")
+        return False
+
     except Exception as e:
         send(f"❌ LIVE SELL ERROR\n{symbol}\n{token}\n{e}")
+        return False
 
 
 # -------------------------
@@ -612,6 +621,7 @@ class PaperTrade:
         self.last_good_liquidity_usd = entry_liquidity_usd if entry_liquidity_usd > 0 else 0.0
         self.last_mark_value_usd = PURCHASE_AMOUNT_USD
         self.peak_value_usd = PURCHASE_AMOUNT_USD
+        self.peak_price = entry_price if entry_price > 0 else 0.0
         self.last_update_ts = now_ts()
         self.last_good_snapshot_ts = now_ts()
 
@@ -640,6 +650,8 @@ def update_trade_market_state(trade: PaperTrade, price: float, liquidity_usd: fl
         trade.last_mark_value_usd = trade.tokens * mark_price
         if trade.last_mark_value_usd > trade.peak_value_usd:
             trade.peak_value_usd = trade.last_mark_value_usd
+        if mark_price > trade.peak_price:
+            trade.peak_price = mark_price
 
     trade.last_update_ts = now_ts()
     if good_snapshot:
@@ -743,6 +755,30 @@ def monitor_paper_trade(token: str):
             f"PnL {pnl:.2f}%"
         )
 
+        trail_arm_value = PURCHASE_AMOUNT_USD * (1.0 + TRAIL_ARM_PCT / 100.0)
+        trail_floor_value = trade.peak_value_usd * (1.0 - TRAIL_DROP_PCT / 100.0)
+        trailing_armed = trade.peak_value_usd >= trail_arm_value
+        trailing_trigger = trailing_armed and value <= trail_floor_value
+
+        if trailing_trigger:
+            ACCOUNT_CASH += value
+            peak_pnl = ((trade.peak_value_usd - PURCHASE_AMOUNT_USD) / PURCHASE_AMOUNT_USD) * 100 if PURCHASE_AMOUNT_USD > 0 else 0.0
+
+            send(
+                f"💰 PAPER TRAILING EXIT\n\n"
+                f"{trade.symbol}\n"
+                f"Token\n{trade.token}\n\n"
+                f"Entry ${trade.entry_price:.10f}\n"
+                f"Exit ${mark_price:.10f}\n\n"
+                f"Peak Value ${trade.peak_value_usd:.2f}\n"
+                f"Final Value ${value:.2f}\n"
+                f"PnL {pnl:.2f}%\n\n"
+                f"Reason: trailed {TRAIL_DROP_PCT:.0f}% from peak after arming at {TRAIL_ARM_PCT:.0f}%\n"
+                f"Peak PnL {peak_pnl:.2f}%"
+            )
+            PAPER_TRADES.pop(token, None)
+            return
+
         exit_floor = trade.entry_liquidity_usd * (1 - LIQUIDITY_DROP_EXIT_PCT / 100.0)
 
         liq_trigger = current_liq >= 0 and current_liq <= exit_floor
@@ -758,7 +794,7 @@ def monitor_paper_trade(token: str):
             reason = (
                 f"liquidity dropped {LIQUIDITY_DROP_EXIT_PCT:.0f}%"
                 if liq_trigger
-                else f"stale snapshot + last liquidity below exit floor"
+                else "stale snapshot + last liquidity below exit floor"
             )
 
             send(
@@ -789,23 +825,65 @@ def monitor_live_position(token: str):
         if not snap:
             continue
 
-        current_liq = snap["liquidity_usd"]
-        current_price = snap["price_usd"]
+        current_liq = safe_float(snap["liquidity_usd"])
+        current_price = safe_float(snap["price_usd"])
+        entry_price = safe_float(pos.get("entry_price"))
         exit_floor = pos["entry_liquidity_usd"] * (1 - LIQUIDITY_DROP_EXIT_PCT / 100.0)
+
+        if current_price > pos.get("peak_price", 0.0):
+            pos["peak_price"] = current_price
+
+        peak_price = safe_float(pos.get("peak_price"))
 
         send(
             f"📊 LIVE POSITION UPDATE\n\n"
             f"{pos['symbol']}\n"
             f"Token\n{pos['token']}\n\n"
+            f"Entry Price ${entry_price:.10f}\n"
             f"Current Price ${current_price:.10f}\n"
+            f"Peak Price ${peak_price:.10f}\n"
             f"Entry Liquidity ${pos['entry_liquidity_usd']:,.0f}\n"
             f"Current Liquidity ${current_liq:,.0f}"
         )
 
+        if entry_price > 0 and current_price > 0 and peak_price > 0:
+            peak_pnl = ((peak_price - entry_price) / entry_price) * 100.0
+            trail_floor_price = peak_price * (1.0 - TRAIL_DROP_PCT / 100.0)
+            trailing_trigger = peak_pnl >= TRAIL_ARM_PCT and current_price <= trail_floor_price
+
+            if trailing_trigger:
+                sold = execute_live_sell(
+                    pos,
+                    current_price,
+                    current_liq,
+                    f"trailed {TRAIL_DROP_PCT:.0f}% from peak after arming at {TRAIL_ARM_PCT:.0f}%"
+                )
+                if sold:
+                    LIVE_POSITIONS.pop(token, None)
+                    return
+                send(
+                    f"⚠️ LIVE POSITION STILL OPEN\n\n"
+                    f"{pos['symbol']}\n"
+                    f"Token\n{pos['token']}\n\n"
+                    f"Sell failed, keeping position in memory."
+                )
+
         if current_liq <= exit_floor:
-            execute_live_sell(pos, current_price, current_liq)
-            LIVE_POSITIONS.pop(token, None)
-            return
+            sold = execute_live_sell(
+                pos,
+                current_price,
+                current_liq,
+                f"liquidity dropped {LIQUIDITY_DROP_EXIT_PCT:.0f}%"
+            )
+            if sold:
+                LIVE_POSITIONS.pop(token, None)
+                return
+            send(
+                f"⚠️ LIVE POSITION STILL OPEN\n\n"
+                f"{pos['symbol']}\n"
+                f"Token\n{pos['token']}\n\n"
+                f"Sell failed, keeping position in memory."
+            )
 
 
 # -------------------------
@@ -927,7 +1005,7 @@ def process_pool(token: str, pair: str, source: str):
             if len(LIVE_POSITIONS) >= MAX_OPEN_TRADES:
                 send(f"⚠️ LIVE TRADE SKIPPED\nReason: max open trades reached\nOpen Trades {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}")
                 return
-            pos = execute_live_buy(token, pair, snap["liquidity_usd"])
+            pos = execute_live_buy(token, pair, snap["liquidity_usd"], snap["price_usd"])
             if pos:
                 LIVE_POSITIONS[token] = pos
                 threading.Thread(target=monitor_live_position, args=(token,), daemon=True).start()
@@ -1153,7 +1231,7 @@ def main():
         f"Age Limit {MAX_TOKEN_AGE_SECONDS}s\n"
         f"Entry Rules: volume there and sells >= {MIN_SELLS_5M}\n"
         f"Security Rules: sell tax <= {MAX_SELL_TAX_PCT:.2f}% | buy tax <= {MAX_BUY_TAX_PCT:.2f}%\n"
-        f"Exit Rule: liquidity drop {LIQUIDITY_DROP_EXIT_PCT:.0f}%\n"
+        f"Exit Rules: trail arm {TRAIL_ARM_PCT:.0f}% | trail drop {TRAIL_DROP_PCT:.0f}% | liquidity drop {LIQUIDITY_DROP_EXIT_PCT:.0f}%\n"
         f"Paper Exit Model: haircut {PAPER_EXIT_HAIRCUT_PCT:.0f}% | cap {PAPER_EXIT_MAX_BUYSIDE_SHARE * 100:.0f}% buy-side\n"
         f"Discovery: V2 + V3\n"
         f"Startup Lookback {STARTUP_LOOKBACK_BLOCKS} blocks"
