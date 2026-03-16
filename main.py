@@ -414,15 +414,30 @@ eth_usd_feed = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=CHAINLINK_ETH_USD_
 # TELEGRAM
 # -------------------------
 def send(msg: str):
+    delivered = False
+
     if TELEGRAM_TOKEN and CHAT_ID:
         try:
-            SESSION.post(
+            r = SESSION.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                data={"chat_id": CHAT_ID, "text": msg, "disable_web_page_preview": True},
+                data={
+                    "chat_id": CHAT_ID,
+                    "text": msg,
+                    "disable_web_page_preview": True,
+                },
                 timeout=10,
             )
-        except Exception:
-            pass
+            if r.status_code == 200:
+                delivered = True
+            else:
+                print(f"Telegram send failed: status={r.status_code} body={r.text}")
+        except Exception as e:
+            print(f"Telegram send exception: {e}")
+    else:
+        print("Telegram not configured: TELEGRAM_TOKEN or CHAT_ID missing")
+
+    if delivered:
+        print("Telegram delivered")
     print(msg)
 
 
