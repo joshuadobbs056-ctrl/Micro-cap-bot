@@ -41,8 +41,8 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
 RUN_PURCHASE = os.getenv("RUN_PURCHASE", "off").strip().lower()  # on/off
 
 START_BALANCE = float(os.getenv("START_BALANCE", "2000"))
-PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD", "50"))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))
+PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD", "25"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
 
 PORTFOLIO_UPDATE_SECONDS = int(os.getenv("PORTFOLIO_UPDATE_SECONDS", "60"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "600"))
@@ -55,25 +55,26 @@ LIVE_ACCOUNT_UPDATE_SECONDS = int(os.getenv("LIVE_ACCOUNT_UPDATE_SECONDS", "60")
 # scan recent blocks on startup so the scanner can prove detection quickly
 STARTUP_LOOKBACK_BLOCKS = int(os.getenv("STARTUP_LOOKBACK_BLOCKS", "250"))
 
-# widened age window so recent pools can still qualify later
-MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "7200"))  # 120 min
+# safer age window
+MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "900"))  # 15 min
+MIN_POOL_AGE_SECONDS = int(os.getenv("MIN_POOL_AGE_SECONDS", "120"))    # 2 min
 
-# entry criteria
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "2000"))
-MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "25"))
-MIN_SELLS_5M = int(os.getenv("MIN_SELLS_5M", "0"))
-MIN_BUYS_5M = int(os.getenv("MIN_BUYS_5M", "1"))
+# entry criteria (tighter defaults)
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "7000"))
+MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "1500"))
+MIN_SELLS_5M = int(os.getenv("MIN_SELLS_5M", "2"))
+MIN_BUYS_5M = int(os.getenv("MIN_BUYS_5M", "3"))
 
 # tax / sellability filter
-MAX_SELL_TAX_PCT = float(os.getenv("MAX_SELL_TAX_PCT", "15"))
-MAX_BUY_TAX_PCT = float(os.getenv("MAX_BUY_TAX_PCT", "20"))
+MAX_SELL_TAX_PCT = float(os.getenv("MAX_SELL_TAX_PCT", "12"))
+MAX_BUY_TAX_PCT = float(os.getenv("MAX_BUY_TAX_PCT", "15"))
 
 # exit rules
-LIQUIDITY_DROP_EXIT_PCT = float(os.getenv("LIQUIDITY_DROP_EXIT_PCT", "35"))
+LIQUIDITY_DROP_EXIT_PCT = float(os.getenv("LIQUIDITY_DROP_EXIT_PCT", "30"))
 
 # trailing exit
-TRAIL_ARM_PCT = float(os.getenv("TRAIL_ARM_PCT", "60"))
-TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "30"))
+TRAIL_ARM_PCT = float(os.getenv("TRAIL_ARM_PCT", "50"))
+TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "25"))
 
 # paper exit simulation
 PAPER_EXIT_HAIRCUT_PCT = float(os.getenv("PAPER_EXIT_HAIRCUT_PCT", "15"))
@@ -101,6 +102,7 @@ V3_FEE_CANDIDATES = [500, 3000, 10000]
 MIN_ETH_GAS_RESERVE = float(os.getenv("MIN_ETH_GAS_RESERVE", "0.01"))
 FAILED_BUY_COOLDOWN_SECONDS = int(os.getenv("FAILED_BUY_COOLDOWN_SECONDS", "900"))
 PAIR_REJECT_LOG_COOLDOWN_SECONDS = int(os.getenv("PAIR_REJECT_LOG_COOLDOWN_SECONDS", "180"))
+MAX_FAILED_SELL_ATTEMPTS = int(os.getenv("MAX_FAILED_SELL_ATTEMPTS", "2"))
 
 # provider limits / retry
 MAX_LOG_RANGE = int(os.getenv("MAX_LOG_RANGE", "10"))
@@ -108,7 +110,7 @@ RPC_BACKOFF_START_SECONDS = int(os.getenv("RPC_BACKOFF_START_SECONDS", "2"))
 RPC_BACKOFF_MAX_SECONDS = int(os.getenv("RPC_BACKOFF_MAX_SECONDS", "30"))
 
 # optional hard cap so listener threads do not get bogged down
-MAX_ACTIVE_POOL_THREADS = int(os.getenv("MAX_ACTIVE_POOL_THREADS", "100"))
+MAX_ACTIVE_POOL_THREADS = int(os.getenv("MAX_ACTIVE_POOL_THREADS", "8"))
 
 # recent pool rescanner
 RECENT_POOL_RESCAN_SECONDS = int(os.getenv("RECENT_POOL_RESCAN_SECONDS", "15"))
@@ -472,6 +474,18 @@ def get_v2_quote(amount_in_wei: int, token: str) -> Tuple[bool, int, int, str]:
         return False, 0, 0, f"no usable V2 route: {e}"
 
 
+def get_v2_reverse_quote(amount_in_raw: int, token: str) -> Tuple[bool, int, str]:
+    path = [Web3.to_checksum_address(token), WETH]
+    try:
+        amounts_out = router.functions.getAmountsOut(int(amount_in_raw), path).call()
+        expected_out = int(amounts_out[-1])
+        if expected_out <= 0:
+            return False, 0, "reverse quote returned zero"
+        return True, expected_out, "ok"
+    except Exception as e:
+        return False, 0, f"no usable V2 reverse route: {e}"
+
+
 def get_v3_fee_from_source(source: str) -> int:
     if isinstance(source, str) and source.startswith("V3:"):
         try:
@@ -502,6 +516,24 @@ def get_v3_quote(amount_in_wei: int, token: str, fee: int) -> Tuple[bool, int, i
         return False, 0, 0, f"no usable V3 route: {e}"
 
 
+def get_v3_reverse_quote(amount_in_raw: int, token: str, fee: int) -> Tuple[bool, int, str]:
+    try:
+        expected_out = int(
+            v3_quoter.functions.quoteExactInputSingle(
+                Web3.to_checksum_address(token),
+                WETH,
+                int(fee),
+                int(amount_in_raw),
+                0,
+            ).call()
+        )
+        if expected_out <= 0:
+            return False, 0, "V3 reverse quote returned zero"
+        return True, expected_out, "ok"
+    except Exception as e:
+        return False, 0, f"no usable V3 reverse route: {e}"
+
+
 def get_v3_quote_best(amount_in_wei: int, token: str, preferred_fee: Optional[int] = None) -> Tuple[bool, int, int, int, str]:
     token = Web3.to_checksum_address(token)
 
@@ -523,6 +555,43 @@ def get_v3_quote_best(amount_in_wei: int, token: str, preferred_fee: Optional[in
     return False, 0, 0, 0, " | ".join(errors)
 
 
+def preflight_sellability_check(token: str, source: str, buy_size_usd: float) -> Tuple[bool, str]:
+    """
+    Cheap pre-buy check to reduce unsellable buys:
+    - verify buy route exists
+    - estimate tokens from that buy
+    - verify reverse sell route exists for the estimated tokens
+    This does NOT guarantee sellability, but it filters out many dead/no-route tokens.
+    """
+    try:
+        token = Web3.to_checksum_address(token)
+        amount_in_wei = int(w3.to_wei(usd_to_eth(buy_size_usd), "ether"))
+    except Exception as e:
+        return False, f"preflight setup failed: {e}"
+
+    if source.startswith("V3"):
+        preferred_fee = get_v3_fee_from_source(source)
+        ok, expected_out, _, fee_used, reason = get_v3_quote_best(amount_in_wei, token, preferred_fee=preferred_fee)
+        if not ok or expected_out <= 0:
+            return False, f"buy quote failed: {reason}"
+
+        sell_ok, expected_back, sell_reason = get_v3_reverse_quote(expected_out, token, fee_used)
+        if not sell_ok or expected_back <= 0:
+            return False, f"sell preflight failed: {sell_reason}"
+
+        return True, f"V3 roundtrip ok fee={fee_used}"
+
+    ok, expected_out, _, reason = get_v2_quote(amount_in_wei, token)
+    if not ok or expected_out <= 0:
+        return False, f"buy quote failed: {reason}"
+
+    sell_ok, expected_back, sell_reason = get_v2_reverse_quote(expected_out, token)
+    if not sell_ok or expected_back <= 0:
+        return False, f"sell preflight failed: {sell_reason}"
+
+    return True, "V2 roundtrip ok"
+
+
 def get_live_buy_block_reason(snap: dict) -> Optional[str]:
     age = snap.get("age_seconds")
     liquidity = safe_float(snap.get("liquidity_usd"))
@@ -533,6 +602,8 @@ def get_live_buy_block_reason(snap: dict) -> Optional[str]:
 
     if age is None:
         return "age unknown"
+    if age < MIN_POOL_AGE_SECONDS:
+        return f"pool too new: {age:.0f}s < {MIN_POOL_AGE_SECONDS}s"
     if age > MAX_TOKEN_AGE_SECONDS:
         return f"age too high: {age:.0f}s > {MAX_TOKEN_AGE_SECONDS}s"
     if liquidity < MIN_LIQUIDITY_USD:
@@ -786,6 +857,21 @@ def approve_token_if_needed(token: str, amount_raw: int, spender: str) -> bool:
     except Exception as e:
         send(f"❌ APPROVE ERROR\n{token}\nSpender {spender}\n{e}")
         return False
+
+
+def record_failed_sell(token: str):
+    with LOCK:
+        FAILED_SELL_ATTEMPTS[token] = FAILED_SELL_ATTEMPTS.get(token, 0) + 1
+
+
+def clear_failed_sell(token: str):
+    with LOCK:
+        FAILED_SELL_ATTEMPTS.pop(token, None)
+
+
+def sell_attempts_exceeded(token: str) -> bool:
+    with LOCK:
+        return FAILED_SELL_ATTEMPTS.get(token, 0) >= MAX_FAILED_SELL_ATTEMPTS
 
 
 def execute_live_buy_v2(
@@ -1147,10 +1233,21 @@ def execute_live_sell_v2(position: dict, current_price_usd: float, current_liqui
     wallet = ACCOUNT.address
     m = get_live_position_metrics(position)
 
+    if sell_attempts_exceeded(token):
+        send(
+            f"⚠️ SELL BLOCKED\n\n"
+            f"{symbol}\n"
+            f"Token\n{token}\n\n"
+            f"Reason: max failed sell attempts reached\n"
+            f"Attempts {MAX_FAILED_SELL_ATTEMPTS}"
+        )
+        return False
+
     try:
         if amount_raw <= 0:
             return False
         if not approve_token_if_needed(token, amount_raw, ROUTER):
+            record_failed_sell(token)
             return False
 
         path = [token, WETH]
@@ -1159,6 +1256,7 @@ def execute_live_sell_v2(position: dict, current_price_usd: float, current_liqui
             expected_eth_out = int(amounts_out[-1])
             amount_out_min = int(expected_eth_out * (10000 - SLIPPAGE_BPS) / 10000)
         except Exception as e:
+            record_failed_sell(token)
             send(
                 f"❌ LIVE SELL SKIPPED\n\n"
                 f"{symbol}\n"
@@ -1184,6 +1282,7 @@ def execute_live_sell_v2(position: dict, current_price_usd: float, current_liqui
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
 
         if receipt.status == 1:
+            clear_failed_sell(token)
             send(
                 f"🔴 LIVE SELL CLOSED\n\n"
                 f"{symbol}\n"
@@ -1202,6 +1301,7 @@ def execute_live_sell_v2(position: dict, current_price_usd: float, current_liqui
             )
             return True
 
+        record_failed_sell(token)
         send(
             f"❌ LIVE SELL FAILED\n\n"
             f"{symbol}\n"
@@ -1217,6 +1317,7 @@ def execute_live_sell_v2(position: dict, current_price_usd: float, current_liqui
         return False
 
     except Exception as e:
+        record_failed_sell(token)
         send(f"❌ LIVE SELL ERROR\n{symbol}\n{token}\n{e}")
         return False
 
@@ -1234,10 +1335,21 @@ def execute_live_sell_v3(position: dict, current_price_usd: float, current_liqui
     fee = get_v3_fee_from_source(source)
     m = get_live_position_metrics(position)
 
+    if sell_attempts_exceeded(token):
+        send(
+            f"⚠️ SELL BLOCKED\n\n"
+            f"{symbol}\n"
+            f"Token\n{token}\n\n"
+            f"Reason: max failed sell attempts reached\n"
+            f"Attempts {MAX_FAILED_SELL_ATTEMPTS}"
+        )
+        return False
+
     try:
         if amount_raw <= 0:
             return False
         if not approve_token_if_needed(token, amount_raw, V3_ROUTER):
+            record_failed_sell(token)
             return False
 
         try:
@@ -1254,6 +1366,7 @@ def execute_live_sell_v3(position: dict, current_price_usd: float, current_liqui
             if amount_out_min <= 0:
                 raise RuntimeError("amountOutMin <= 0")
         except Exception as e:
+            record_failed_sell(token)
             send(
                 f"❌ LIVE SELL SKIPPED\n\n"
                 f"{symbol}\n"
@@ -1295,6 +1408,7 @@ def execute_live_sell_v3(position: dict, current_price_usd: float, current_liqui
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
 
         if receipt.status == 1:
+            clear_failed_sell(token)
             send(
                 f"🔴 LIVE SELL CLOSED (V3)\n\n"
                 f"{symbol}\n"
@@ -1314,6 +1428,7 @@ def execute_live_sell_v3(position: dict, current_price_usd: float, current_liqui
             )
             return True
 
+        record_failed_sell(token)
         send(
             f"❌ LIVE SELL FAILED (V3)\n\n"
             f"{symbol}\n"
@@ -1329,6 +1444,7 @@ def execute_live_sell_v3(position: dict, current_price_usd: float, current_liqui
         return False
 
     except Exception as e:
+        record_failed_sell(token)
         send(f"❌ LIVE SELL ERROR (V3)\n{symbol}\n{token}\n{e}")
         return False
 
@@ -1374,6 +1490,7 @@ TRADED_POOLS = set()
 
 RECENT_POOLS: Dict[str, Dict[str, Any]] = {}
 FAILED_LIVE_BUYS: Dict[str, float] = {}
+FAILED_SELL_ATTEMPTS: Dict[str, int] = {}
 PAIR_REASON_LOG_TS: Dict[str, float] = {}
 
 LOCK = threading.Lock()
@@ -1812,6 +1929,17 @@ def process_pool(token: str, pair: str, source: str):
             )
             return
 
+        sell_ok, sell_reason = preflight_sellability_check(token, source, PURCHASE_AMOUNT_USD)
+        if not sell_ok:
+            send(
+                f"⚠️ TRADE SKIPPED\n\n"
+                f"Source {source}\n"
+                f"Token\n{token}\n\n"
+                f"Pair\n{pair}\n\n"
+                f"Reason: {sell_reason}"
+            )
+            return
+
         age = snap["age_seconds"] or 0
 
         should_alert = False
@@ -1833,7 +1961,8 @@ def process_pool(token: str, pair: str, source: str):
                 f"Volume 5m ${snap['volume_5m']:,.0f}\n"
                 f"Buys 5m {snap['buys_5m']}\n"
                 f"Sells 5m {snap['sells_5m']}\n"
-                f"Security: {security_reason}"
+                f"Security: {security_reason}\n"
+                f"Preflight: {sell_reason}"
             )
 
         if RUN_PURCHASE == "on":
@@ -2164,13 +2293,15 @@ def main():
         f"Balance ${START_BALANCE:.2f}\n"
         f"Buy Size ${PURCHASE_AMOUNT_USD:.2f}\n"
         f"Max Open Trades {MAX_OPEN_TRADES}\n"
-        f"Age Limit {MAX_TOKEN_AGE_SECONDS}s\n"
+        f"Pool Age Window {MIN_POOL_AGE_SECONDS}s - {MAX_TOKEN_AGE_SECONDS}s\n"
         f"Min Liquidity ${MIN_LIQUIDITY_USD:,.0f}\n"
         f"Min Volume 5m ${MIN_VOLUME_5M_USD:,.0f}\n"
-        f"Entry Rules: volume there and sells >= {MIN_SELLS_5M}\n"
+        f"Entry Rules: buys >= {MIN_BUYS_5M} | sells >= {MIN_SELLS_5M}\n"
         f"Security Rules: sell tax <= {MAX_SELL_TAX_PCT:.2f}% | buy tax <= {MAX_BUY_TAX_PCT:.2f}%\n"
         f"Exit Rules: trail arm {TRAIL_ARM_PCT:.0f}% | trail drop {TRAIL_DROP_PCT:.0f}% | liquidity drop {LIQUIDITY_DROP_EXIT_PCT:.0f}%\n"
         f"Paper Exit Model: haircut {PAPER_EXIT_HAIRCUT_PCT:.0f}% | cap {PAPER_EXIT_MAX_BUYSIDE_SHARE * 100:.0f}% buy-side\n"
+        f"Sell Preflight ON\n"
+        f"Max Failed Sell Attempts {MAX_FAILED_SELL_ATTEMPTS}\n"
         f"Discovery: V2 + V3 + Recent Pool Rescan\n"
         f"Startup Lookback {STARTUP_LOOKBACK_BLOCKS} blocks\n"
         f"Recent Pool Rescan Every {RECENT_POOL_RESCAN_SECONDS}s\n"
