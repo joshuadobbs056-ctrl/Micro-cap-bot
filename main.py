@@ -47,48 +47,53 @@ MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))
 PORTFOLIO_UPDATE_SECONDS = int(os.getenv("PORTFOLIO_UPDATE_SECONDS", "60"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "600"))
 EVENT_POLL_SECONDS = float(os.getenv("EVENT_POLL_SECONDS", "10"))
-DISCOVERY_WAIT_SECONDS = int(os.getenv("DISCOVERY_WAIT_SECONDS", "20"))
-DISCOVERY_POLL_SECONDS = float(os.getenv("DISCOVERY_POLL_SECONDS", "3"))
+DISCOVERY_WAIT_SECONDS = int(os.getenv("DISCOVERY_WAIT_SECONDS", "45"))
+DISCOVERY_POLL_SECONDS = float(os.getenv("DISCOVERY_POLL_SECONDS", "2"))
 POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "20"))
 
 # scan recent blocks on startup so the scanner can prove detection quickly
 STARTUP_LOOKBACK_BLOCKS = int(os.getenv("STARTUP_LOOKBACK_BLOCKS", "250"))
 
 # widened age window so recent pools can still qualify later
-MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "3600"))  # 60 min
+MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "7200"))  # 120 min
 
 # entry criteria
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))
-MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "1000"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "2000"))
+MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "25"))
 MIN_SELLS_5M = int(os.getenv("MIN_SELLS_5M", "0"))
 MIN_BUYS_5M = int(os.getenv("MIN_BUYS_5M", "1"))
 
 # tax / sellability filter
-MAX_SELL_TAX_PCT = float(os.getenv("MAX_SELL_TAX_PCT", "10"))
-MAX_BUY_TAX_PCT = float(os.getenv("MAX_BUY_TAX_PCT", "15"))
+MAX_SELL_TAX_PCT = float(os.getenv("MAX_SELL_TAX_PCT", "15"))
+MAX_BUY_TAX_PCT = float(os.getenv("MAX_BUY_TAX_PCT", "20"))
 
 # exit rules
-LIQUIDITY_DROP_EXIT_PCT = float(os.getenv("LIQUIDITY_DROP_EXIT_PCT", "25"))
+LIQUIDITY_DROP_EXIT_PCT = float(os.getenv("LIQUIDITY_DROP_EXIT_PCT", "35"))
 
 # trailing exit
-TRAIL_ARM_PCT = float(os.getenv("TRAIL_ARM_PCT", "20"))
-TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "15"))
+TRAIL_ARM_PCT = float(os.getenv("TRAIL_ARM_PCT", "60"))
+TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "30"))
 
 # paper exit simulation
-PAPER_EXIT_HAIRCUT_PCT = float(os.getenv("PAPER_EXIT_HAIRCUT_PCT", "30"))
-PAPER_EXIT_MAX_BUYSIDE_SHARE = float(os.getenv("PAPER_EXIT_MAX_BUYSIDE_SHARE", "0.10"))
+PAPER_EXIT_HAIRCUT_PCT = float(os.getenv("PAPER_EXIT_HAIRCUT_PCT", "15"))
+PAPER_EXIT_MAX_BUYSIDE_SHARE = float(os.getenv("PAPER_EXIT_MAX_BUYSIDE_SHARE", "0.80"))
 PAPER_EXIT_MIN_VALUE_USD = float(os.getenv("PAPER_EXIT_MIN_VALUE_USD", "0.01"))
 PAPER_MARK_PRICE_FALLBACK_HAIRCUT_PCT = float(os.getenv("PAPER_MARK_PRICE_FALLBACK_HAIRCUT_PCT", "15"))
 PAPER_STALE_SNAPSHOT_SECONDS = int(os.getenv("PAPER_STALE_SNAPSHOT_SECONDS", "90"))
 PAPER_STALE_MARKDOWN_PCT = float(os.getenv("PAPER_STALE_MARKDOWN_PCT", "35"))
 
 # live buy settings
-SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "1500"))
+SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "2000"))
 GAS_LIMIT_BUY = int(os.getenv("GAS_LIMIT_BUY", "450000"))
 GAS_LIMIT_APPROVE = int(os.getenv("GAS_LIMIT_APPROVE", "120000"))
 GAS_LIMIT_SELL = int(os.getenv("GAS_LIMIT_SELL", "450000"))
 BUY_DEADLINE_SECONDS = int(os.getenv("BUY_DEADLINE_SECONDS", "180"))
 SELL_DEADLINE_SECONDS = int(os.getenv("SELL_DEADLINE_SECONDS", "180"))
+
+# live safety / retry
+MIN_ETH_GAS_RESERVE = float(os.getenv("MIN_ETH_GAS_RESERVE", "0.01"))
+FAILED_BUY_COOLDOWN_SECONDS = int(os.getenv("FAILED_BUY_COOLDOWN_SECONDS", "900"))
+PAIR_REJECT_LOG_COOLDOWN_SECONDS = int(os.getenv("PAIR_REJECT_LOG_COOLDOWN_SECONDS", "180"))
 
 # provider limits / retry
 MAX_LOG_RANGE = int(os.getenv("MAX_LOG_RANGE", "10"))
@@ -361,6 +366,70 @@ def build_tx_params(wallet_address: str, nonce: int, gas: int, value: int = 0) -
     }
 
 
+def wei_to_eth(value_wei: int) -> float:
+    return float(w3.from_wei(int(value_wei), "ether"))
+
+
+def estimate_total_buy_cost_wei(value_wei: int) -> int:
+    try:
+        gas_price = int(w3.eth.gas_price)
+    except Exception:
+        gas_price = 0
+    gas_buffer_wei = gas_price * GAS_LIMIT_BUY
+    reserve_wei = int(w3.to_wei(MIN_ETH_GAS_RESERVE, "ether"))
+    return int(value_wei + gas_buffer_wei + reserve_wei)
+
+
+def get_v2_quote(amount_in_wei: int, token: str) -> Tuple[bool, int, int, str]:
+    path = [WETH, Web3.to_checksum_address(token)]
+    try:
+        amounts_out = router.functions.getAmountsOut(amount_in_wei, path).call()
+        expected_out = int(amounts_out[-1])
+        if expected_out <= 0:
+            return False, 0, 0, "quote returned zero"
+        amount_out_min = int(expected_out * (10000 - SLIPPAGE_BPS) / 10000)
+        if amount_out_min <= 0:
+            return False, 0, 0, "amountOutMin <= 0"
+        return True, expected_out, amount_out_min, "ok"
+    except Exception as e:
+        return False, 0, 0, f"no usable V2 route: {e}"
+
+
+def get_live_buy_block_reason(snap: dict) -> Optional[str]:
+    age = snap.get("age_seconds")
+    liquidity = safe_float(snap.get("liquidity_usd"))
+    volume = safe_float(snap.get("volume_5m"))
+    buys = int(snap.get("buys_5m") or 0)
+    sells = int(snap.get("sells_5m") or 0)
+    price = safe_float(snap.get("price_usd"))
+
+    if age is None:
+        return "age unknown"
+    if age > MAX_TOKEN_AGE_SECONDS:
+        return f"age too high: {age:.0f}s > {MAX_TOKEN_AGE_SECONDS}s"
+    if liquidity < MIN_LIQUIDITY_USD:
+        return f"liquidity too low: ${liquidity:,.0f} < ${MIN_LIQUIDITY_USD:,.0f}"
+    if volume < MIN_VOLUME_5M_USD:
+        return f"volume too low: ${volume:,.0f} < ${MIN_VOLUME_5M_USD:,.0f}"
+    if sells < MIN_SELLS_5M:
+        return f"sells too low: {sells} < {MIN_SELLS_5M}"
+    if buys < MIN_BUYS_5M:
+        return f"buys too low: {buys} < {MIN_BUYS_5M}"
+    if price <= 0:
+        return "price <= 0"
+    return None
+
+
+def should_log_pair_reason(pair: str) -> bool:
+    current = now_ts()
+    with LOCK:
+        last = PAIR_REASON_LOG_TS.get(pair, 0.0)
+        if current - last >= PAIR_REJECT_LOG_COOLDOWN_SECONDS:
+            PAIR_REASON_LOG_TS[pair] = current
+            return True
+    return False
+
+
 # -------------------------
 # SECURITY / TAX CHECK
 # -------------------------
@@ -504,13 +573,25 @@ def approve_token_if_needed(token: str, amount_raw: int) -> bool:
         signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
-        return receipt.status == 1
+
+        if receipt.status == 1:
+            send(f"✅ APPROVE OK\n{token}\nTx {tx_hash.hex()}")
+            return True
+
+        send(f"❌ APPROVE FAILED\n{token}\nTx {tx_hash.hex()}")
+        return False
     except Exception as e:
         send(f"❌ APPROVE ERROR\n{token}\n{e}")
         return False
 
 
-def execute_live_buy(token: str, pair: str, entry_liquidity_usd: float, entry_price: float) -> Optional[dict]:
+def execute_live_buy(
+    token: str,
+    pair: str,
+    entry_liquidity_usd: float,
+    entry_price: float,
+    source: str,
+) -> Optional[dict]:
     if not ACCOUNT:
         send("⚠️ LIVE BUY SKIPPED\nReason: PRIVATE_KEY not loaded")
         return None
@@ -519,20 +600,54 @@ def execute_live_buy(token: str, pair: str, entry_liquidity_usd: float, entry_pr
     token = Web3.to_checksum_address(token)
     _, symbol, decimals = get_token_meta(token)
 
+    with LOCK:
+        last_fail = FAILED_LIVE_BUYS.get(pair, 0.0)
+    if now_ts() - last_fail < FAILED_BUY_COOLDOWN_SECONDS:
+        remaining = int(FAILED_BUY_COOLDOWN_SECONDS - (now_ts() - last_fail))
+        send(
+            f"⚠️ LIVE BUY SKIPPED\n\n"
+            f"{symbol}\n"
+            f"Pair\n{pair}\n\n"
+            f"Reason: failed buy cooldown active\n"
+            f"Retry In {remaining}s"
+        )
+        return None
+
     try:
         eth_amount = usd_to_eth(PURCHASE_AMOUNT_USD)
         value_wei = int(w3.to_wei(eth_amount, "ether"))
         path = [WETH, token]
 
+        wallet_balance = int(w3.eth.get_balance(wallet))
+        total_required_wei = estimate_total_buy_cost_wei(value_wei)
+
+        if wallet_balance < total_required_wei:
+            send(
+                f"⚠️ LIVE BUY SKIPPED\n\n"
+                f"{symbol}\n"
+                f"Pair\n{pair}\n\n"
+                f"Reason: insufficient ETH for buy + gas reserve\n"
+                f"Wallet ETH {wei_to_eth(wallet_balance):.6f}\n"
+                f"Needed ETH {wei_to_eth(total_required_wei):.6f}"
+            )
+            return None
+
+        quote_ok, expected_out, amount_out_min, quote_reason = get_v2_quote(value_wei, token)
+        if not quote_ok:
+            with LOCK:
+                FAILED_LIVE_BUYS[pair] = now_ts()
+            send(
+                f"⚠️ LIVE BUY SKIPPED\n\n"
+                f"{symbol}\n"
+                f"Source {source}\n"
+                f"Token\n{token}\n\n"
+                f"Pair\n{pair}\n\n"
+                f"Reason: {quote_reason}"
+            )
+            return None
+
         token_contract = get_token_contract(token)
         balance_before = int(token_contract.functions.balanceOf(wallet).call())
-
-        try:
-            amounts_out = router.functions.getAmountsOut(value_wei, path).call()
-            expected_out = int(amounts_out[-1])
-            amount_out_min = int(expected_out * (10000 - SLIPPAGE_BPS) / 10000)
-        except Exception:
-            amount_out_min = 0
 
         nonce = w3.eth.get_transaction_count(wallet, "pending")
         deadline = int(time.time()) + BUY_DEADLINE_SECONDS
@@ -549,22 +664,51 @@ def execute_live_buy(token: str, pair: str, entry_liquidity_usd: float, entry_pr
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
 
         if receipt.status != 1:
-            send(f"❌ LIVE BUY FAILED\n{symbol}\n{token}")
+            with LOCK:
+                FAILED_LIVE_BUYS[pair] = now_ts()
+            send(
+                f"❌ LIVE BUY FAILED\n\n"
+                f"{symbol}\n"
+                f"Source {source}\n"
+                f"Token\n{token}\n\n"
+                f"Pair\n{pair}\n\n"
+                f"Tx {tx_hash.hex()}\n"
+                f"Reason: transaction reverted"
+            )
             return None
 
         balance_after = int(token_contract.functions.balanceOf(wallet).call())
         token_amount_raw = max(balance_after - balance_before, 0)
+
+        if token_amount_raw <= 0:
+            with LOCK:
+                FAILED_LIVE_BUYS[pair] = now_ts()
+            send(
+                f"❌ LIVE BUY FAILED\n\n"
+                f"{symbol}\n"
+                f"Source {source}\n"
+                f"Token\n{token}\n\n"
+                f"Pair\n{pair}\n\n"
+                f"Tx {tx_hash.hex()}\n"
+                f"Reason: no token balance received"
+            )
+            return None
+
         token_amount = token_amount_raw / (10 ** decimals)
 
         send(
             f"🟢 LIVE BUY OPENED\n\n"
             f"{symbol}\n"
+            f"Source {source}\n"
             f"Token\n{token}\n\n"
             f"Pair\n{pair}\n\n"
             f"Entry Price ${entry_price:.10f}\n"
+            f"Entry Liquidity ${entry_liquidity_usd:,.0f}\n"
             f"Buy Size ${PURCHASE_AMOUNT_USD:.2f}\n"
             f"Approx ETH {eth_amount:.6f}\n"
-            f"Tokens {token_amount:,.6f}"
+            f"Quoted Tokens {expected_out / (10 ** decimals):,.6f}\n"
+            f"Received Tokens {token_amount:,.6f}\n"
+            f"Tx {tx_hash.hex()}"
         )
 
         return {
@@ -580,7 +724,16 @@ def execute_live_buy(token: str, pair: str, entry_liquidity_usd: float, entry_pr
         }
 
     except Exception as e:
-        send(f"❌ LIVE BUY ERROR\n{token}\n{e}")
+        with LOCK:
+            FAILED_LIVE_BUYS[pair] = now_ts()
+        send(
+            f"❌ LIVE BUY ERROR\n\n"
+            f"{symbol}\n"
+            f"Source {source}\n"
+            f"Token\n{token}\n\n"
+            f"Pair\n{pair}\n\n"
+            f"{e}"
+        )
         return None
 
 
@@ -605,8 +758,15 @@ def execute_live_sell(position: dict, current_price_usd: float, current_liquidit
             amounts_out = router.functions.getAmountsOut(amount_raw, path).call()
             expected_eth_out = int(amounts_out[-1])
             amount_out_min = int(expected_eth_out * (10000 - SLIPPAGE_BPS) / 10000)
-        except Exception:
-            amount_out_min = 0
+        except Exception as e:
+            send(
+                f"❌ LIVE SELL SKIPPED\n\n"
+                f"{symbol}\n"
+                f"Token\n{token}\n\n"
+                f"Pair\n{pair}\n\n"
+                f"Reason: no usable V2 sell route\n{e}"
+            )
+            return False
 
         nonce = w3.eth.get_transaction_count(wallet, "pending")
         deadline = int(time.time()) + SELL_DEADLINE_SECONDS
@@ -631,11 +791,18 @@ def execute_live_sell(position: dict, current_price_usd: float, current_liquidit
                 f"Pair\n{pair}\n\n"
                 f"Current Price ${current_price_usd:.10f}\n"
                 f"Current Liquidity ${current_liquidity_usd:,.0f}\n"
-                f"Reason: {reason}"
+                f"Reason: {reason}\n"
+                f"Tx {tx_hash.hex()}"
             )
             return True
 
-        send(f"❌ LIVE SELL FAILED\n{symbol}\n{token}")
+        send(
+            f"❌ LIVE SELL FAILED\n\n"
+            f"{symbol}\n"
+            f"Token\n{token}\n\n"
+            f"Pair\n{pair}\n\n"
+            f"Tx {tx_hash.hex()}"
+        )
         return False
 
     except Exception as e:
@@ -676,6 +843,8 @@ ALERTED_POOLS = set()
 TRADED_POOLS = set()
 
 RECENT_POOLS: Dict[str, Dict[str, Any]] = {}
+FAILED_LIVE_BUYS: Dict[str, float] = {}
+PAIR_REASON_LOG_TS: Dict[str, float] = {}
 
 LOCK = threading.Lock()
 POOL_THREAD_SEMAPHORE = threading.BoundedSemaphore(MAX_ACTIVE_POOL_THREADS)
@@ -1021,20 +1190,7 @@ def open_paper_trade(token: str, pair: str, snap: dict) -> bool:
 # PROCESS POOL
 # -------------------------
 def qualifies_for_entry(snap: dict) -> bool:
-    age = snap["age_seconds"]
-    if age is None or age > MAX_TOKEN_AGE_SECONDS:
-        return False
-    if snap["liquidity_usd"] < MIN_LIQUIDITY_USD:
-        return False
-    if snap["volume_5m"] < MIN_VOLUME_5M_USD:
-        return False
-    if snap["sells_5m"] < MIN_SELLS_5M:
-        return False
-    if snap["buys_5m"] < MIN_BUYS_5M:
-        return False
-    if snap["price_usd"] <= 0:
-        return False
-    return True
+    return get_live_buy_block_reason(snap) is None
 
 
 def process_pool(token: str, pair: str, source: str):
@@ -1056,12 +1212,51 @@ def process_pool(token: str, pair: str, source: str):
             snap = get_pair_snapshot(pair)
             if snap and qualifies_for_entry(snap):
                 break
+
+            if snap:
+                reason = get_live_buy_block_reason(snap)
+                if reason and should_log_pair_reason(pair):
+                    send(
+                        f"⏳ POOL NOT READY\n\n"
+                        f"Source {source}\n"
+                        f"Pair\n{pair}\n\n"
+                        f"Reason: {reason}\n"
+                        f"Liquidity ${safe_float(snap.get('liquidity_usd')):,.0f}\n"
+                        f"Volume 5m ${safe_float(snap.get('volume_5m')):,.0f}\n"
+                        f"Buys 5m {int(snap.get('buys_5m') or 0)}\n"
+                        f"Sells 5m {int(snap.get('sells_5m') or 0)}"
+                    )
+
             time.sleep(DISCOVERY_POLL_SECONDS)
 
         if not snap:
             snap = get_pair_snapshot(pair)
 
-        if not snap or not qualifies_for_entry(snap):
+        if not snap:
+            if should_log_pair_reason(pair):
+                send(
+                    f"⚠️ POOL SKIPPED\n\n"
+                    f"Source {source}\n"
+                    f"Pair\n{pair}\n\n"
+                    f"Reason: snapshot unavailable"
+                )
+            return
+
+        reason = get_live_buy_block_reason(snap)
+        if reason:
+            if should_log_pair_reason(pair):
+                send(
+                    f"⚠️ POOL FILTERED\n\n"
+                    f"Source {source}\n"
+                    f"{snap.get('symbol', 'UNK')}\n"
+                    f"Token\n{token}\n\n"
+                    f"Pair\n{pair}\n\n"
+                    f"Reason: {reason}\n"
+                    f"Liquidity ${safe_float(snap.get('liquidity_usd')):,.0f}\n"
+                    f"Volume 5m ${safe_float(snap.get('volume_5m')):,.0f}\n"
+                    f"Buys 5m {int(snap.get('buys_5m') or 0)}\n"
+                    f"Sells 5m {int(snap.get('sells_5m') or 0)}"
+                )
             return
 
         ok, security_reason = passes_tax_and_sellability(token)
@@ -1101,9 +1296,16 @@ def process_pool(token: str, pair: str, source: str):
 
         if RUN_PURCHASE == "on":
             if len(LIVE_POSITIONS) >= MAX_OPEN_TRADES:
+                send(
+                    f"⚠️ LIVE BUY SKIPPED\n\n"
+                    f"{snap['symbol']}\n"
+                    f"Pair\n{pair}\n\n"
+                    f"Reason: max live positions reached\n"
+                    f"Live Positions {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}"
+                )
                 return
 
-            pos = execute_live_buy(token, pair, snap["liquidity_usd"], snap["price_usd"])
+            pos = execute_live_buy(token, pair, snap["liquidity_usd"], snap["price_usd"], source)
             if pos:
                 LIVE_POSITIONS[token] = pos
                 with LOCK:
