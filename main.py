@@ -64,12 +64,12 @@ MAX_BUY_TAX_PCT = float(os.getenv("MAX_BUY_TAX_PCT", "15"))
 LIQUIDITY_DROP_EXIT_PCT = float(os.getenv("LIQUIDITY_DROP_EXIT_PCT", "25"))
 
 # paper exit simulation
-# When liquidity exit triggers, do NOT force value to zero.
-# Use latest usable price, apply haircut, and cap by buy-side liquidity.
-PAPER_EXIT_HAIRCUT_PCT = float(os.getenv("PAPER_EXIT_HAIRCUT_PCT", "30"))   # 30% haircut on emergency exit
-PAPER_EXIT_MAX_BUYSIDE_SHARE = float(os.getenv("PAPER_EXIT_MAX_BUYSIDE_SHARE", "0.10"))  # 10% of buy-side liquidity
-PAPER_EXIT_MIN_VALUE_USD = float(os.getenv("PAPER_EXIT_MIN_VALUE_USD", "0.01"))  # prevent fake 0 when still sellable
+PAPER_EXIT_HAIRCUT_PCT = float(os.getenv("PAPER_EXIT_HAIRCUT_PCT", "30"))
+PAPER_EXIT_MAX_BUYSIDE_SHARE = float(os.getenv("PAPER_EXIT_MAX_BUYSIDE_SHARE", "0.10"))
+PAPER_EXIT_MIN_VALUE_USD = float(os.getenv("PAPER_EXIT_MIN_VALUE_USD", "0.01"))
 PAPER_MARK_PRICE_FALLBACK_HAIRCUT_PCT = float(os.getenv("PAPER_MARK_PRICE_FALLBACK_HAIRCUT_PCT", "15"))
+PAPER_STALE_SNAPSHOT_SECONDS = int(os.getenv("PAPER_STALE_SNAPSHOT_SECONDS", "90"))
+PAPER_STALE_MARKDOWN_PCT = float(os.getenv("PAPER_STALE_MARKDOWN_PCT", "35"))
 
 # live buy settings
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "1500"))
@@ -94,8 +94,6 @@ MAX_ACTIVE_POOL_THREADS = int(os.getenv("MAX_ACTIVE_POOL_THREADS", "100"))
 if not NODE:
     raise RuntimeError("NODE missing")
 
-# Force HTTP provider for this threaded scanner.
-# WebSocket providers can throw recv/coroutine errors when multiple listeners run.
 if NODE.startswith("wss://"):
     NODE = NODE.replace("wss://", "https://", 1)
     print("Converted WSS node to HTTPS for threaded scanner.")
@@ -375,8 +373,6 @@ def passes_tax_and_sellability(token: str) -> Tuple[bool, str]:
     sell_tax_raw = sec.get("sell_tax")
     buy_tax_raw = sec.get("buy_tax")
 
-    # Unknown tax values are common on very new launches.
-    # Treat them as unknown instead of fake 999% taxes.
     sell_tax = safe_pct(sell_tax_raw, default=-1.0)
     buy_tax = safe_pct(buy_tax_raw, default=-1.0)
 
@@ -612,12 +608,12 @@ class PaperTrade:
         self.tokens = PURCHASE_AMOUNT_USD / entry_price if entry_price > 0 else 0.0
         self.opened = now_ts()
 
-        # Track latest usable market state so a broken quote doesn't force a fake zero.
         self.last_good_price = entry_price if entry_price > 0 else 0.0
         self.last_good_liquidity_usd = entry_liquidity_usd if entry_liquidity_usd > 0 else 0.0
         self.last_mark_value_usd = PURCHASE_AMOUNT_USD
         self.peak_value_usd = PURCHASE_AMOUNT_USD
         self.last_update_ts = now_ts()
+        self.last_good_snapshot_ts = now_ts()
 
 
 PAPER_TRADES: Dict[str, PaperTrade] = {}
@@ -629,10 +625,15 @@ POOL_THREAD_SEMAPHORE = threading.BoundedSemaphore(MAX_ACTIVE_POOL_THREADS)
 
 
 def update_trade_market_state(trade: PaperTrade, price: float, liquidity_usd: float):
+    good_snapshot = False
+
     if price > 0:
         trade.last_good_price = price
-    if liquidity_usd > 0:
+        good_snapshot = True
+
+    if liquidity_usd >= 0:
         trade.last_good_liquidity_usd = liquidity_usd
+        good_snapshot = True
 
     mark_price = price if price > 0 else trade.last_good_price
     if mark_price > 0:
@@ -641,39 +642,34 @@ def update_trade_market_state(trade: PaperTrade, price: float, liquidity_usd: fl
             trade.peak_value_usd = trade.last_mark_value_usd
 
     trade.last_update_ts = now_ts()
+    if good_snapshot:
+        trade.last_good_snapshot_ts = now_ts()
 
 
 def simulate_paper_exit(trade: PaperTrade, snap: Optional[Dict[str, Any]]) -> Tuple[float, float, float, str]:
-    """
-    Returns:
-        exit_price_used, final_value_usd, pnl_pct, detail_reason
-    """
     current_price = 0.0
-    current_liq = 0.0
+    current_liq = -1.0
 
     if snap:
         current_price = safe_float(snap.get("price_usd"))
-        current_liq = safe_float(snap.get("liquidity_usd"))
+        current_liq = safe_float(snap.get("liquidity_usd"), default=-1.0)
 
     usable_price = current_price if current_price > 0 else trade.last_good_price
-    usable_liq = current_liq if current_liq > 0 else trade.last_good_liquidity_usd
+    usable_liq = current_liq if current_liq >= 0 else trade.last_good_liquidity_usd
 
     if usable_price <= 0:
         return 0.0, 0.0, -100.0, "no usable price or liquidity basis"
 
     gross_value = trade.tokens * usable_price
 
-    # If the live quote is broken/zero, apply an additional fallback haircut to avoid over-crediting.
     if current_price <= 0:
         gross_value *= (1.0 - PAPER_MARK_PRICE_FALLBACK_HAIRCUT_PCT / 100.0)
 
-    # Liquidity on Dexscreener is both sides combined. Approximate buy-side as half.
     buy_side_liquidity = max(usable_liq * 0.5, 0.0)
     liquidity_cap = buy_side_liquidity * max(PAPER_EXIT_MAX_BUYSIDE_SHARE, 0.0)
 
     haircut_value = gross_value * (1.0 - PAPER_EXIT_HAIRCUT_PCT / 100.0)
 
-    # If we have a meaningful liquidity cap, respect it.
     if liquidity_cap > 0:
         final_value = min(haircut_value, liquidity_cap)
         cap_text = f"haircut {PAPER_EXIT_HAIRCUT_PCT:.0f}% | cap {PAPER_EXIT_MAX_BUYSIDE_SHARE * 100:.0f}% buy-side"
@@ -681,13 +677,27 @@ def simulate_paper_exit(trade: PaperTrade, snap: Optional[Dict[str, Any]]) -> Tu
         final_value = haircut_value
         cap_text = f"haircut {PAPER_EXIT_HAIRCUT_PCT:.0f}% | no liq cap available"
 
-    # Prevent fake zero on still-sellable names.
     if final_value <= 0 and gross_value > 0:
         final_value = max(PAPER_EXIT_MIN_VALUE_USD, gross_value * 0.05)
         cap_text += " | min emergency floor used"
 
     pnl_pct = ((final_value - PURCHASE_AMOUNT_USD) / PURCHASE_AMOUNT_USD) * 100 if PURCHASE_AMOUNT_USD > 0 else 0.0
     return usable_price, final_value, pnl_pct, cap_text
+
+
+def get_portfolio_mark_value(trade: PaperTrade) -> float:
+    age_of_last_good = now_ts() - trade.last_good_snapshot_ts
+    mark_price = trade.last_good_price
+
+    if mark_price <= 0:
+        return 0.0
+
+    value = trade.tokens * mark_price
+
+    if age_of_last_good > PAPER_STALE_SNAPSHOT_SECONDS:
+        value *= (1.0 - PAPER_STALE_MARKDOWN_PCT / 100.0)
+
+    return value
 
 
 # -------------------------
@@ -704,17 +714,22 @@ def monitor_paper_trade(token: str):
             return
 
         snap = get_pair_snapshot(trade.pair)
-        if not snap:
-            continue
 
-        price = safe_float(snap["price_usd"])
-        current_liq = safe_float(snap["liquidity_usd"])
+        if snap:
+            price = safe_float(snap["price_usd"])
+            current_liq = safe_float(snap["liquidity_usd"], default=-1.0)
+            update_trade_market_state(trade, price, current_liq)
+            mark_price = price if price > 0 else trade.last_good_price
+            display_liq = current_liq
+        else:
+            mark_price = trade.last_good_price
+            current_liq = -1.0
+            display_liq = trade.last_good_liquidity_usd
 
-        update_trade_market_state(trade, price, current_liq)
-
-        mark_price = price if price > 0 else trade.last_good_price
         value = trade.tokens * mark_price if mark_price > 0 else 0.0
         pnl = ((value - PURCHASE_AMOUNT_USD) / PURCHASE_AMOUNT_USD) * 100 if PURCHASE_AMOUNT_USD > 0 else 0.0
+
+        liq_text = f"${display_liq:,.0f}" if display_liq >= 0 else "unknown"
 
         send(
             f"📊 PAPER TRADE UPDATE\n\n"
@@ -723,15 +738,28 @@ def monitor_paper_trade(token: str):
             f"Entry ${trade.entry_price:.10f}\n"
             f"Current ${mark_price:.10f}\n\n"
             f"Entry Liquidity ${trade.entry_liquidity_usd:,.0f}\n"
-            f"Current Liquidity ${current_liq:,.0f}\n\n"
+            f"Current Liquidity {liq_text}\n\n"
             f"Value ${value:.2f}\n"
             f"PnL {pnl:.2f}%"
         )
 
         exit_floor = trade.entry_liquidity_usd * (1 - LIQUIDITY_DROP_EXIT_PCT / 100.0)
-        if current_liq > 0 and current_liq <= exit_floor:
+
+        liq_trigger = current_liq >= 0 and current_liq <= exit_floor
+        stale_and_weak = (
+            (now_ts() - trade.last_good_snapshot_ts > PAPER_STALE_SNAPSHOT_SECONDS)
+            and trade.last_good_liquidity_usd <= exit_floor
+        )
+
+        if liq_trigger or stale_and_weak:
             exit_price_used, final_value, final_pnl_pct, exit_detail = simulate_paper_exit(trade, snap)
             ACCOUNT_CASH += final_value
+
+            reason = (
+                f"liquidity dropped {LIQUIDITY_DROP_EXIT_PCT:.0f}%"
+                if liq_trigger
+                else f"stale snapshot + last liquidity below exit floor"
+            )
 
             send(
                 f"🧪 PAPER TRADE CLOSED\n\n"
@@ -742,7 +770,7 @@ def monitor_paper_trade(token: str):
                 f"Peak Value ${trade.peak_value_usd:.2f}\n"
                 f"Final Value ${final_value:.2f}\n"
                 f"PnL {final_pnl_pct:.2f}%\n\n"
-                f"Reason: liquidity dropped {LIQUIDITY_DROP_EXIT_PCT:.0f}%\n"
+                f"Reason: {reason}\n"
                 f"Model: {exit_detail}"
             )
             PAPER_TRADES.pop(token, None)
@@ -1071,12 +1099,10 @@ def portfolio_loop():
             snap = get_pair_snapshot(trade.pair)
             if snap:
                 price = safe_float(snap["price_usd"])
-                liq = safe_float(snap["liquidity_usd"])
+                liq = safe_float(snap["liquidity_usd"], default=-1.0)
                 update_trade_market_state(trade, price, liq)
 
-            mark_price = trade.last_good_price
-            if mark_price > 0:
-                total += trade.tokens * mark_price
+            total += get_portfolio_mark_value(trade)
 
         pnl = total - START_BALANCE
         pnl_pct = (pnl / START_BALANCE) * 100 if START_BALANCE > 0 else 0.0
