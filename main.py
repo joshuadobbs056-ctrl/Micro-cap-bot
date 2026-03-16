@@ -90,6 +90,12 @@ GAS_LIMIT_SELL = int(os.getenv("GAS_LIMIT_SELL", "450000"))
 BUY_DEADLINE_SECONDS = int(os.getenv("BUY_DEADLINE_SECONDS", "180"))
 SELL_DEADLINE_SECONDS = int(os.getenv("SELL_DEADLINE_SECONDS", "180"))
 
+# v3
+V3_DEFAULT_FEE = int(os.getenv("V3_DEFAULT_FEE", "3000"))
+GAS_LIMIT_BUY_V3 = int(os.getenv("GAS_LIMIT_BUY_V3", "550000"))
+GAS_LIMIT_SELL_V3 = int(os.getenv("GAS_LIMIT_SELL_V3", "550000"))
+V3_FEE_CANDIDATES = [500, 3000, 10000]
+
 # live safety / retry
 MIN_ETH_GAS_RESERVE = float(os.getenv("MIN_ETH_GAS_RESERVE", "0.01"))
 FAILED_BUY_COOLDOWN_SECONDS = int(os.getenv("FAILED_BUY_COOLDOWN_SECONDS", "900"))
@@ -145,6 +151,8 @@ WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 V2_FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
 V3_FACTORY = Web3.to_checksum_address("0x1F98431c8aD98523631AE4a59f267346ea31F984")
 ROUTER = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
+V3_ROUTER = Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564")
+V3_QUOTER = Web3.to_checksum_address("0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6")
 CHAINLINK_ETH_USD = Web3.to_checksum_address("0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419")
 
 V2_FACTORY_ABI = [
@@ -256,6 +264,48 @@ ROUTER_ABI = [
     },
 ]
 
+V3_ROUTER_ABI = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType": "address", "name": "tokenIn", "type": "address"},
+                    {"internalType": "address", "name": "tokenOut", "type": "address"},
+                    {"internalType": "uint24", "name": "fee", "type": "uint24"},
+                    {"internalType": "address", "name": "recipient", "type": "address"},
+                    {"internalType": "uint256", "name": "deadline", "type": "uint256"},
+                    {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+                    {"internalType": "uint256", "name": "amountOutMinimum", "type": "uint256"},
+                    {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"},
+                ],
+                "internalType": "struct ISwapRouter.ExactInputSingleParams",
+                "name": "params",
+                "type": "tuple",
+            }
+        ],
+        "name": "exactInputSingle",
+        "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
+        "stateMutability": "payable",
+        "type": "function",
+    }
+]
+
+V3_QUOTER_ABI = [
+    {
+        "inputs": [
+            {"internalType": "address", "name": "tokenIn", "type": "address"},
+            {"internalType": "address", "name": "tokenOut", "type": "address"},
+            {"internalType": "uint24", "name": "fee", "type": "uint24"},
+            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+            {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"},
+        ],
+        "name": "quoteExactInputSingle",
+        "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    }
+]
+
 CHAINLINK_ETH_USD_ABI = [
     {
         "inputs": [],
@@ -264,6 +314,7 @@ CHAINLINK_ETH_USD_ABI = [
             {"internalType": "uint80", "name": "roundId", "type": "uint80"},
             {"internalType": "int256", "name": "answer", "type": "int256"},
             {"internalType": "uint256", "name": "startedAt", "type": "uint256"},
+            {"internalType": "uint256", "name": "updatedAt", "type": "uint256"},
             {"internalType": "uint80", "name": "answeredInRound", "type": "uint80"},
         ],
         "stateMutability": "view",
@@ -274,6 +325,8 @@ CHAINLINK_ETH_USD_ABI = [
 v2_factory = w3.eth.contract(address=V2_FACTORY, abi=V2_FACTORY_ABI)
 v3_factory = w3.eth.contract(address=V3_FACTORY, abi=V3_FACTORY_ABI)
 router = w3.eth.contract(address=ROUTER, abi=ROUTER_ABI)
+v3_router = w3.eth.contract(address=V3_ROUTER, abi=V3_ROUTER_ABI)
+v3_quoter = w3.eth.contract(address=V3_QUOTER, abi=V3_QUOTER_ABI)
 eth_usd_feed = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=CHAINLINK_ETH_USD_ABI)
 
 
@@ -356,26 +409,49 @@ def usd_to_eth(usd_amount: float) -> float:
 
 
 def build_tx_params(wallet_address: str, nonce: int, gas: int, value: int = 0) -> dict:
-    return {
+    tx = {
         "from": wallet_address,
         "value": value,
         "nonce": nonce,
         "chainId": w3.eth.chain_id,
-        "gas": gas,
-        "gasPrice": w3.eth.gas_price,
     }
+
+    try:
+        latest_block = w3.eth.get_block("latest")
+        base_fee = latest_block.get("baseFeePerGas")
+    except Exception:
+        base_fee = None
+
+    if base_fee is not None:
+        try:
+            priority_fee = int(w3.to_wei(2, "gwei"))
+        except Exception:
+            priority_fee = 2_000_000_000
+
+        max_fee = int(base_fee * 2 + priority_fee)
+        tx["maxPriorityFeePerGas"] = priority_fee
+        tx["maxFeePerGas"] = max_fee
+    else:
+        tx["gasPrice"] = int(w3.eth.gas_price)
+
+    if gas and gas > 0:
+        tx["gas"] = int(gas)
+
+    return tx
 
 
 def wei_to_eth(value_wei: int) -> float:
     return float(w3.from_wei(int(value_wei), "ether"))
 
 
-def estimate_total_buy_cost_wei(value_wei: int) -> int:
+def estimate_total_buy_cost_wei(value_wei: int, gas_limit: int = None) -> int:
+    if gas_limit is None:
+        gas_limit = GAS_LIMIT_BUY
     try:
         gas_price = int(w3.eth.gas_price)
     except Exception:
         gas_price = 0
-    gas_buffer_wei = gas_price * GAS_LIMIT_BUY
+    gas_buffer_wei = gas_price * int(gas_limit)
     reserve_wei = int(w3.to_wei(MIN_ETH_GAS_RESERVE, "ether"))
     return int(value_wei + gas_buffer_wei + reserve_wei)
 
@@ -393,6 +469,57 @@ def get_v2_quote(amount_in_wei: int, token: str) -> Tuple[bool, int, int, str]:
         return True, expected_out, amount_out_min, "ok"
     except Exception as e:
         return False, 0, 0, f"no usable V2 route: {e}"
+
+
+def get_v3_fee_from_source(source: str) -> int:
+    if isinstance(source, str) and source.startswith("V3:"):
+        try:
+            return int(source.split(":", 1)[1])
+        except Exception:
+            return V3_DEFAULT_FEE
+    return V3_DEFAULT_FEE
+
+
+def get_v3_quote(amount_in_wei: int, token: str, fee: int) -> Tuple[bool, int, int, str]:
+    try:
+        expected_out = int(
+            v3_quoter.functions.quoteExactInputSingle(
+                WETH,
+                Web3.to_checksum_address(token),
+                int(fee),
+                int(amount_in_wei),
+                0,
+            ).call()
+        )
+        if expected_out <= 0:
+            return False, 0, 0, "V3 quote returned zero"
+        amount_out_min = int(expected_out * (10000 - SLIPPAGE_BPS) / 10000)
+        if amount_out_min <= 0:
+            return False, 0, 0, "V3 amountOutMin <= 0"
+        return True, expected_out, amount_out_min, "ok"
+    except Exception as e:
+        return False, 0, 0, f"no usable V3 route: {e}"
+
+
+def get_v3_quote_best(amount_in_wei: int, token: str, preferred_fee: Optional[int] = None) -> Tuple[bool, int, int, int, str]:
+    token = Web3.to_checksum_address(token)
+
+    fees_to_try = []
+    if preferred_fee and int(preferred_fee) > 0:
+        fees_to_try.append(int(preferred_fee))
+
+    for fee in V3_FEE_CANDIDATES:
+        if fee not in fees_to_try:
+            fees_to_try.append(fee)
+
+    errors = []
+    for fee in fees_to_try:
+        ok, expected_out, amount_out_min, reason = get_v3_quote(amount_in_wei, token, fee)
+        if ok:
+            return True, expected_out, amount_out_min, fee, "ok"
+        errors.append(f"{fee}: {reason}")
+
+    return False, 0, 0, 0, " | ".join(errors)
 
 
 def get_live_buy_block_reason(snap: dict) -> Optional[str]:
@@ -552,21 +679,22 @@ def get_pair_snapshot(pair: str) -> Optional[Dict[str, Any]]:
 # -------------------------
 # LIVE BUY/SELL
 # -------------------------
-def approve_token_if_needed(token: str, amount_raw: int) -> bool:
+def approve_token_if_needed(token: str, amount_raw: int, spender: str) -> bool:
     if not ACCOUNT:
         return False
 
     token_contract = get_token_contract(token)
     wallet = ACCOUNT.address
+    spender = Web3.to_checksum_address(spender)
 
     try:
-        allowance = int(token_contract.functions.allowance(wallet, ROUTER).call())
+        allowance = int(token_contract.functions.allowance(wallet, spender).call())
         if allowance >= amount_raw:
             return True
 
         nonce = w3.eth.get_transaction_count(wallet, "pending")
         tx = token_contract.functions.approve(
-            ROUTER,
+            spender,
             2**256 - 1,
         ).build_transaction(build_tx_params(wallet, nonce, GAS_LIMIT_APPROVE))
 
@@ -575,17 +703,17 @@ def approve_token_if_needed(token: str, amount_raw: int) -> bool:
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
 
         if receipt.status == 1:
-            send(f"✅ APPROVE OK\n{token}\nTx {tx_hash.hex()}")
+            send(f"✅ APPROVE OK\n{token}\nSpender {spender}\nTx {tx_hash.hex()}")
             return True
 
-        send(f"❌ APPROVE FAILED\n{token}\nTx {tx_hash.hex()}")
+        send(f"❌ APPROVE FAILED\n{token}\nSpender {spender}\nTx {tx_hash.hex()}")
         return False
     except Exception as e:
-        send(f"❌ APPROVE ERROR\n{token}\n{e}")
+        send(f"❌ APPROVE ERROR\n{token}\nSpender {spender}\n{e}")
         return False
 
 
-def execute_live_buy(
+def execute_live_buy_v2(
     token: str,
     pair: str,
     entry_liquidity_usd: float,
@@ -619,7 +747,7 @@ def execute_live_buy(
         path = [WETH, token]
 
         wallet_balance = int(w3.eth.get_balance(wallet))
-        total_required_wei = estimate_total_buy_cost_wei(value_wei)
+        total_required_wei = estimate_total_buy_cost_wei(value_wei, GAS_LIMIT_BUY)
 
         if wallet_balance < total_required_wei:
             send(
@@ -721,6 +849,7 @@ def execute_live_buy(
             "decimals": decimals,
             "opened": now_ts(),
             "peak_price": entry_price if entry_price > 0 else 0.0,
+            "source": "V2",
         }
 
     except Exception as e:
@@ -737,7 +866,196 @@ def execute_live_buy(
         return None
 
 
-def execute_live_sell(position: dict, current_price_usd: float, current_liquidity_usd: float, reason: str) -> bool:
+def execute_live_buy_v3(
+    token: str,
+    pair: str,
+    entry_liquidity_usd: float,
+    entry_price: float,
+    source: str,
+) -> Optional[dict]:
+    if not ACCOUNT:
+        send("⚠️ LIVE BUY SKIPPED\nReason: PRIVATE_KEY not loaded")
+        return None
+
+    wallet = ACCOUNT.address
+    token = Web3.to_checksum_address(token)
+    _, symbol, decimals = get_token_meta(token)
+    preferred_fee = get_v3_fee_from_source(source)
+
+    with LOCK:
+        last_fail = FAILED_LIVE_BUYS.get(pair, 0.0)
+    if now_ts() - last_fail < FAILED_BUY_COOLDOWN_SECONDS:
+        remaining = int(FAILED_BUY_COOLDOWN_SECONDS - (now_ts() - last_fail))
+        send(
+            f"⚠️ LIVE BUY SKIPPED\n\n"
+            f"{symbol}\n"
+            f"Pair\n{pair}\n\n"
+            f"Reason: failed buy cooldown active\n"
+            f"Retry In {remaining}s"
+        )
+        return None
+
+    try:
+        eth_amount = usd_to_eth(PURCHASE_AMOUNT_USD)
+        value_wei = int(w3.to_wei(eth_amount, "ether"))
+
+        wallet_balance = int(w3.eth.get_balance(wallet))
+        total_required_wei = estimate_total_buy_cost_wei(value_wei, GAS_LIMIT_BUY_V3)
+
+        if wallet_balance < total_required_wei:
+            send(
+                f"⚠️ LIVE BUY SKIPPED\n\n"
+                f"{symbol}\n"
+                f"Pair\n{pair}\n\n"
+                f"Reason: insufficient ETH for buy + gas reserve\n"
+                f"Wallet ETH {wei_to_eth(wallet_balance):.6f}\n"
+                f"Needed ETH {wei_to_eth(total_required_wei):.6f}"
+            )
+            return None
+
+        quote_ok, expected_out, amount_out_min, fee_used, quote_reason = get_v3_quote_best(
+            value_wei,
+            token,
+            preferred_fee=preferred_fee,
+        )
+        if not quote_ok:
+            with LOCK:
+                FAILED_LIVE_BUYS[pair] = now_ts()
+            send(
+                f"⚠️ LIVE BUY SKIPPED\n\n"
+                f"{symbol}\n"
+                f"Source {source}\n"
+                f"Token\n{token}\n\n"
+                f"Pair\n{pair}\n\n"
+                f"Reason: {quote_reason}"
+            )
+            return None
+
+        token_contract = get_token_contract(token)
+        balance_before = int(token_contract.functions.balanceOf(wallet).call())
+
+        nonce = w3.eth.get_transaction_count(wallet, "pending")
+        deadline = int(time.time()) + BUY_DEADLINE_SECONDS
+
+        params = (
+            WETH,
+            token,
+            int(fee_used),
+            wallet,
+            deadline,
+            int(value_wei),
+            int(amount_out_min),
+            0,
+        )
+
+        gas_limit = GAS_LIMIT_BUY_V3
+        try:
+            gas_estimate = v3_router.functions.exactInputSingle(params).estimate_gas(
+                build_tx_params(wallet, nonce, 0, value=value_wei)
+            )
+            gas_limit = max(int(gas_estimate * 1.25), GAS_LIMIT_BUY_V3)
+        except Exception as e:
+            print(f"V3 gas estimate failed for {symbol}: {e}")
+
+        tx = v3_router.functions.exactInputSingle(params).build_transaction(
+            build_tx_params(wallet, nonce, gas_limit, value=value_wei)
+        )
+
+        signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+
+        if receipt.status != 1:
+            with LOCK:
+                FAILED_LIVE_BUYS[pair] = now_ts()
+            send(
+                f"❌ LIVE BUY FAILED\n\n"
+                f"{symbol}\n"
+                f"Source {source}\n"
+                f"Fee Tier {fee_used}\n"
+                f"Token\n{token}\n\n"
+                f"Pair\n{pair}\n\n"
+                f"Tx {tx_hash.hex()}\n"
+                f"Reason: V3 transaction reverted"
+            )
+            return None
+
+        balance_after = int(token_contract.functions.balanceOf(wallet).call())
+        token_amount_raw = max(balance_after - balance_before, 0)
+
+        if token_amount_raw <= 0:
+            with LOCK:
+                FAILED_LIVE_BUYS[pair] = now_ts()
+            send(
+                f"❌ LIVE BUY FAILED\n\n"
+                f"{symbol}\n"
+                f"Source {source}\n"
+                f"Fee Tier {fee_used}\n"
+                f"Token\n{token}\n\n"
+                f"Pair\n{pair}\n\n"
+                f"Tx {tx_hash.hex()}\n"
+                f"Reason: no token balance received"
+            )
+            return None
+
+        token_amount = token_amount_raw / (10 ** decimals)
+
+        send(
+            f"🟢 LIVE BUY OPENED (V3)\n\n"
+            f"{symbol}\n"
+            f"Source {source}\n"
+            f"Fee Tier {fee_used}\n"
+            f"Token\n{token}\n\n"
+            f"Pair\n{pair}\n\n"
+            f"Entry Price ${entry_price:.10f}\n"
+            f"Entry Liquidity ${entry_liquidity_usd:,.0f}\n"
+            f"Buy Size ${PURCHASE_AMOUNT_USD:.2f}\n"
+            f"Approx ETH {eth_amount:.6f}\n"
+            f"Quoted Tokens {expected_out / (10 ** decimals):,.6f}\n"
+            f"Received Tokens {token_amount:,.6f}\n"
+            f"Tx {tx_hash.hex()}"
+        )
+
+        return {
+            "token": token,
+            "pair": pair,
+            "symbol": symbol,
+            "entry_price": entry_price,
+            "entry_liquidity_usd": entry_liquidity_usd,
+            "token_amount_raw": token_amount_raw,
+            "decimals": decimals,
+            "opened": now_ts(),
+            "peak_price": entry_price if entry_price > 0 else 0.0,
+            "source": f"V3:{fee_used}",
+        }
+
+    except Exception as e:
+        with LOCK:
+            FAILED_LIVE_BUYS[pair] = now_ts()
+        send(
+            f"❌ LIVE BUY ERROR (V3)\n\n"
+            f"{symbol}\n"
+            f"Source {source}\n"
+            f"Token\n{token}\n\n"
+            f"Pair\n{pair}\n\n"
+            f"{e}"
+        )
+        return None
+
+
+def execute_live_buy(
+    token: str,
+    pair: str,
+    entry_liquidity_usd: float,
+    entry_price: float,
+    source: str,
+) -> Optional[dict]:
+    if isinstance(source, str) and source.startswith("V3"):
+        return execute_live_buy_v3(token, pair, entry_liquidity_usd, entry_price, source)
+    return execute_live_buy_v2(token, pair, entry_liquidity_usd, entry_price, source)
+
+
+def execute_live_sell_v2(position: dict, current_price_usd: float, current_liquidity_usd: float, reason: str) -> bool:
     if not ACCOUNT:
         return False
 
@@ -750,7 +1068,7 @@ def execute_live_sell(position: dict, current_price_usd: float, current_liquidit
     try:
         if amount_raw <= 0:
             return False
-        if not approve_token_if_needed(token, amount_raw):
+        if not approve_token_if_needed(token, amount_raw, ROUTER):
             return False
 
         path = [token, WETH]
@@ -808,6 +1126,115 @@ def execute_live_sell(position: dict, current_price_usd: float, current_liquidit
     except Exception as e:
         send(f"❌ LIVE SELL ERROR\n{symbol}\n{token}\n{e}")
         return False
+
+
+def execute_live_sell_v3(position: dict, current_price_usd: float, current_liquidity_usd: float, reason: str) -> bool:
+    if not ACCOUNT:
+        return False
+
+    token = position["token"]
+    pair = position["pair"]
+    symbol = position["symbol"]
+    amount_raw = position["token_amount_raw"]
+    wallet = ACCOUNT.address
+    source = str(position.get("source", "V3"))
+    fee = get_v3_fee_from_source(source)
+
+    try:
+        if amount_raw <= 0:
+            return False
+        if not approve_token_if_needed(token, amount_raw, V3_ROUTER):
+            return False
+
+        quote_ok, expected_out, amount_out_min, quote_reason = get_v3_quote(amount_raw, WETH, fee)
+        # Above won't work because tokenIn must be token, tokenOut WETH. So re-quote properly:
+        try:
+            expected_eth_out = int(
+                v3_quoter.functions.quoteExactInputSingle(
+                    Web3.to_checksum_address(token),
+                    WETH,
+                    int(fee),
+                    int(amount_raw),
+                    0,
+                ).call()
+            )
+            amount_out_min = int(expected_eth_out * (10000 - SLIPPAGE_BPS) / 10000)
+            if amount_out_min <= 0:
+                raise RuntimeError("amountOutMin <= 0")
+        except Exception as e:
+            send(
+                f"❌ LIVE SELL SKIPPED\n\n"
+                f"{symbol}\n"
+                f"Token\n{token}\n\n"
+                f"Pair\n{pair}\n\n"
+                f"Reason: no usable V3 sell route\n{e}"
+            )
+            return False
+
+        nonce = w3.eth.get_transaction_count(wallet, "pending")
+        deadline = int(time.time()) + SELL_DEADLINE_SECONDS
+
+        params = (
+            Web3.to_checksum_address(token),
+            WETH,
+            int(fee),
+            wallet,
+            deadline,
+            int(amount_raw),
+            int(amount_out_min),
+            0,
+        )
+
+        gas_limit = GAS_LIMIT_SELL_V3
+        try:
+            gas_estimate = v3_router.functions.exactInputSingle(params).estimate_gas(
+                build_tx_params(wallet, nonce, 0, value=0)
+            )
+            gas_limit = max(int(gas_estimate * 1.25), GAS_LIMIT_SELL_V3)
+        except Exception as e:
+            print(f"V3 sell gas estimate failed for {symbol}: {e}")
+
+        tx = v3_router.functions.exactInputSingle(params).build_transaction(
+            build_tx_params(wallet, nonce, gas_limit, value=0)
+        )
+
+        signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+
+        if receipt.status == 1:
+            send(
+                f"🔴 LIVE SELL CLOSED (V3)\n\n"
+                f"{symbol}\n"
+                f"Token\n{token}\n\n"
+                f"Pair\n{pair}\n\n"
+                f"Fee Tier {fee}\n"
+                f"Current Price ${current_price_usd:.10f}\n"
+                f"Current Liquidity ${current_liquidity_usd:,.0f}\n"
+                f"Reason: {reason}\n"
+                f"Tx {tx_hash.hex()}"
+            )
+            return True
+
+        send(
+            f"❌ LIVE SELL FAILED (V3)\n\n"
+            f"{symbol}\n"
+            f"Token\n{token}\n\n"
+            f"Pair\n{pair}\n\n"
+            f"Tx {tx_hash.hex()}"
+        )
+        return False
+
+    except Exception as e:
+        send(f"❌ LIVE SELL ERROR (V3)\n{symbol}\n{token}\n{e}")
+        return False
+
+
+def execute_live_sell(position: dict, current_price_usd: float, current_liquidity_usd: float, reason: str) -> bool:
+    source = str(position.get("source", "V2"))
+    if source.startswith("V3"):
+        return execute_live_sell_v3(position, current_price_usd, current_liquidity_usd, reason)
+    return execute_live_sell_v2(position, current_price_usd, current_liquidity_usd, reason)
 
 
 # -------------------------
@@ -1351,6 +1778,7 @@ def parse_v3_event(e) -> Optional[Tuple[str, str, str]]:
         token0 = e["args"]["token0"]
         token1 = e["args"]["token1"]
         pool = e["args"]["pool"]
+        fee = int(e["args"]["fee"])
 
         token = None
         if token0.lower() == WETH.lower():
@@ -1359,7 +1787,7 @@ def parse_v3_event(e) -> Optional[Tuple[str, str, str]]:
             token = token0
 
         if token:
-            return Web3.to_checksum_address(token), Web3.to_checksum_address(pool), "V3"
+            return Web3.to_checksum_address(token), Web3.to_checksum_address(pool), f"V3:{fee}"
     except Exception as ex:
         print("parse_v3_event error:", ex)
     return None
