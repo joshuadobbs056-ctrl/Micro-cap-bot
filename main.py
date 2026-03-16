@@ -51,7 +51,7 @@ STARTUP_LOOKBACK_BLOCKS = int(os.getenv("STARTUP_LOOKBACK_BLOCKS", "250"))
 MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "900"))  # 15 min
 
 # entry criteria
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "3000"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "20000"))
 MIN_VOLUME_5M_USD = float(os.getenv("MIN_VOLUME_5M_USD", "1000"))
 MIN_SELLS_5M = int(os.getenv("MIN_SELLS_5M", "0"))
 MIN_BUYS_5M = int(os.getenv("MIN_BUYS_5M", "1"))
@@ -62,6 +62,14 @@ MAX_BUY_TAX_PCT = float(os.getenv("MAX_BUY_TAX_PCT", "15"))
 
 # exit criteria - ONLY liquidity drop
 LIQUIDITY_DROP_EXIT_PCT = float(os.getenv("LIQUIDITY_DROP_EXIT_PCT", "25"))
+
+# paper exit simulation
+# When liquidity exit triggers, do NOT force value to zero.
+# Use latest usable price, apply haircut, and cap by buy-side liquidity.
+PAPER_EXIT_HAIRCUT_PCT = float(os.getenv("PAPER_EXIT_HAIRCUT_PCT", "30"))   # 30% haircut on emergency exit
+PAPER_EXIT_MAX_BUYSIDE_SHARE = float(os.getenv("PAPER_EXIT_MAX_BUYSIDE_SHARE", "0.10"))  # 10% of buy-side liquidity
+PAPER_EXIT_MIN_VALUE_USD = float(os.getenv("PAPER_EXIT_MIN_VALUE_USD", "0.01"))  # prevent fake 0 when still sellable
+PAPER_MARK_PRICE_FALLBACK_HAIRCUT_PCT = float(os.getenv("PAPER_MARK_PRICE_FALLBACK_HAIRCUT_PCT", "15"))
 
 # live buy settings
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "1500"))
@@ -604,6 +612,13 @@ class PaperTrade:
         self.tokens = PURCHASE_AMOUNT_USD / entry_price if entry_price > 0 else 0.0
         self.opened = now_ts()
 
+        # Track latest usable market state so a broken quote doesn't force a fake zero.
+        self.last_good_price = entry_price if entry_price > 0 else 0.0
+        self.last_good_liquidity_usd = entry_liquidity_usd if entry_liquidity_usd > 0 else 0.0
+        self.last_mark_value_usd = PURCHASE_AMOUNT_USD
+        self.peak_value_usd = PURCHASE_AMOUNT_USD
+        self.last_update_ts = now_ts()
+
 
 PAPER_TRADES: Dict[str, PaperTrade] = {}
 LIVE_POSITIONS: Dict[str, dict] = {}
@@ -611,6 +626,68 @@ SEEN_POOLS = set()
 ACTIVE_POOLS = set()
 LOCK = threading.Lock()
 POOL_THREAD_SEMAPHORE = threading.BoundedSemaphore(MAX_ACTIVE_POOL_THREADS)
+
+
+def update_trade_market_state(trade: PaperTrade, price: float, liquidity_usd: float):
+    if price > 0:
+        trade.last_good_price = price
+    if liquidity_usd > 0:
+        trade.last_good_liquidity_usd = liquidity_usd
+
+    mark_price = price if price > 0 else trade.last_good_price
+    if mark_price > 0:
+        trade.last_mark_value_usd = trade.tokens * mark_price
+        if trade.last_mark_value_usd > trade.peak_value_usd:
+            trade.peak_value_usd = trade.last_mark_value_usd
+
+    trade.last_update_ts = now_ts()
+
+
+def simulate_paper_exit(trade: PaperTrade, snap: Optional[Dict[str, Any]]) -> Tuple[float, float, float, str]:
+    """
+    Returns:
+        exit_price_used, final_value_usd, pnl_pct, detail_reason
+    """
+    current_price = 0.0
+    current_liq = 0.0
+
+    if snap:
+        current_price = safe_float(snap.get("price_usd"))
+        current_liq = safe_float(snap.get("liquidity_usd"))
+
+    usable_price = current_price if current_price > 0 else trade.last_good_price
+    usable_liq = current_liq if current_liq > 0 else trade.last_good_liquidity_usd
+
+    if usable_price <= 0:
+        return 0.0, 0.0, -100.0, "no usable price or liquidity basis"
+
+    gross_value = trade.tokens * usable_price
+
+    # If the live quote is broken/zero, apply an additional fallback haircut to avoid over-crediting.
+    if current_price <= 0:
+        gross_value *= (1.0 - PAPER_MARK_PRICE_FALLBACK_HAIRCUT_PCT / 100.0)
+
+    # Liquidity on Dexscreener is both sides combined. Approximate buy-side as half.
+    buy_side_liquidity = max(usable_liq * 0.5, 0.0)
+    liquidity_cap = buy_side_liquidity * max(PAPER_EXIT_MAX_BUYSIDE_SHARE, 0.0)
+
+    haircut_value = gross_value * (1.0 - PAPER_EXIT_HAIRCUT_PCT / 100.0)
+
+    # If we have a meaningful liquidity cap, respect it.
+    if liquidity_cap > 0:
+        final_value = min(haircut_value, liquidity_cap)
+        cap_text = f"haircut {PAPER_EXIT_HAIRCUT_PCT:.0f}% | cap {PAPER_EXIT_MAX_BUYSIDE_SHARE * 100:.0f}% buy-side"
+    else:
+        final_value = haircut_value
+        cap_text = f"haircut {PAPER_EXIT_HAIRCUT_PCT:.0f}% | no liq cap available"
+
+    # Prevent fake zero on still-sellable names.
+    if final_value <= 0 and gross_value > 0:
+        final_value = max(PAPER_EXIT_MIN_VALUE_USD, gross_value * 0.05)
+        cap_text += " | min emergency floor used"
+
+    pnl_pct = ((final_value - PURCHASE_AMOUNT_USD) / PURCHASE_AMOUNT_USD) * 100 if PURCHASE_AMOUNT_USD > 0 else 0.0
+    return usable_price, final_value, pnl_pct, cap_text
 
 
 # -------------------------
@@ -630,9 +707,13 @@ def monitor_paper_trade(token: str):
         if not snap:
             continue
 
-        price = snap["price_usd"]
-        current_liq = snap["liquidity_usd"]
-        value = trade.tokens * price if price > 0 else 0.0
+        price = safe_float(snap["price_usd"])
+        current_liq = safe_float(snap["liquidity_usd"])
+
+        update_trade_market_state(trade, price, current_liq)
+
+        mark_price = price if price > 0 else trade.last_good_price
+        value = trade.tokens * mark_price if mark_price > 0 else 0.0
         pnl = ((value - PURCHASE_AMOUNT_USD) / PURCHASE_AMOUNT_USD) * 100 if PURCHASE_AMOUNT_USD > 0 else 0.0
 
         send(
@@ -640,7 +721,7 @@ def monitor_paper_trade(token: str):
             f"{trade.symbol}\n"
             f"Token\n{trade.token}\n\n"
             f"Entry ${trade.entry_price:.10f}\n"
-            f"Current ${price:.10f}\n\n"
+            f"Current ${mark_price:.10f}\n\n"
             f"Entry Liquidity ${trade.entry_liquidity_usd:,.0f}\n"
             f"Current Liquidity ${current_liq:,.0f}\n\n"
             f"Value ${value:.2f}\n"
@@ -648,17 +729,21 @@ def monitor_paper_trade(token: str):
         )
 
         exit_floor = trade.entry_liquidity_usd * (1 - LIQUIDITY_DROP_EXIT_PCT / 100.0)
-        if current_liq <= exit_floor:
-            ACCOUNT_CASH += value
+        if current_liq > 0 and current_liq <= exit_floor:
+            exit_price_used, final_value, final_pnl_pct, exit_detail = simulate_paper_exit(trade, snap)
+            ACCOUNT_CASH += final_value
+
             send(
                 f"🧪 PAPER TRADE CLOSED\n\n"
                 f"{trade.symbol}\n"
                 f"Token\n{trade.token}\n\n"
                 f"Entry ${trade.entry_price:.10f}\n"
-                f"Exit ${price:.10f}\n\n"
-                f"Final Value ${value:.2f}\n"
-                f"PnL {pnl:.2f}%\n\n"
-                f"Reason: liquidity dropped {LIQUIDITY_DROP_EXIT_PCT:.0f}%"
+                f"Sim Exit ${exit_price_used:.10f}\n\n"
+                f"Peak Value ${trade.peak_value_usd:.2f}\n"
+                f"Final Value ${final_value:.2f}\n"
+                f"PnL {final_pnl_pct:.2f}%\n\n"
+                f"Reason: liquidity dropped {LIQUIDITY_DROP_EXIT_PCT:.0f}%\n"
+                f"Model: {exit_detail}"
             )
             PAPER_TRADES.pop(token, None)
             return
@@ -984,9 +1069,14 @@ def portfolio_loop():
 
         for trade in PAPER_TRADES.values():
             snap = get_pair_snapshot(trade.pair)
-            if not snap:
-                continue
-            total += trade.tokens * snap["price_usd"]
+            if snap:
+                price = safe_float(snap["price_usd"])
+                liq = safe_float(snap["liquidity_usd"])
+                update_trade_market_state(trade, price, liq)
+
+            mark_price = trade.last_good_price
+            if mark_price > 0:
+                total += trade.tokens * mark_price
 
         pnl = total - START_BALANCE
         pnl_pct = (pnl / START_BALANCE) * 100 if START_BALANCE > 0 else 0.0
@@ -1038,6 +1128,7 @@ def main():
         f"Entry Rules: volume there and sells >= {MIN_SELLS_5M}\n"
         f"Security Rules: sell tax <= {MAX_SELL_TAX_PCT:.2f}% | buy tax <= {MAX_BUY_TAX_PCT:.2f}%\n"
         f"Exit Rule: liquidity drop {LIQUIDITY_DROP_EXIT_PCT:.0f}%\n"
+        f"Paper Exit Model: haircut {PAPER_EXIT_HAIRCUT_PCT:.0f}% | cap {PAPER_EXIT_MAX_BUYSIDE_SHARE * 100:.0f}% buy-side\n"
         f"Discovery: V2 + V3\n"
         f"Startup Lookback {STARTUP_LOOKBACK_BLOCKS} blocks"
     )
