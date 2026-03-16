@@ -24,6 +24,13 @@ except Exception:
 
 
 # -------------------------
+# SHARED HTTP SESSION
+# -------------------------
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+
+
+# -------------------------
 # ENV
 # -------------------------
 NODE = os.getenv("NODE")
@@ -271,7 +278,7 @@ eth_usd_feed = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=CHAINLINK_ETH_USD_
 def send(msg: str):
     if TELEGRAM_TOKEN and CHAT_ID:
         try:
-            requests.post(
+            SESSION.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 data={"chat_id": CHAT_ID, "text": msg, "disable_web_page_preview": True},
                 timeout=10,
@@ -360,7 +367,15 @@ def build_tx_params(wallet_address: str, nonce: int, gas: int, value: int = 0) -
 def get_token_security(token: str) -> Optional[dict]:
     try:
         url = f"https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses={token}"
-        r = requests.get(url, timeout=10)
+        r = SESSION.get(url, timeout=10)
+
+        if r.status_code != 200:
+            return None
+
+        body = (r.text or "").strip()
+        if not body:
+            return None
+
         data = r.json()
         result = (data.get("result") or {}).get(token.lower())
         return result if isinstance(result, dict) else None
@@ -403,8 +418,23 @@ def passes_tax_and_sellability(token: str) -> Tuple[bool, str]:
 def get_pair_snapshot(pair: str) -> Optional[Dict[str, Any]]:
     try:
         url = f"https://api.dexscreener.com/latest/dex/pairs/ethereum/{pair}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
+        r = SESSION.get(url, timeout=10)
+
+        if r.status_code != 200:
+            print(f"get_pair_snapshot status {r.status_code} for {pair}")
+            return None
+
+        body = (r.text or "").strip()
+        if not body:
+            print(f"get_pair_snapshot empty response for {pair}")
+            return None
+
+        try:
+            data = r.json()
+        except Exception:
+            preview = body[:200].replace("\n", " ")
+            print(f"get_pair_snapshot non-json response for {pair}: {preview}")
+            return None
 
         p = data.get("pair")
         if not p:
@@ -438,8 +468,15 @@ def get_pair_snapshot(pair: str) -> Optional[Dict[str, Any]]:
             "age_seconds": age_seconds,
             "url": p.get("url", ""),
         }
+
+    except requests.exceptions.Timeout:
+        print(f"get_pair_snapshot timeout for {pair}")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"get_pair_snapshot request error for {pair}: {e}")
+        return None
     except Exception as e:
-        print("get_pair_snapshot error:", e)
+        print(f"get_pair_snapshot error for {pair}: {e}")
         return None
 
 
