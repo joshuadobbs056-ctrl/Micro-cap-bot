@@ -30,6 +30,8 @@ if not NODE:
 
 if NODE.startswith("wss://"):
     NODE = NODE.replace("wss://", "https://", 1)
+elif NODE.startswith("ws://"):
+    NODE = NODE.replace("ws://", "http://", 1)
 
 # =========================
 # WEB3
@@ -43,43 +45,53 @@ V2_FACTORY = Web3.to_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
 
 # =========================
+# HTTP SESSION
+# =========================
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+
+# =========================
 # TELEGRAM
 # =========================
-def send(msg):
+def send(msg: str):
     print(msg)
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
-            requests.post(
+            SESSION.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
                 timeout=10,
             )
-        except:
-            pass
+        except Exception as e:
+            print("telegram error:", e)
 
 # =========================
 # GOPLUS
 # =========================
-def check_goplus(token):
+def check_goplus(token: str):
     try:
-        r = requests.get(GOPLUS_API.format(token), timeout=10)
-        data = r.json()["result"][token.lower()]
+        r = SESSION.get(GOPLUS_API.format(token), timeout=10)
+        data = r.json()
+        result = (data.get("result") or {}).get(token.lower())
+
+        if not result:
+            return None
 
         return {
-            "honeypot": data.get("is_honeypot") == "1",
-            "cannot_sell": data.get("cannot_sell_all") == "1",
-            "buy_tax": float(data.get("buy_tax") or 0),
-            "sell_tax": float(data.get("sell_tax") or 0),
+            "honeypot": result.get("is_honeypot") == "1",
+            "cannot_sell": result.get("cannot_sell_all") == "1",
+            "buy_tax": float(result.get("buy_tax") or 0),
+            "sell_tax": float(result.get("sell_tax") or 0),
         }
-    except:
+    except Exception:
         return None
 
 # =========================
 # DEX
 # =========================
-def get_dex(token):
+def get_dex(token: str):
     try:
-        r = requests.get(DEX_API.format(token), timeout=10)
+        r = SESSION.get(DEX_API.format(token), timeout=10)
         pairs = r.json().get("pairs", [])
 
         if not pairs:
@@ -88,17 +100,17 @@ def get_dex(token):
         p = pairs[0]
 
         return {
-            "price": float(p.get("priceUsd", 0)),
-            "liquidity": float(p.get("liquidity", {}).get("usd", 0)),
-            "volume": float(p.get("volume", {}).get("m5", 0)),
-            "buys": p.get("txns", {}).get("m5", {}).get("buys", 0),
-            "sells": p.get("txns", {}).get("m5", {}).get("sells", 0),
+            "price": float(p.get("priceUsd", 0) or 0),
+            "liquidity": float((p.get("liquidity") or {}).get("usd", 0) or 0),
+            "volume": float((p.get("volume") or {}).get("m5", 0) or 0),
+            "buys": int(((p.get("txns") or {}).get("m5") or {}).get("buys", 0) or 0),
+            "sells": int(((p.get("txns") or {}).get("m5") or {}).get("sells", 0) or 0),
             "url": p.get("url", ""),
-            "symbol": p.get("baseToken", {}).get("symbol", "UNK"),
-            "websites": p.get("info", {}).get("websites", []),
-            "socials": p.get("info", {}).get("socials", []),
+            "symbol": (p.get("baseToken") or {}).get("symbol", "UNK"),
+            "websites": (p.get("info") or {}).get("websites", []) or [],
+            "socials": (p.get("info") or {}).get("socials", []) or [],
         }
-    except:
+    except Exception:
         return None
 
 # =========================
@@ -106,24 +118,29 @@ def get_dex(token):
 # =========================
 def analyze_docs(urls):
     score = 0
+    summary = "No site"
     narrative = "Unknown"
 
     if not urls:
-        return 0, "No site", "Unknown"
+        return 0, summary, narrative
 
     try:
         url = urls[0].get("url")
-        r = requests.get(url, timeout=8)
-        text = BeautifulSoup(r.text, "html.parser").get_text().lower()
+        if not url:
+            return 0, summary, narrative
+
+        r = SESSION.get(url, timeout=8)
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(" ").lower()
 
         # narrative detection
-        if "ai" in text:
+        if "artificial intelligence" in text or " ai " in f" {text} ":
             narrative = "AI"
             score += 2
-        elif "game" in text:
+        elif "game" in text or "gaming" in text:
             narrative = "Gaming"
             score += 1
-        elif "defi" in text:
+        elif "defi" in text or "decentralized finance" in text:
             narrative = "DeFi"
             score += 1
         elif "meme" in text:
@@ -137,18 +154,24 @@ def analyze_docs(urls):
             score += 1
         if "whitepaper" in text:
             score += 2
-        if "audit" in text:
+        if "audit" in text or "audited" in text:
             score += 2
+        if "team" in text:
+            score += 1
+        if "utility" in text:
+            score += 1
 
-        # scam detection
-        if "guaranteed" in text or "100x" in text:
+        # scam-ish language
+        if "guaranteed" in text or "100x" in text or "1000x" in text:
+            score -= 3
+        if "no risk" in text or "free money" in text:
             score -= 3
 
         summary = "Strong" if score >= 4 else "Basic"
 
         return score, summary, narrative
 
-    except:
+    except Exception:
         return 0, "Failed", "Unknown"
 
 # =========================
@@ -159,101 +182,132 @@ def analyze_socials(socials):
     found = []
 
     for s in socials:
-        if "twitter" in s.get("url", ""):
+        url = (s.get("url") or "").lower()
+        if "twitter.com" in url or "x.com" in url:
             score += 1
-            found.append("Twitter")
-        if "telegram" in s.get("url", ""):
+            if "Twitter/X" not in found:
+                found.append("Twitter/X")
+        if "t.me" in url or "telegram" in url:
             score += 1
-            found.append("Telegram")
+            if "Telegram" not in found:
+                found.append("Telegram")
+        if "discord" in url:
+            score += 1
+            if "Discord" not in found:
+                found.append("Discord")
 
     return score, ", ".join(found) if found else "None"
 
 # =========================
 # ANALYZE TOKEN
 # =========================
-def analyze_token(token):
+def analyze_token(token: str):
+    try:
+        g = check_goplus(token)
+        d = get_dex(token)
 
-    g = check_goplus(token)
-    d = get_dex(token)
+        if not d:
+            return
 
-    if not d:
-        return
+        doc_score, doc_summary, narrative = analyze_docs(d["websites"])
+        social_score, social_summary = analyze_socials(d["socials"])
 
-    doc_score, doc_summary, narrative = analyze_docs(d["websites"])
-    social_score, social_summary = analyze_socials(d["socials"])
+        score = 0
 
-    score = 0
+        # SECURITY
+        if g:
+            if not g["honeypot"]:
+                score += 2
+            else:
+                score -= 5
 
-    # SECURITY
-    if g:
-        if not g["honeypot"]:
+            if not g["cannot_sell"]:
+                score += 1
+            else:
+                score -= 5
+
+            if g["sell_tax"] <= 10:
+                score += 1
+            else:
+                score -= 2
+
+            if g["buy_tax"] <= 15:
+                score += 1
+            else:
+                score -= 2
+
+        # MARKET
+        if d["liquidity"] > MIN_LIQUIDITY:
             score += 2
+        if d["volume"] > MIN_VOLUME:
+            score += 2
+        if d["buys"] > d["sells"]:
+            score += 1
+
+        # DOCS / SOCIALS
+        score += doc_score + social_score
+
+        # verdict
+        if score >= 8:
+            verdict = "🔥 HIGH POTENTIAL"
+        elif score >= 5:
+            verdict = "💎 EARLY GEM"
+        elif score >= 3:
+            verdict = "⚠️ WATCH"
         else:
-            score -= 5
+            verdict = "❌ AVOID"
 
-        if not g["cannot_sell"]:
-            score += 1
+        msg = (
+            "🚀 NEW TOKEN DETECTED\n\n"
+            "📌 CONTRACT\n"
+            f"{token}\n\n"
+            f"🏷️ {d['symbol']}\n"
+            f"💰 ${d['price']:.8f}\n"
+            f"💧 ${d['liquidity']:,.0f}\n"
+            f"📊 Vol ${d['volume']:,.0f}\n"
+            f"🟢 {d['buys']} | 🔴 {d['sells']}\n\n"
+            f"🛡 Honeypot: {g['honeypot'] if g else 'unknown'}\n"
+            f"🚫 Cannot Sell: {g['cannot_sell'] if g else 'unknown'}\n"
+            f"Buy Tax: {g['buy_tax'] if g else '?'}%\n"
+            f"Sell Tax: {g['sell_tax'] if g else '?'}%\n\n"
+            f"🧠 Narrative: {narrative}\n"
+            f"🌐 Docs: {doc_summary}\n"
+            f"🐦 Socials: {social_summary}\n\n"
+            f"⭐ SCORE {score}\n"
+            f"{verdict}\n\n"
+            f"{d['url']}"
+        )
 
-        if g["sell_tax"] <= 10:
-            score += 1
+        send(msg)
 
-    # MARKET
-    if d["liquidity"] > MIN_LIQUIDITY:
-        score += 2
-    if d["volume"] > MIN_VOLUME:
-        score += 2
-    if d["buys"] > d["sells"]:
-        score += 1
-
-    score += doc_score + social_score
-
-    # verdict
-    if score >= 8:
-        verdict = "🔥 HIGH POTENTIAL"
-    elif score >= 5:
-        verdict = "💎 EARLY GEM"
-    elif score >= 3:
-        verdict = "⚠️ WATCH"
-    else:
-        verdict = "❌ AVOID"
-
-    msg = (
-        "🚀 NEW TOKEN DETECTED\n\n"
-        "📌 CONTRACT\n"
-        f"{token}\n\n"
-        f"🏷️ {d['symbol']}\n"
-        f"💰 ${d['price']:.8f}\n"
-        f"💧 ${d['liquidity']:,.0f}\n"
-        f"📊 Vol ${d['volume']:,.0f}\n"
-        f"🟢 {d['buys']} | 🔴 {d['sells']}\n\n"
-        f"🛡 Honeypot: {g['honeypot'] if g else 'unknown'}\n"
-        f"Tax: {g['sell_tax'] if g else '?'}%\n\n"
-        f"🧠 Narrative: {narrative}\n"
-        f"🌐 Docs: {doc_summary}\n"
-        f"🐦 Socials: {social_summary}\n\n"
-        f"⭐ SCORE {score}\n"
-        f"{verdict}\n\n"
-        f"{d['url']}"
-    )
-
-    send(msg)
+    except Exception as e:
+        print("analyze_token error:", e)
 
 # =========================
 # EVENT LISTENER
 # =========================
-V2_ABI = [{
-    "anonymous": False,
-    "inputs": [
-        {"indexed": True, "name": "token0", "type": "address"},
-        {"indexed": True, "name": "token1", "type": "address"},
-        {"indexed": False, "name": "pair", "type": "address"}
-    ],
-    "name": "PairCreated",
-    "type": "event"
-}]
+V2_ABI = [
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "name": "token0", "type": "address"},
+            {"indexed": True, "name": "token1", "type": "address"},
+            {"indexed": False, "name": "pair", "type": "address"},
+            {"indexed": False, "name": "", "type": "uint256"},
+        ],
+        "name": "PairCreated",
+        "type": "event",
+    }
+]
 
 v2 = w3.eth.contract(address=V2_FACTORY, abi=V2_ABI)
 seen = set()
+
+def get_event_logs(event_obj, start_block, end_block):
+    try:
+        return event_obj.get_logs(from_block=start_block, to_block=end_block)
+    except TypeError:
+        return event_obj.get_logs(fromBlock=start_block, toBlock=end_block)
 
 def fetch_logs(start, end):
     logs = []
@@ -261,10 +315,7 @@ def fetch_logs(start, end):
         chunk_end = min(start + MAX_LOG_RANGE - 1, end)
 
         try:
-            chunk = v2.events.PairCreated.get_logs(
-                from_block=start,
-                to_block=chunk_end
-            )
+            chunk = get_event_logs(v2.events.PairCreated, start, chunk_end)
             logs.extend(chunk)
         except Exception as e:
             print("log error", e)
