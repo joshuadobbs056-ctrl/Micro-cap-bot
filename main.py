@@ -62,7 +62,10 @@ TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "2.0"))
 
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "100000"))
 MIN_24H_VOLUME_USD = float(os.getenv("MIN_24H_VOLUME_USD", "1000000"))
+
+# price band: default now targets one cent and under
 MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.0000001"))
+MAX_PRICE_USD = float(os.getenv("MAX_PRICE_USD", "0.01"))
 
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "300"))
 GAS_LIMIT_BUY = int(os.getenv("GAS_LIMIT_BUY", "450000"))
@@ -303,7 +306,6 @@ CHAINLINK_ETH_USD_ABI = [
             {"internalType": "uint80", "name": "roundId", "type": "uint80"},
             {"internalType": "int256", "name": "answer", "type": "int256"},
             {"internalType": "uint256", "name": "startedAt", "type": "uint256"},
-            {"internalType": "uint256", "name": "updatedAt", "type": "uint256"},
             {"internalType": "uint80", "name": "answeredInRound", "type": "uint80"},
         ],
         "stateMutability": "view",
@@ -497,6 +499,16 @@ def sell_attempts_exceeded(token: str) -> bool:
         return FAILED_SELL_ATTEMPTS.get(token, 0) >= MAX_FAILED_SELL_ATTEMPTS
 
 
+def price_in_band(price_usd: float) -> bool:
+    if price_usd <= 0:
+        return False
+    if price_usd < MIN_PRICE_USD:
+        return False
+    if MAX_PRICE_USD > 0 and price_usd > MAX_PRICE_USD:
+        return False
+    return True
+
+
 # -------------------------
 # DEXSCREENER
 # -------------------------
@@ -535,11 +547,12 @@ def get_best_pair_snapshot(token: str) -> Optional[dict]:
         liquidity_usd = safe_float((p.get("liquidity") or {}).get("usd"))
         vol24 = safe_float((p.get("volume") or {}).get("h24"))
         price_usd = safe_float(p.get("priceUsd"))
+
         if liquidity_usd < MIN_LIQUIDITY_USD:
             continue
         if vol24 < MIN_24H_VOLUME_USD:
             continue
-        if price_usd < MIN_PRICE_USD:
+        if not price_in_band(price_usd):
             continue
 
         score = liquidity_usd + (vol24 * 0.25)
@@ -696,6 +709,18 @@ def approve_token_if_needed(token: str, amount_raw: int, spender: str) -> bool:
 def execute_live_buy(token: str, symbol: str, entry_price_usd: float) -> Optional[dict]:
     if not ACCOUNT:
         send("⚠️ LIVE BUY SKIPPED\nReason: PRIVATE_KEY not loaded")
+        return None
+
+    if not price_in_band(entry_price_usd):
+        send(
+            f"⚠️ LIVE BUY SKIPPED\n\n"
+            f"{symbol}\n"
+            f"Token\n{token}\n\n"
+            f"Reason: price outside configured band\n"
+            f"Price ${entry_price_usd:.8f}\n"
+            f"Min ${MIN_PRICE_USD:.8f}\n"
+            f"Max ${MAX_PRICE_USD:.8f}"
+        )
         return None
 
     wallet = ACCOUNT.address
@@ -1082,7 +1107,7 @@ def open_paper_position(symbol: str, token: str, price: float) -> bool:
         return False
     if ACCOUNT_CASH < BUY_SIZE_USD:
         return False
-    if price <= 0:
+    if not price_in_band(price):
         return False
 
     qty = BUY_SIZE_USD / price
@@ -1246,6 +1271,8 @@ def get_signal_for_token(symbol: str, token: str, market: dict) -> Tuple[bool, s
 
     if price <= 0:
         return False, "bad price"
+    if not price_in_band(price):
+        return False, f"price outside band {price:.8f}"
     if liquidity < MIN_LIQUIDITY_USD:
         return False, f"liquidity too low {liquidity:.0f}"
     if vol24 < MIN_24H_VOLUME_USD:
@@ -1275,6 +1302,8 @@ def get_signal_for_token(symbol: str, token: str, market: dict) -> Tuple[bool, s
 def process_signal(symbol: str, token: str, market: dict):
     price = safe_float(market.get("price_usd"))
     if price <= 0:
+        return
+    if not price_in_band(price):
         return
 
     signal_ok, signal_reason = get_signal_for_token(symbol, token, market)
@@ -1413,6 +1442,8 @@ def heartbeat_loop():
                 f"Trail Arm {TRAIL_ARM_PCT:.2f}%\n"
                 f"Trail Drop {TRAIL_DROP_PCT:.2f}%\n"
                 f"Stop Loss {STOP_LOSS_PCT:.2f}%\n"
+                f"Min Price ${MIN_PRICE_USD:.8f}\n"
+                f"Max Price ${MAX_PRICE_USD:.8f}\n"
                 f"Min Liquidity ${MIN_LIQUIDITY_USD:,.0f}\n"
                 f"Min 24h Volume ${MIN_24H_VOLUME_USD:,.0f}"
                 f"{extra}"
@@ -1440,6 +1471,8 @@ def main():
         f"Trail Arm {TRAIL_ARM_PCT:.2f}%\n"
         f"Trail Drop {TRAIL_DROP_PCT:.2f}%\n"
         f"Stop Loss {STOP_LOSS_PCT:.2f}%\n"
+        f"Min Price ${MIN_PRICE_USD:.8f}\n"
+        f"Max Price ${MAX_PRICE_USD:.8f}\n"
         f"Min Liquidity ${MIN_LIQUIDITY_USD:,.0f}\n"
         f"Min 24h Volume ${MIN_24H_VOLUME_USD:,.0f}\n"
         f"Slippage {SLIPPAGE_BPS} bps\n"
