@@ -51,16 +51,18 @@ CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "1800"))
 LIVE_ACCOUNT_UPDATE_SECONDS = int(os.getenv("LIVE_ACCOUNT_UPDATE_SECONDS", "300"))
 POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "30"))
+PORTFOLIO_UPDATE_SECONDS = int(os.getenv("PORTFOLIO_UPDATE_SECONDS", "300"))
 
-TOP_COINS_LIMIT = int(os.getenv("TOP_COINS_LIMIT", "100"))
-MIN_24H_VOLUME_USD = float(os.getenv("MIN_24H_VOLUME_USD", "5000000"))
-MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "50000000"))
-LOOKBACK_POINTS = int(os.getenv("LOOKBACK_POINTS", "6"))  # with 30s check, 6 = 3 minutes
-ENTRY_PUMP_PCT = float(os.getenv("ENTRY_PUMP_PCT", "2.5"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5"))
+LOOKBACK_POINTS = int(os.getenv("LOOKBACK_POINTS", "6"))  # with 30s checks, 6 = ~3 minutes
+ENTRY_PUMP_PCT = float(os.getenv("ENTRY_PUMP_PCT", "2.0"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5.0"))
 
-TRAIL_ARM_PCT = float(os.getenv("TRAIL_ARM_PCT", "5"))
-TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "2"))
+TRAIL_ARM_PCT = float(os.getenv("TRAIL_ARM_PCT", "5.0"))
+TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "2.0"))
+
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "100000"))
+MIN_24H_VOLUME_USD = float(os.getenv("MIN_24H_VOLUME_USD", "1000000"))
+MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.0000001"))
 
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "300"))
 GAS_LIMIT_BUY = int(os.getenv("GAS_LIMIT_BUY", "450000"))
@@ -77,18 +79,17 @@ FAILED_BUY_COOLDOWN_SECONDS = int(os.getenv("FAILED_BUY_COOLDOWN_SECONDS", "900"
 MAX_FAILED_SELL_ATTEMPTS = int(os.getenv("MAX_FAILED_SELL_ATTEMPTS", "2"))
 
 TELEGRAM_COOLDOWN_SECONDS = int(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "3"))
-PORTFOLIO_UPDATE_SECONDS = int(os.getenv("PORTFOLIO_UPDATE_SECONDS", "300"))
 
 V3_DEFAULT_FEE = int(os.getenv("V3_DEFAULT_FEE", "3000"))
 V3_FEE_CANDIDATES = [500, 3000, 10000]
 
-# exclude wrapped and stables by default
-EXCLUDED_SYMBOLS = {
+DEX_PREFERRED_CHAIN = os.getenv("DEX_PREFERRED_CHAIN", "ethereum").strip().lower()
+PAIR_STALE_SECONDS = int(os.getenv("PAIR_STALE_SECONDS", "180"))
+
+# comma separated symbol filter if you want to narrow down further
+WATCH_SYMBOLS_FILTER = {
     s.strip().upper()
-    for s in os.getenv(
-        "EXCLUDED_SYMBOLS",
-        "WETH,WBTC,USDT,USDC,DAI,FDUSD,TUSD,PYUSD,USDE,LUSD,USDD,USDB"
-    ).split(",")
+    for s in os.getenv("WATCH_SYMBOLS_FILTER", "").split(",")
     if s.strip()
 }
 
@@ -120,6 +121,47 @@ if PRIVATE_KEY:
         print(f"Loaded wallet: {ACCOUNT.address}")
     except Exception as e:
         raise RuntimeError(f"Bad PRIVATE_KEY: {e}")
+
+
+# -------------------------
+# TRUSTED ETHEREUM TOKEN UNIVERSE
+# -------------------------
+TRUSTED_TOKENS = {
+    "ETH": {"symbol": "ETH", "token": "0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2", "name": "Wrapped Ether"},
+    "WBTC": {"symbol": "WBTC", "token": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", "name": "Wrapped BTC"},
+    "LINK": {"symbol": "LINK", "token": "0x514910771AF9Ca656af840dff83E8264EcF986CA", "name": "Chainlink"},
+    "UNI": {"symbol": "UNI", "token": "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "name": "Uniswap"},
+    "AAVE": {"symbol": "AAVE", "token": "0x7Fc66500c84A76Ad7E9c93437bFc5Ac33E2DDAE9", "name": "Aave"},
+    "MKR": {"symbol": "MKR", "token": "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2", "name": "Maker"},
+    "CRV": {"symbol": "CRV", "token": "0xD533a949740bb3306d119CC777fa900bA034cd52", "name": "Curve DAO"},
+    "SNX": {"symbol": "SNX", "token": "0xC011A72400E58ecD99Ee497CF89E3775d4bd732F", "name": "Synthetix"},
+    "COMP": {"symbol": "COMP", "token": "0xc00e94Cb662C3520282E6f5717214004A7f26888", "name": "Compound"},
+    "LDO": {"symbol": "LDO", "token": "0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32", "name": "Lido DAO"},
+    "RPL": {"symbol": "RPL", "token": "0xD33526068D116cE69F19A9ee46F0bd304F21A51f", "name": "Rocket Pool"},
+    "PENDLE": {"symbol": "PENDLE", "token": "0x808507121B80c02388fAd14726482e061B8da827", "name": "Pendle"},
+    "ONDO": {"symbol": "ONDO", "token": "0xFAbA6f8e4a5E8Ab82F62fe7C39859FA577269BE3", "name": "Ondo"},
+    "MNT": {"symbol": "MNT", "token": "0x3c3a81e81dc49A522A592e7622A7E711c06bf354", "name": "Mantle"},
+    "AXS": {"symbol": "AXS", "token": "0xBB0E17EF65F82Ab018d8EDd776e8Dd940327B28b", "name": "Axie Infinity"},
+    "SUSHI": {"symbol": "SUSHI", "token": "0x6B3595068778DD592e39A122f4f5a5Cf09C90fE2", "name": "Sushi"},
+    "BAL": {"symbol": "BAL", "token": "0xba100000625a3754423978a60c9317c58a424e3D", "name": "Balancer"},
+    "1INCH": {"symbol": "1INCH", "token": "0x111111111117dC0aa78b770fA6A738034120C302", "name": "1inch"},
+    "YFI": {"symbol": "YFI", "token": "0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e", "name": "yearn.finance"},
+    "REN": {"symbol": "REN", "token": "0x408e41876cCCDC0F92210600ef50372656052a38", "name": "Ren"},
+    "BAT": {"symbol": "BAT", "token": "0x0D8775F648430679A709E98d2b0Cb6250d2887EF", "name": "Basic Attention Token"},
+    "ZRX": {"symbol": "ZRX", "token": "0xE41d2489571d322189246DaFA5ebDe1F4699F498", "name": "0x"},
+    "MANA": {"symbol": "MANA", "token": "0x0F5D2fB29fb7d3CFeE444a200298f468908cC942", "name": "Decentraland"},
+    "ENJ": {"symbol": "ENJ", "token": "0xF629cBd94d3791C9250152BD8dFbDF380E2a3B9c", "name": "Enjin"},
+    "APE": {"symbol": "APE", "token": "0x4d224452801ACEd8B2F0aebE155379bb5D594381", "name": "ApeCoin"},
+    "PEPE": {"symbol": "PEPE", "token": "0x6982508145454Ce325dDbE47a25d4ec3d2311933", "name": "Pepe"},
+    "SHIB": {"symbol": "SHIB", "token": "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE", "name": "Shiba Inu"},
+    "FLOKI": {"symbol": "FLOKI", "token": "0xcf0c122c6b73ff809c693db761e7b5b7f5b3c6c0", "name": "Floki"},
+}
+
+if WATCH_SYMBOLS_FILTER:
+    TRUSTED_TOKENS = {
+        sym: data for sym, data in TRUSTED_TOKENS.items()
+        if sym in WATCH_SYMBOLS_FILTER
+    }
 
 
 # -------------------------
@@ -285,8 +327,7 @@ FAILED_LIVE_BUYS: Dict[str, float] = {}
 FAILED_SELL_ATTEMPTS: Dict[str, int] = {}
 
 PRICE_HISTORY: Dict[str, deque] = {}
-TOP_MARKET_CACHE: Dict[str, dict] = {}
-CONTRACT_CACHE: Dict[str, Optional[str]] = {}
+MARKET_CACHE: Dict[str, dict] = {}
 LAST_SIGNAL_TS: Dict[str, float] = {}
 
 PAPER_POSITIONS: Dict[str, dict] = {}
@@ -457,82 +498,73 @@ def sell_attempts_exceeded(token: str) -> bool:
 
 
 # -------------------------
-# COINGECKO
+# DEXSCREENER
 # -------------------------
-def coingecko_get(path: str, params: Optional[dict] = None) -> Optional[Any]:
+def dexscreener_get_token_pairs(token: str) -> Optional[dict]:
     try:
-        r = SESSION.get(f"https://api.coingecko.com/api/v3{path}", params=params or {}, timeout=20)
+        r = SESSION.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{Web3.to_checksum_address(token)}",
+            timeout=20,
+        )
         if r.status_code != 200:
-            print(f"CoinGecko error {r.status_code}: {path} | {r.text[:200]}")
+            print(f"DexScreener error {r.status_code} for token {token}: {r.text[:200]}")
             return None
         body = (r.text or "").strip()
         if not body:
             return None
-        return r.json()
+        data = r.json()
+        return data if isinstance(data, dict) else None
     except Exception as e:
-        print(f"CoinGecko request failed for {path}: {e}")
+        print(f"DexScreener request failed for token {token}: {e}")
         return None
 
 
-def fetch_top_markets() -> List[dict]:
-    data = coingecko_get(
-        "/coins/markets",
-        params={
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": min(max(TOP_COINS_LIMIT, 1), 250),
-            "page": 1,
-            "sparkline": "false",
-            "price_change_percentage": "1h,24h",
-        },
-    )
+def get_best_pair_snapshot(token: str) -> Optional[dict]:
+    data = dexscreener_get_token_pairs(token)
+    if not data:
+        return None
 
-    if not isinstance(data, list):
-        return []
+    pairs = data.get("pairs") or []
+    best = None
+    best_score = -1.0
 
-    filtered = []
-    for coin in data:
-        symbol = str(coin.get("symbol") or "").upper()
-        market_cap = safe_float(coin.get("market_cap"))
-        vol = safe_float(coin.get("total_volume"))
-        price = safe_float(coin.get("current_price"))
-
-        if not symbol:
-            continue
-        if symbol in EXCLUDED_SYMBOLS:
-            continue
-        if market_cap < MIN_MARKET_CAP_USD:
-            continue
-        if vol < MIN_24H_VOLUME_USD:
-            continue
-        if price <= 0:
+    for p in pairs:
+        if str(p.get("chainId") or "").lower() != DEX_PREFERRED_CHAIN:
             continue
 
-        filtered.append(coin)
+        liquidity_usd = safe_float((p.get("liquidity") or {}).get("usd"))
+        vol24 = safe_float((p.get("volume") or {}).get("h24"))
+        price_usd = safe_float(p.get("priceUsd"))
+        if liquidity_usd < MIN_LIQUIDITY_USD:
+            continue
+        if vol24 < MIN_24H_VOLUME_USD:
+            continue
+        if price_usd < MIN_PRICE_USD:
+            continue
 
-    return filtered[:TOP_COINS_LIMIT]
+        score = liquidity_usd + (vol24 * 0.25)
+        if score > best_score:
+            txns_h1 = (p.get("txns") or {}).get("h1") or {}
+            txns_m5 = (p.get("txns") or {}).get("m5") or {}
+            best = {
+                "pair_address": p.get("pairAddress"),
+                "dex_id": p.get("dexId"),
+                "url": p.get("url"),
+                "price_usd": price_usd,
+                "liquidity_usd": liquidity_usd,
+                "volume_h24_usd": vol24,
+                "volume_m5_usd": safe_float((p.get("volume") or {}).get("m5")),
+                "buys_h1": int(txns_h1.get("buys") or 0),
+                "sells_h1": int(txns_h1.get("sells") or 0),
+                "buys_m5": int(txns_m5.get("buys") or 0),
+                "sells_m5": int(txns_m5.get("sells") or 0),
+                "pair_created_at_ms": p.get("pairCreatedAt"),
+                "source": "dexscreener",
+                "updated_ts": now_ts(),
+            }
+            best_score = score
 
-
-def get_ethereum_contract_for_coin(coin_id: str) -> Optional[str]:
-    with LOCK:
-        if coin_id in CONTRACT_CACHE:
-            return CONTRACT_CACHE[coin_id]
-
-    data = coingecko_get("/coins/" + coin_id, params={"localization": "false", "tickers": "false", "market_data": "false", "community_data": "false", "developer_data": "false", "sparkline": "false"})
-    contract = None
-
-    if isinstance(data, dict):
-        platforms = data.get("platforms") or {}
-        eth_address = platforms.get("ethereum")
-        if eth_address:
-            try:
-                contract = Web3.to_checksum_address(eth_address)
-            except Exception:
-                contract = None
-
-    with LOCK:
-        CONTRACT_CACHE[coin_id] = contract
-    return contract
+    return best
 
 
 # -------------------------
@@ -608,12 +640,12 @@ def get_best_buy_route(amount_in_wei: int, token: str) -> Tuple[bool, str, int, 
     token = Web3.to_checksum_address(token)
     best = None
 
-    ok, expected_out, amount_out_min, reason = get_v2_quote(amount_in_wei, token)
+    ok, expected_out, amount_out_min, _ = get_v2_quote(amount_in_wei, token)
     if ok:
         best = ("V2", 0, expected_out, amount_out_min, "ok")
 
     for fee in V3_FEE_CANDIDATES:
-        ok3, expected_out3, amount_out_min3, reason3 = get_v3_quote(amount_in_wei, token, fee)
+        ok3, expected_out3, amount_out_min3, _ = get_v3_quote(amount_in_wei, token, fee)
         if ok3:
             if best is None or expected_out3 > best[2]:
                 best = ("V3", fee, expected_out3, amount_out_min3, "ok")
@@ -661,7 +693,7 @@ def approve_token_if_needed(token: str, amount_raw: int, spender: str) -> bool:
         return False
 
 
-def execute_live_buy(token: str, coin_id: str, symbol: str, entry_price_usd: float) -> Optional[dict]:
+def execute_live_buy(token: str, symbol: str, entry_price_usd: float) -> Optional[dict]:
     if not ACCOUNT:
         send("⚠️ LIVE BUY SKIPPED\nReason: PRIVATE_KEY not loaded")
         return None
@@ -789,7 +821,6 @@ def execute_live_buy(token: str, coin_id: str, symbol: str, entry_price_usd: flo
         send(
             f"🟢 LIVE BUY OPENED\n\n"
             f"{symbol}\n"
-            f"Coin ID {coin_id}\n"
             f"Token\n{token}\n\n"
             f"Route {route_type}{f' fee={fee_used}' if route_type == 'V3' else ''}\n"
             f"Entry Price ${entry_price_usd:.8f}\n"
@@ -801,7 +832,6 @@ def execute_live_buy(token: str, coin_id: str, symbol: str, entry_price_usd: flo
         )
 
         return {
-            "coin_id": coin_id,
             "token": token,
             "symbol": symbol,
             "entry_price": entry_price_usd,
@@ -1045,7 +1075,7 @@ def get_live_account_snapshot() -> Dict[str, float]:
 # -------------------------
 # PAPER MODE
 # -------------------------
-def open_paper_position(coin_id: str, token: str, symbol: str, price: float) -> bool:
+def open_paper_position(symbol: str, token: str, price: float) -> bool:
     global ACCOUNT_CASH
 
     if len(PAPER_POSITIONS) >= MAX_OPEN_TRADES:
@@ -1056,8 +1086,7 @@ def open_paper_position(coin_id: str, token: str, symbol: str, price: float) -> 
         return False
 
     qty = BUY_SIZE_USD / price
-    PAPER_POSITIONS[coin_id] = {
-        "coin_id": coin_id,
+    PAPER_POSITIONS[token] = {
         "token": token,
         "symbol": symbol,
         "entry_price": price,
@@ -1072,7 +1101,6 @@ def open_paper_position(coin_id: str, token: str, symbol: str, price: float) -> 
     send(
         f"🧪 PAPER BUY OPENED\n\n"
         f"{symbol}\n"
-        f"Coin ID {coin_id}\n"
         f"Token\n{token}\n\n"
         f"Entry Price ${price:.8f}\n"
         f"Buy Size ${BUY_SIZE_USD:.2f}\n"
@@ -1086,15 +1114,15 @@ def monitor_paper_positions():
     global ACCOUNT_CASH
     while True:
         try:
-            top = fetch_top_markets()
-            market_by_id = {c.get("id"): c for c in top if c.get("id")}
+            with LOCK:
+                cache_copy = dict(MARKET_CACHE)
 
-            for coin_id, pos in list(PAPER_POSITIONS.items()):
-                market = market_by_id.get(coin_id)
+            for token, pos in list(PAPER_POSITIONS.items()):
+                market = cache_copy.get(token)
                 if not market:
                     continue
 
-                current_price = safe_float(market.get("current_price"))
+                current_price = safe_float(market.get("price_usd"))
                 if current_price <= 0:
                     continue
 
@@ -1124,7 +1152,7 @@ def monitor_paper_positions():
                             f"Final Value ${current_value:.2f}\n"
                             f"Reason: trailed {TRAIL_DROP_PCT:.2f}% from peak after arming at {TRAIL_ARM_PCT:.2f}%"
                         )
-                        PAPER_POSITIONS.pop(coin_id, None)
+                        PAPER_POSITIONS.pop(token, None)
                         continue
 
                 if pnl_pct <= -abs(STOP_LOSS_PCT):
@@ -1137,7 +1165,7 @@ def monitor_paper_positions():
                         f"PnL {pnl_pct:.2f}%\n"
                         f"Final Value ${current_value:.2f}"
                     )
-                    PAPER_POSITIONS.pop(coin_id, None)
+                    PAPER_POSITIONS.pop(token, None)
 
         except Exception as e:
             print(f"monitor_paper_positions error: {e}")
@@ -1151,16 +1179,15 @@ def monitor_paper_positions():
 def monitor_live_positions():
     while True:
         try:
-            top = fetch_top_markets()
-            market_by_id = {c.get("id"): c for c in top if c.get("id")}
+            with LOCK:
+                cache_copy = dict(MARKET_CACHE)
 
             for token, pos in list(LIVE_POSITIONS.items()):
-                coin_id = pos.get("coin_id")
-                market = market_by_id.get(coin_id)
+                market = cache_copy.get(token)
                 if not market:
                     continue
 
-                current_price = safe_float(market.get("current_price"))
+                current_price = safe_float(market.get("price_usd"))
                 if current_price <= 0:
                     continue
 
@@ -1171,8 +1198,6 @@ def monitor_live_positions():
                     pos["peak_price"] = current_price
 
                 peak_price = safe_float(pos.get("peak_price"))
-                m = get_live_position_metrics(pos)
-
                 peak_pnl = ((peak_price - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
 
@@ -1202,33 +1227,33 @@ def monitor_live_positions():
 # -------------------------
 # SIGNAL ENGINE
 # -------------------------
-def update_price_history(coin: dict):
-    coin_id = str(coin.get("id") or "")
-    if not coin_id:
-        return
-
-    price = safe_float(coin.get("current_price"))
+def update_price_history(symbol: str, token: str, market: dict):
+    price = safe_float(market.get("price_usd"))
     if price <= 0:
         return
 
     with LOCK:
-        if coin_id not in PRICE_HISTORY:
-            PRICE_HISTORY[coin_id] = deque(maxlen=max(LOOKBACK_POINTS, 2))
-        PRICE_HISTORY[coin_id].append((now_ts(), price))
-        TOP_MARKET_CACHE[coin_id] = coin
+        if token not in PRICE_HISTORY:
+            PRICE_HISTORY[token] = deque(maxlen=max(LOOKBACK_POINTS, 2))
+        PRICE_HISTORY[token].append((now_ts(), price))
+        MARKET_CACHE[token] = market
 
 
-def get_signal_for_coin(coin: dict) -> Tuple[bool, str]:
-    coin_id = str(coin.get("id") or "")
-    symbol = str(coin.get("symbol") or "").upper()
-    price = safe_float(coin.get("current_price"))
+def get_signal_for_token(symbol: str, token: str, market: dict) -> Tuple[bool, str]:
+    price = safe_float(market.get("price_usd"))
+    liquidity = safe_float(market.get("liquidity_usd"))
+    vol24 = safe_float(market.get("volume_h24_usd"))
 
-    if not coin_id or price <= 0:
-        return False, "bad market data"
+    if price <= 0:
+        return False, "bad price"
+    if liquidity < MIN_LIQUIDITY_USD:
+        return False, f"liquidity too low {liquidity:.0f}"
+    if vol24 < MIN_24H_VOLUME_USD:
+        return False, f"24h vol too low {vol24:.0f}"
 
     with LOCK:
-        hist = list(PRICE_HISTORY.get(coin_id, []))
-        last_signal = LAST_SIGNAL_TS.get(coin_id, 0.0)
+        hist = list(PRICE_HISTORY.get(token, []))
+        last_signal = LAST_SIGNAL_TS.get(token, 0.0)
 
     if len(hist) < max(LOOKBACK_POINTS, 2):
         return False, "not enough history"
@@ -1244,61 +1269,58 @@ def get_signal_for_coin(coin: dict) -> Tuple[bool, str]:
     if move_pct < ENTRY_PUMP_PCT:
         return False, f"momentum too low: {move_pct:.2f}% < {ENTRY_PUMP_PCT:.2f}%"
 
-    if symbol in EXCLUDED_SYMBOLS:
-        return False, f"excluded symbol {symbol}"
-
     return True, f"momentum breakout {move_pct:.2f}% over {len(hist)} points"
 
 
-def process_signal(coin: dict):
-    coin_id = str(coin.get("id") or "")
-    symbol = str(coin.get("symbol") or "").upper()
-    price = safe_float(coin.get("current_price"))
-
-    if not coin_id or not symbol or price <= 0:
+def process_signal(symbol: str, token: str, market: dict):
+    price = safe_float(market.get("price_usd"))
+    if price <= 0:
         return
 
-    signal_ok, signal_reason = get_signal_for_coin(coin)
+    signal_ok, signal_reason = get_signal_for_token(symbol, token, market)
     if not signal_ok:
         return
 
-    contract = get_ethereum_contract_for_coin(coin_id)
-    if not contract:
-        print(f"{symbol}: no ethereum contract found")
-        return
-
     with LOCK:
-        LAST_SIGNAL_TS[coin_id] = now_ts()
+        LAST_SIGNAL_TS[token] = now_ts()
 
     if RUN_AUTO_BUY == "on":
         if len(LIVE_POSITIONS) >= MAX_OPEN_TRADES:
             return
-        if contract in LIVE_POSITIONS:
+        if token in LIVE_POSITIONS:
             return
 
-        pos = execute_live_buy(contract, coin_id, symbol, price)
+        pos = execute_live_buy(token, symbol, price)
         if pos:
-            LIVE_POSITIONS[contract] = pos
+            LIVE_POSITIONS[token] = pos
     else:
-        if coin_id not in PAPER_POSITIONS:
-            open_paper_position(coin_id, contract, symbol, price)
+        if token not in PAPER_POSITIONS:
+            open_paper_position(symbol, token, price)
+
+    send(
+        f"🚀 SIGNAL DETECTED\n\n"
+        f"{symbol}\n"
+        f"Token\n{token}\n\n"
+        f"Price ${price:.8f}\n"
+        f"Liquidity ${safe_float(market.get('liquidity_usd')):,.0f}\n"
+        f"24h Volume ${safe_float(market.get('volume_h24_usd')):,.0f}\n"
+        f"Reason: {signal_reason}"
+    )
 
 
 def scanner_loop():
-    send("Top 100 momentum scanner ON")
+    send("Trusted-coin DexScreener scanner ON")
 
     while True:
         try:
-            top = fetch_top_markets()
-            if not top:
-                time.sleep(CHECK_INTERVAL_SECONDS)
-                continue
+            for symbol, meta in TRUSTED_TOKENS.items():
+                token = Web3.to_checksum_address(meta["token"])
+                snap = get_best_pair_snapshot(token)
+                if not snap:
+                    continue
 
-            for coin in top:
-                update_price_history(coin)
-
-            for coin in top:
-                process_signal(coin)
+                update_price_history(symbol, token, snap)
+                process_signal(symbol, token, snap)
 
         except Exception as e:
             print(f"scanner_loop error: {e}")
@@ -1381,15 +1403,18 @@ def heartbeat_loop():
                 f"Connected YES\n"
                 f"Block {safe_block_number()}\n"
                 f"Mode {'LIVE' if RUN_AUTO_BUY == 'on' else 'PAPER'}\n"
-                f"Top Coins Limit {TOP_COINS_LIMIT}\n"
+                f"Trusted Coins {len(TRUSTED_TOKENS)}\n"
                 f"Tracked Histories {len(PRICE_HISTORY)}\n"
                 f"Paper Trades {len(PAPER_POSITIONS)}/{MAX_OPEN_TRADES}\n"
                 f"Live Positions {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}\n"
                 f"Check Every {CHECK_INTERVAL_SECONDS}s\n"
+                f"Buy Size ${BUY_SIZE_USD:.2f}\n"
                 f"Entry Pump {ENTRY_PUMP_PCT:.2f}%\n"
                 f"Trail Arm {TRAIL_ARM_PCT:.2f}%\n"
                 f"Trail Drop {TRAIL_DROP_PCT:.2f}%\n"
-                f"Stop Loss {STOP_LOSS_PCT:.2f}%"
+                f"Stop Loss {STOP_LOSS_PCT:.2f}%\n"
+                f"Min Liquidity ${MIN_LIQUIDITY_USD:,.0f}\n"
+                f"Min 24h Volume ${MIN_24H_VOLUME_USD:,.0f}"
                 f"{extra}"
             )
         except Exception as e:
@@ -1402,22 +1427,23 @@ def heartbeat_loop():
 # MAIN
 # -------------------------
 def main():
+    watched_symbols = ",".join(sorted(TRUSTED_TOKENS.keys()))
+
     send(
-        f"Top 100 Momentum Bot Started\n\n"
+        f"Trusted Coin Momentum Bot Started\n\n"
         f"Mode {'LIVE' if RUN_AUTO_BUY == 'on' else 'PAPER'}\n"
         f"Buy Size ${BUY_SIZE_USD:.2f}\n"
         f"Max Open Trades {MAX_OPEN_TRADES}\n"
-        f"Top Coins Limit {TOP_COINS_LIMIT}\n"
-        f"Min 24h Volume ${MIN_24H_VOLUME_USD:,.0f}\n"
-        f"Min Market Cap ${MIN_MARKET_CAP_USD:,.0f}\n"
         f"Check Interval {CHECK_INTERVAL_SECONDS}s\n"
         f"Lookback Points {LOOKBACK_POINTS}\n"
         f"Entry Pump {ENTRY_PUMP_PCT:.2f}%\n"
         f"Trail Arm {TRAIL_ARM_PCT:.2f}%\n"
         f"Trail Drop {TRAIL_DROP_PCT:.2f}%\n"
         f"Stop Loss {STOP_LOSS_PCT:.2f}%\n"
+        f"Min Liquidity ${MIN_LIQUIDITY_USD:,.0f}\n"
+        f"Min 24h Volume ${MIN_24H_VOLUME_USD:,.0f}\n"
         f"Slippage {SLIPPAGE_BPS} bps\n"
-        f"Excluded Symbols {','.join(sorted(EXCLUDED_SYMBOLS)) if EXCLUDED_SYMBOLS else 'none'}"
+        f"Trusted Symbols {watched_symbols}"
     )
 
     threading.Thread(target=scanner_loop, daemon=True).start()
