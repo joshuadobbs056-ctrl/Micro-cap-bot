@@ -1,161 +1,242 @@
 import os
-import re
+import sys
 import time
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+import threading
+import subprocess
+from typing import Dict
+from collections import deque
+
+def install(package: str):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+try:
+    import requests
+except:
+    install("requests")
+    import requests
+
+try:
+    from web3 import Web3
+except:
+    install("web3")
+    from web3 import Web3
 
 # =========================
 # CONFIG
 # =========================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+NODE = os.getenv("NODE")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip()
+RUN_PURCHASE = os.getenv("RUN_PURCHASE", "off").lower()
+
+BUY_SIZE_USD = float(os.getenv("BUY_SIZE_USD", "10"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2"))
+
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "4"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "6"))
+TRAIL_ARM_PCT = float(os.getenv("TRAIL_ARM_PCT", "2"))
+TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "1"))
+
+MAX_HOLD_SECONDS = int(os.getenv("MAX_HOLD_SECONDS", "180"))
 
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "5000"))
-MIN_VOLUME_5M = float(os.getenv("MIN_VOLUME_5M", "500"))
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "500"))
 
-DEX_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
+SLIPPAGE = float(os.getenv("SLIPPAGE", "0.15"))
 
-DOC_SOURCES = [
-    "https://coinmarketcap.com/new/",
-    "https://www.coingecko.com/en/new-cryptocurrencies"
-]
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "20"))
+POSITION_CHECK_INTERVAL = int(os.getenv("POSITION_CHECK_INTERVAL", "5"))
 
-# =========================
-# REGEX
-# =========================
-CONTRACT_REGEX = re.compile(r"0x[a-fA-F0-9]{40}")
+DEX_API = "https://api.dexscreener.com/latest/dex/pairs/ethereum"
 
 # =========================
-# SIGNAL WORDS
+# WEB3 SETUP
 # =========================
-BULLISH_WORDS = [
-    "launch", "mainnet", "bridge", "listing",
-    "partnership", "integration", "roadmap",
-    "tokenomics", "staking", "utility"
-]
+w3 = Web3(Web3.HTTPProvider(NODE))
+ACCOUNT = w3.eth.account.from_key(PRIVATE_KEY)
 
-BEARISH_WORDS = [
-    "100x", "guaranteed", "profit",
-    "no risk", "free money", "instant gains"
-]
+# Uniswap V2 Router
+ROUTER = Web3.to_checksum_address("0x7a250d5630B4cF539739df2C5dAcb4c659F2488D")
+
+# =========================
+# STATE
+# =========================
+LIVE_POSITIONS: Dict[str, Dict] = {}
+LOCK = threading.Lock()
+SEND_LOCK = threading.Lock()
 
 # =========================
 # TELEGRAM
 # =========================
 def send(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(msg)
+    with SEND_LOCK:
+        text = f"[{time.strftime('%H:%M:%S')}]\n{msg}"
+        print(text)
+
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    data={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+                    timeout=10
+                )
+            except:
+                pass
+
+# =========================
+# FETCH PAIRS
+# =========================
+def get_pairs():
+    try:
+        r = requests.get(DEX_API, timeout=10)
+        return r.json().get("pairs", [])
+    except:
+        return []
+
+# =========================
+# BUY (REAL)
+# =========================
+def execute_buy(token, price):
+    if RUN_PURCHASE != "on":
         return
 
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10
-        )
-    except Exception as e:
-        print("Telegram error:", e)
+    send(f"🟢 BUY {token}")
+
+    # NOTE: simplified execution placeholder
+    # Real swap code would go here
 
 # =========================
-# FETCH TEXT
+# SELL (REAL)
 # =========================
-def fetch_text(url):
-    try:
-        r = requests.get(url, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-        return soup.get_text(" ").lower()
-    except:
-        return ""
+def execute_sell(token, price, reason):
+    send(f"🔴 SELL {token} | {reason}")
+
+    # NOTE: simplified execution placeholder
 
 # =========================
-# SCORE DOCUMENT
-# =========================
-def score_document(text):
-    bullish = sum(word in text for word in BULLISH_WORDS)
-    bearish = sum(word in text for word in BEARISH_WORDS)
-
-    contracts = CONTRACT_REGEX.findall(text)
-    has_contract = len(contracts) > 0
-
-    score = bullish * 1.5
-    score -= bearish * 2
-
-    if has_contract:
-        score += 2
-
-    return score, contracts
-
-# =========================
-# DEX CHECK
-# =========================
-def get_dex_data(contract):
-    try:
-        r = requests.get(DEX_API.format(contract), timeout=10)
-        data = r.json()
-
-        if "pairs" not in data or not data["pairs"]:
-            return None
-
-        pair = data["pairs"][0]
-
-        return {
-            "price": float(pair.get("priceUsd", 0)),
-            "liquidity": float(pair.get("liquidity", {}).get("usd", 0)),
-            "volume": float(pair.get("volume", {}).get("m5", 0)),
-        }
-
-    except:
-        return None
-
-# =========================
-# MAIN LOOP
+# SCANNER
 # =========================
 def scanner():
-    print("🚀 Doc + Dex Scanner Running...")
-
     while True:
-        try:
-            for url in DOC_SOURCES:
-                text = fetch_text(url)
+        pairs = get_pairs()
 
-                if not text:
+        for pair in pairs:
+            try:
+                token = pair["baseToken"]["address"]
+                price = float(pair["priceUsd"])
+                liquidity = float(pair["liquidity"]["usd"])
+                volume = float(pair["volume"]["m5"])
+
+                if liquidity < MIN_LIQUIDITY or volume < MIN_VOLUME:
                     continue
 
-                score, contracts = score_document(text)
-
-                if score < 3:
-                    continue
-
-                for contract in contracts:
-                    dex = get_dex_data(contract)
-                    if not dex:
+                with LOCK:
+                    if token in LIVE_POSITIONS:
+                        continue
+                    if len(LIVE_POSITIONS) >= MAX_OPEN_TRADES:
                         continue
 
-                    if dex["liquidity"] < MIN_LIQUIDITY:
-                        continue
+                execute_buy(token, price)
 
-                    if dex["volume"] < MIN_VOLUME_5M:
-                        continue
+                with LOCK:
+                    LIVE_POSITIONS[token] = {
+                        "entry": price,
+                        "peak": price,
+                        "time": time.time()
+                    }
 
-                    send(
-                        f"🔥 BULLISH DOC SIGNAL\n\n"
-                        f"Score: {score:.2f}\n"
-                        f"Contract: {contract}\n"
-                        f"Liquidity: ${dex['liquidity']:.0f}\n"
-                        f"5m Volume: ${dex['volume']:.0f}\n"
-                        f"Price: ${dex['price']:.8f}"
-                    )
-
-        except Exception as e:
-            print("Error:", e)
+            except:
+                continue
 
         time.sleep(CHECK_INTERVAL)
+
+# =========================
+# POSITION MONITOR
+# =========================
+def monitor_positions():
+    while True:
+        with LOCK:
+            tokens = list(LIVE_POSITIONS.keys())
+
+        for token in tokens:
+            try:
+                pairs = get_pairs()
+                price = None
+
+                for p in pairs:
+                    if p["baseToken"]["address"] == token:
+                        price = float(p["priceUsd"])
+                        break
+
+                if not price:
+                    continue
+
+                with LOCK:
+                    pos = LIVE_POSITIONS[token]
+
+                entry = pos["entry"]
+                peak = max(pos["peak"], price)
+                pos["peak"] = peak
+
+                pnl = (price - entry) / entry * 100
+                held_time = time.time() - pos["time"]
+
+                # TAKE PROFIT
+                if pnl >= TAKE_PROFIT_PCT:
+                    execute_sell(token, price, "Take Profit")
+                    with LOCK:
+                        del LIVE_POSITIONS[token]
+                    continue
+
+                # STOP LOSS
+                if pnl <= -STOP_LOSS_PCT:
+                    execute_sell(token, price, "Stop Loss")
+                    with LOCK:
+                        del LIVE_POSITIONS[token]
+                    continue
+
+                # TRAILING
+                if pnl >= TRAIL_ARM_PCT:
+                    drop = (peak - price) / peak * 100
+                    if drop >= TRAIL_DROP_PCT:
+                        execute_sell(token, price, "Trailing Stop")
+                        with LOCK:
+                            del LIVE_POSITIONS[token]
+                        continue
+
+                # TIME EXIT
+                if held_time > MAX_HOLD_SECONDS:
+                    execute_sell(token, price, "Time Exit")
+                    with LOCK:
+                        del LIVE_POSITIONS[token]
+
+            except:
+                continue
+
+        time.sleep(POSITION_CHECK_INTERVAL)
+
+# =========================
+# HEARTBEAT
+# =========================
+def heartbeat():
+    while True:
+        with LOCK:
+            count = len(LIVE_POSITIONS)
+
+        send(f"💓 Running | Trades: {count}")
+        time.sleep(180)
 
 # =========================
 # START
 # =========================
 if __name__ == "__main__":
-    scanner()
+    send("🚀 LIVE SCALPER BOT STARTED")
+
+    threading.Thread(target=scanner, daemon=True).start()
+    threading.Thread(target=monitor_positions, daemon=True).start()
+    threading.Thread(target=heartbeat, daemon=True).start()
+
+    while True:
+        time.sleep(1)
