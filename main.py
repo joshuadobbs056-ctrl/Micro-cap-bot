@@ -3,7 +3,7 @@ import sys
 import time
 import threading
 import subprocess
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Set
 from collections import deque
 
 
@@ -54,18 +54,37 @@ POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "30"))
 PORTFOLIO_UPDATE_SECONDS = int(os.getenv("PORTFOLIO_UPDATE_SECONDS", "300"))
 
 LOOKBACK_POINTS = int(os.getenv("LOOKBACK_POINTS", "6"))  # with 30s checks, 6 = ~3 minutes
-ENTRY_PUMP_PCT = float(os.getenv("ENTRY_PUMP_PCT", "2.0"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5.0"))
+ENTRY_PUMP_PCT = float(os.getenv("ENTRY_PUMP_PCT", "4.0"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "8.0"))
 
-TRAIL_ARM_PCT = float(os.getenv("TRAIL_ARM_PCT", "5.0"))
-TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "2.0"))
+TRAIL_ARM_PCT = float(os.getenv("TRAIL_ARM_PCT", "8.0"))
+TRAIL_DROP_PCT = float(os.getenv("TRAIL_DROP_PCT", "3.0"))
 
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "100000"))
-MIN_24H_VOLUME_USD = float(os.getenv("MIN_24H_VOLUME_USD", "1000000"))
+# small-cap style filters
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "8000"))
+MAX_LIQUIDITY_USD = float(os.getenv("MAX_LIQUIDITY_USD", "250000"))
 
-# price band: default now targets one cent and under
+MIN_24H_VOLUME_USD = float(os.getenv("MIN_24H_VOLUME_USD", "15000"))
+MIN_M5_VOLUME_USD = float(os.getenv("MIN_M5_VOLUME_USD", "1000"))
+
 MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.0000001"))
 MAX_PRICE_USD = float(os.getenv("MAX_PRICE_USD", "0.01"))
+
+MIN_M5_BUYS = int(os.getenv("MIN_M5_BUYS", "8"))
+MAX_M5_SELLS = int(os.getenv("MAX_M5_SELLS", "999999"))
+MIN_H1_BUYS = int(os.getenv("MIN_H1_BUYS", "20"))
+
+MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "20000000"))  # 20M
+MAX_FDV_USD = float(os.getenv("MAX_FDV_USD", "25000000"))               # 25M
+MAX_PAIR_AGE_MINUTES = int(os.getenv("MAX_PAIR_AGE_MINUTES", "4320"))   # 3 days
+MIN_PAIR_AGE_MINUTES = int(os.getenv("MIN_PAIR_AGE_MINUTES", "1"))
+
+MAX_CANDIDATES_TRACKED = int(os.getenv("MAX_CANDIDATES_TRACKED", "300"))
+CANDIDATE_RETAIN_SECONDS = int(os.getenv("CANDIDATE_RETAIN_SECONDS", "21600"))  # 6h
+DISCOVERY_COOLDOWN_SECONDS = int(os.getenv("DISCOVERY_COOLDOWN_SECONDS", "120"))
+
+REQUIRE_BOOSTED_CANDIDATE = os.getenv("REQUIRE_BOOSTED_CANDIDATE", "off").strip().lower() == "on"
+REQUIRE_ETH_QUOTE_ONLY = os.getenv("REQUIRE_ETH_QUOTE_ONLY", "on").strip().lower() == "on"
 
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "300"))
 GAS_LIMIT_BUY = int(os.getenv("GAS_LIMIT_BUY", "450000"))
@@ -89,7 +108,6 @@ V3_FEE_CANDIDATES = [500, 3000, 10000]
 DEX_PREFERRED_CHAIN = os.getenv("DEX_PREFERRED_CHAIN", "ethereum").strip().lower()
 PAIR_STALE_SECONDS = int(os.getenv("PAIR_STALE_SECONDS", "180"))
 
-# comma separated symbol filter if you want to narrow down further
 WATCH_SYMBOLS_FILTER = {
     s.strip().upper()
     for s in os.getenv("WATCH_SYMBOLS_FILTER", "").split(",")
@@ -127,54 +145,22 @@ if PRIVATE_KEY:
 
 
 # -------------------------
-# TRUSTED ETHEREUM TOKEN UNIVERSE
-# -------------------------
-TRUSTED_TOKENS = {
-    "ETH": {"symbol": "ETH", "token": "0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2", "name": "Wrapped Ether"},
-    "WBTC": {"symbol": "WBTC", "token": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", "name": "Wrapped BTC"},
-    "LINK": {"symbol": "LINK", "token": "0x514910771AF9Ca656af840dff83E8264EcF986CA", "name": "Chainlink"},
-    "UNI": {"symbol": "UNI", "token": "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "name": "Uniswap"},
-    "AAVE": {"symbol": "AAVE", "token": "0x7Fc66500c84A76Ad7E9c93437bFc5Ac33E2DDAE9", "name": "Aave"},
-    "MKR": {"symbol": "MKR", "token": "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2", "name": "Maker"},
-    "CRV": {"symbol": "CRV", "token": "0xD533a949740bb3306d119CC777fa900bA034cd52", "name": "Curve DAO"},
-    "SNX": {"symbol": "SNX", "token": "0xC011A72400E58ecD99Ee497CF89E3775d4bd732F", "name": "Synthetix"},
-    "COMP": {"symbol": "COMP", "token": "0xc00e94Cb662C3520282E6f5717214004A7f26888", "name": "Compound"},
-    "LDO": {"symbol": "LDO", "token": "0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32", "name": "Lido DAO"},
-    "RPL": {"symbol": "RPL", "token": "0xD33526068D116cE69F19A9ee46F0bd304F21A51f", "name": "Rocket Pool"},
-    "PENDLE": {"symbol": "PENDLE", "token": "0x808507121B80c02388fAd14726482e061B8da827", "name": "Pendle"},
-    "ONDO": {"symbol": "ONDO", "token": "0xFAbA6f8e4a5E8Ab82F62fe7C39859FA577269BE3", "name": "Ondo"},
-    "MNT": {"symbol": "MNT", "token": "0x3c3a81e81dc49A522A592e7622A7E711c06bf354", "name": "Mantle"},
-    "AXS": {"symbol": "AXS", "token": "0xBB0E17EF65F82Ab018d8EDd776e8Dd940327B28b", "name": "Axie Infinity"},
-    "SUSHI": {"symbol": "SUSHI", "token": "0x6B3595068778DD592e39A122f4f5a5Cf09C90fE2", "name": "Sushi"},
-    "BAL": {"symbol": "BAL", "token": "0xba100000625a3754423978a60c9317c58a424e3D", "name": "Balancer"},
-    "1INCH": {"symbol": "1INCH", "token": "0x111111111117dC0aa78b770fA6A738034120C302", "name": "1inch"},
-    "YFI": {"symbol": "YFI", "token": "0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e", "name": "yearn.finance"},
-    "REN": {"symbol": "REN", "token": "0x408e41876cCCDC0F92210600ef50372656052a38", "name": "Ren"},
-    "BAT": {"symbol": "BAT", "token": "0x0D8775F648430679A709E98d2b0Cb6250d2887EF", "name": "Basic Attention Token"},
-    "ZRX": {"symbol": "ZRX", "token": "0xE41d2489571d322189246DaFA5ebDe1F4699F498", "name": "0x"},
-    "MANA": {"symbol": "MANA", "token": "0x0F5D2fB29fb7d3CFeE444a200298f468908cC942", "name": "Decentraland"},
-    "ENJ": {"symbol": "ENJ", "token": "0xF629cBd94d3791C9250152BD8dFbDF380E2a3B9c", "name": "Enjin"},
-    "APE": {"symbol": "APE", "token": "0x4d224452801ACEd8B2F0aebE155379bb5D594381", "name": "ApeCoin"},
-    "PEPE": {"symbol": "PEPE", "token": "0x6982508145454Ce325dDbE47a25d4ec3d2311933", "name": "Pepe"},
-    "SHIB": {"symbol": "SHIB", "token": "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE", "name": "Shiba Inu"},
-    "FLOKI": {"symbol": "FLOKI", "token": "0xcf0c122c6b73ff809c693db761e7b5b7f5b3c6c0", "name": "Floki"},
-}
-
-if WATCH_SYMBOLS_FILTER:
-    TRUSTED_TOKENS = {
-        sym: data for sym, data in TRUSTED_TOKENS.items()
-        if sym in WATCH_SYMBOLS_FILTER
-    }
-
-
-# -------------------------
 # CONSTANTS / ABIS
 # -------------------------
 WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2")
+USDC = Web3.to_checksum_address("0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+USDT = Web3.to_checksum_address("0xdAC17F958D2ee523a2206206994597C13D831ec7")
+
 ROUTER = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
 V3_ROUTER = Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564")
 V3_QUOTER = Web3.to_checksum_address("0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6")
 CHAINLINK_ETH_USD = Web3.to_checksum_address("0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419")
+
+DISCOVERY_SOURCE_URLS = [
+    "https://api.dexscreener.com/token-profiles/latest/v1",
+    "https://api.dexscreener.com/token-boosts/latest/v1",
+    "https://api.dexscreener.com/token-boosts/top/v1",
+]
 
 ERC20_ABI = [
     {
@@ -306,6 +292,7 @@ CHAINLINK_ETH_USD_ABI = [
             {"internalType": "uint80", "name": "roundId", "type": "uint80"},
             {"internalType": "int256", "name": "answer", "type": "int256"},
             {"internalType": "uint256", "name": "startedAt", "type": "uint256"},
+            {"internalType": "uint256", "name": "updatedAt", "type": "uint256"},
             {"internalType": "uint80", "name": "answeredInRound", "type": "uint80"},
         ],
         "stateMutability": "view",
@@ -324,6 +311,7 @@ eth_usd_feed = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=CHAINLINK_ETH_USD_
 # -------------------------
 LOCK = threading.Lock()
 LAST_TELEGRAM_SEND_TS = 0.0
+LAST_DISCOVERY_TS = 0.0
 
 FAILED_LIVE_BUYS: Dict[str, float] = {}
 FAILED_SELL_ATTEMPTS: Dict[str, int] = {}
@@ -335,6 +323,9 @@ LAST_SIGNAL_TS: Dict[str, float] = {}
 PAPER_POSITIONS: Dict[str, dict] = {}
 LIVE_POSITIONS: Dict[str, dict] = {}
 ACCOUNT_CASH = START_BALANCE
+
+DISCOVERED_TOKENS: Dict[str, dict] = {}  # token -> {symbol, name, first_seen, last_seen, sources:set}
+DISCOVERY_BLACKLIST: Dict[str, float] = {}
 
 
 # -------------------------
@@ -393,6 +384,13 @@ def now_ts() -> float:
 def safe_float(v: Any, default: float = 0.0) -> float:
     try:
         return float(v)
+    except Exception:
+        return default
+
+
+def safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
     except Exception:
         return default
 
@@ -509,75 +507,342 @@ def price_in_band(price_usd: float) -> bool:
     return True
 
 
-# -------------------------
-# DEXSCREENER
-# -------------------------
-def dexscreener_get_token_pairs(token: str) -> Optional[dict]:
+def quote_is_allowed(addr: str) -> bool:
     try:
-        r = SESSION.get(
-            f"https://api.dexscreener.com/latest/dex/tokens/{Web3.to_checksum_address(token)}",
-            timeout=20,
-        )
+        addr = Web3.to_checksum_address(addr)
+    except Exception:
+        return False
+    if REQUIRE_ETH_QUOTE_ONLY:
+        return addr == WETH
+    return addr in {WETH, USDC, USDT}
+
+
+def token_not_weth(token_addr: str) -> bool:
+    try:
+        return Web3.to_checksum_address(token_addr) != WETH
+    except Exception:
+        return False
+
+
+def pair_age_minutes(pair_created_at_ms: Any) -> Optional[float]:
+    try:
+        ts_ms = int(pair_created_at_ms)
+        age_sec = max(0.0, now_ts() - (ts_ms / 1000.0))
+        return age_sec / 60.0
+    except Exception:
+        return None
+
+
+def cleanup_discovery_state():
+    cutoff = now_ts() - CANDIDATE_RETAIN_SECONDS
+    with LOCK:
+        old_tokens = [t for t, v in DISCOVERED_TOKENS.items() if v.get("last_seen", 0) < cutoff]
+        for t in old_tokens:
+            DISCOVERED_TOKENS.pop(t, None)
+            PRICE_HISTORY.pop(t, None)
+            MARKET_CACHE.pop(t, None)
+            LAST_SIGNAL_TS.pop(t, None)
+
+        old_blacklist = [t for t, ts in DISCOVERY_BLACKLIST.items() if ts < cutoff]
+        for t in old_blacklist:
+            DISCOVERY_BLACKLIST.pop(t, None)
+
+        if len(DISCOVERED_TOKENS) > MAX_CANDIDATES_TRACKED:
+            ranked = sorted(DISCOVERED_TOKENS.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True)
+            keep = set(k for k, _ in ranked[:MAX_CANDIDATES_TRACKED])
+            for t in list(DISCOVERED_TOKENS.keys()):
+                if t not in keep:
+                    DISCOVERED_TOKENS.pop(t, None)
+                    PRICE_HISTORY.pop(t, None)
+                    MARKET_CACHE.pop(t, None)
+                    LAST_SIGNAL_TS.pop(t, None)
+
+
+# -------------------------
+# DEXSCREENER HTTP
+# -------------------------
+def dexscreener_get_json(url: str, timeout: int = 20):
+    try:
+        r = SESSION.get(url, timeout=timeout)
         if r.status_code != 200:
-            print(f"DexScreener error {r.status_code} for token {token}: {r.text[:200]}")
+            print(f"DexScreener error {r.status_code}: {url} body={r.text[:200]}")
             return None
         body = (r.text or "").strip()
         if not body:
             return None
-        data = r.json()
-        return data if isinstance(data, dict) else None
+        return r.json()
     except Exception as e:
-        print(f"DexScreener request failed for token {token}: {e}")
+        print(f"DexScreener request failed: {url} -> {e}")
         return None
 
 
-def get_best_pair_snapshot(token: str) -> Optional[dict]:
-    data = dexscreener_get_token_pairs(token)
-    if not data:
+def dexscreener_get_discovery_feed(url: str) -> List[dict]:
+    data = dexscreener_get_json(url, timeout=20)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        if isinstance(data.get("pairs"), list):
+            return data["pairs"]
+        return [data]
+    return []
+
+
+def dexscreener_get_token_pairs(token: str) -> List[dict]:
+    url = f"https://api.dexscreener.com/token-pairs/v1/{DEX_PREFERRED_CHAIN}/{Web3.to_checksum_address(token)}"
+    data = dexscreener_get_json(url, timeout=20)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("pairs"), list):
+        return data["pairs"]
+    return []
+
+
+# -------------------------
+# DISCOVERY
+# -------------------------
+def discover_candidate_tokens() -> List[Tuple[str, str, str, Set[str]]]:
+    results: Dict[str, dict] = {}
+
+    for url in DISCOVERY_SOURCE_URLS:
+        rows = dexscreener_get_discovery_feed(url)
+        source_name = url.split("/")[-2] if "/v1" in url else "feed"
+
+        for row in rows:
+            chain_id = str(row.get("chainId") or "").lower()
+            if chain_id != DEX_PREFERRED_CHAIN:
+                continue
+
+            token_addr = row.get("tokenAddress") or row.get("address")
+            if not token_addr:
+                continue
+
+            try:
+                token_addr = Web3.to_checksum_address(token_addr)
+            except Exception:
+                continue
+
+            if not token_not_weth(token_addr):
+                continue
+
+            symbol = str(row.get("symbol") or "").strip().upper()
+            name = str(row.get("name") or row.get("description") or "").strip()
+
+            if WATCH_SYMBOLS_FILTER and symbol and symbol not in WATCH_SYMBOLS_FILTER:
+                continue
+
+            entry = results.get(token_addr)
+            if not entry:
+                entry = {
+                    "symbol": symbol or "UNK",
+                    "name": name or "Unknown",
+                    "sources": set(),
+                }
+                results[token_addr] = entry
+
+            entry["sources"].add(source_name)
+
+    if REQUIRE_BOOSTED_CANDIDATE:
+        filtered: List[Tuple[str, str, str, Set[str]]] = []
+        for token, meta in results.items():
+            joined = ",".join(sorted(meta["sources"])).lower()
+            if "boost" in joined:
+                filtered.append((token, meta["symbol"], meta["name"], set(meta["sources"])))
+        return filtered
+
+    return [(token, meta["symbol"], meta["name"], set(meta["sources"])) for token, meta in results.items()]
+
+
+def score_pair_for_smallcap(pair: dict) -> Optional[float]:
+    try:
+        chain_id = str(pair.get("chainId") or "").lower()
+        if chain_id != DEX_PREFERRED_CHAIN:
+            return None
+
+        base = pair.get("baseToken") or {}
+        quote = pair.get("quoteToken") or {}
+        base_addr = base.get("address")
+        quote_addr = quote.get("address")
+
+        if not base_addr or not quote_addr:
+            return None
+
+        try:
+            base_addr = Web3.to_checksum_address(base_addr)
+            quote_addr = Web3.to_checksum_address(quote_addr)
+        except Exception:
+            return None
+
+        if not token_not_weth(base_addr):
+            return None
+        if not quote_is_allowed(quote_addr):
+            return None
+
+        price_usd = safe_float(pair.get("priceUsd"))
+        liquidity_usd = safe_float((pair.get("liquidity") or {}).get("usd"))
+        vol24 = safe_float((pair.get("volume") or {}).get("h24"))
+        vol_m5 = safe_float((pair.get("volume") or {}).get("m5"))
+
+        txns_h1 = (pair.get("txns") or {}).get("h1") or {}
+        txns_m5 = (pair.get("txns") or {}).get("m5") or {}
+
+        buys_h1 = safe_int(txns_h1.get("buys"))
+        buys_m5 = safe_int(txns_m5.get("buys"))
+        sells_m5 = safe_int(txns_m5.get("sells"))
+
+        market_cap = safe_float(pair.get("marketCap"))
+        fdv = safe_float(pair.get("fdv"))
+
+        age_m = pair_age_minutes(pair.get("pairCreatedAt"))
+
+        if not price_in_band(price_usd):
+            return None
+        if liquidity_usd < MIN_LIQUIDITY_USD or liquidity_usd > MAX_LIQUIDITY_USD:
+            return None
+        if vol24 < MIN_24H_VOLUME_USD:
+            return None
+        if vol_m5 < MIN_M5_VOLUME_USD:
+            return None
+        if buys_m5 < MIN_M5_BUYS:
+            return None
+        if buys_h1 < MIN_H1_BUYS:
+            return None
+        if sells_m5 > MAX_M5_SELLS:
+            return None
+
+        if market_cap > 0 and market_cap > MAX_MARKET_CAP_USD:
+            return None
+        if fdv > 0 and fdv > MAX_FDV_USD:
+            return None
+
+        if age_m is not None:
+            if age_m < MIN_PAIR_AGE_MINUTES:
+                return None
+            if age_m > MAX_PAIR_AGE_MINUTES:
+                return None
+
+        buy_pressure = (buys_m5 + 1) / max(sells_m5 + 1, 1)
+        score = (
+            liquidity_usd * 0.0005
+            + vol24 * 0.0001
+            + vol_m5 * 0.003
+            + buys_m5 * 6.0
+            + buys_h1 * 0.8
+            + buy_pressure * 20.0
+        )
+
+        if market_cap > 0:
+            score -= min(market_cap * 0.000001, 50.0)
+        if fdv > 0:
+            score -= min(fdv * 0.000001, 50.0)
+
+        return score
+    except Exception:
         return None
 
-    pairs = data.get("pairs") or []
+
+def get_best_pair_snapshot_for_token(token: str, symbol_hint: str = "", name_hint: str = "") -> Optional[dict]:
+    try:
+        token = Web3.to_checksum_address(token)
+    except Exception:
+        return None
+
+    pairs = dexscreener_get_token_pairs(token)
+    if not pairs:
+        return None
+
     best = None
-    best_score = -1.0
+    best_score = None
 
     for p in pairs:
-        if str(p.get("chainId") or "").lower() != DEX_PREFERRED_CHAIN:
+        base = p.get("baseToken") or {}
+        base_addr = base.get("address")
+        if not base_addr:
             continue
 
-        liquidity_usd = safe_float((p.get("liquidity") or {}).get("usd"))
-        vol24 = safe_float((p.get("volume") or {}).get("h24"))
-        price_usd = safe_float(p.get("priceUsd"))
-
-        if liquidity_usd < MIN_LIQUIDITY_USD:
-            continue
-        if vol24 < MIN_24H_VOLUME_USD:
-            continue
-        if not price_in_band(price_usd):
+        try:
+            if Web3.to_checksum_address(base_addr) != token:
+                continue
+        except Exception:
             continue
 
-        score = liquidity_usd + (vol24 * 0.25)
-        if score > best_score:
+        score = score_pair_for_smallcap(p)
+        if score is None:
+            continue
+
+        if best is None or score > best_score:
             txns_h1 = (p.get("txns") or {}).get("h1") or {}
             txns_m5 = (p.get("txns") or {}).get("m5") or {}
+            base_token = p.get("baseToken") or {}
+            quote_token = p.get("quoteToken") or {}
             best = {
+                "token": token,
+                "symbol": str(base_token.get("symbol") or symbol_hint or "UNK").upper(),
+                "name": str(base_token.get("name") or name_hint or "Unknown"),
                 "pair_address": p.get("pairAddress"),
                 "dex_id": p.get("dexId"),
                 "url": p.get("url"),
-                "price_usd": price_usd,
-                "liquidity_usd": liquidity_usd,
-                "volume_h24_usd": vol24,
+                "price_usd": safe_float(p.get("priceUsd")),
+                "liquidity_usd": safe_float((p.get("liquidity") or {}).get("usd")),
+                "volume_h24_usd": safe_float((p.get("volume") or {}).get("h24")),
                 "volume_m5_usd": safe_float((p.get("volume") or {}).get("m5")),
+                "price_change_m5_pct": safe_float((p.get("priceChange") or {}).get("m5")),
+                "price_change_h1_pct": safe_float((p.get("priceChange") or {}).get("h1")),
                 "buys_h1": int(txns_h1.get("buys") or 0),
                 "sells_h1": int(txns_h1.get("sells") or 0),
                 "buys_m5": int(txns_m5.get("buys") or 0),
                 "sells_m5": int(txns_m5.get("sells") or 0),
                 "pair_created_at_ms": p.get("pairCreatedAt"),
-                "source": "dexscreener",
+                "quote_symbol": str((quote_token or {}).get("symbol") or "").upper(),
+                "quote_address": quote_token.get("address"),
+                "market_cap": safe_float(p.get("marketCap")),
+                "fdv": safe_float(p.get("fdv")),
+                "boosts_active": safe_int((p.get("boosts") or {}).get("active")),
+                "source": "dexscreener_dynamic",
                 "updated_ts": now_ts(),
+                "score": float(score),
             }
             best_score = score
 
     return best
+
+
+def refresh_discoveries():
+    global LAST_DISCOVERY_TS
+
+    if now_ts() - LAST_DISCOVERY_TS < DISCOVERY_COOLDOWN_SECONDS:
+        return
+
+    LAST_DISCOVERY_TS = now_ts()
+    cleanup_discovery_state()
+
+    candidates = discover_candidate_tokens()
+    added = 0
+
+    with LOCK:
+        blacklisted = set(DISCOVERY_BLACKLIST.keys())
+
+    for token, symbol, name, sources in candidates:
+        if token in blacklisted:
+            continue
+
+        with LOCK:
+            existing = DISCOVERED_TOKENS.get(token)
+            if existing:
+                existing["last_seen"] = now_ts()
+                existing["sources"] = set(existing.get("sources", set())) | set(sources)
+            else:
+                DISCOVERED_TOKENS[token] = {
+                    "token": token,
+                    "symbol": symbol or "UNK",
+                    "name": name or "Unknown",
+                    "first_seen": now_ts(),
+                    "last_seen": now_ts(),
+                    "sources": set(sources),
+                }
+                added += 1
+
+    if added > 0:
+        print(f"Discovery added {added} new candidates")
 
 
 # -------------------------
@@ -763,6 +1028,7 @@ def execute_live_buy(token: str, symbol: str, entry_price_usd: float) -> Optiona
         if not route_ok:
             with LOCK:
                 FAILED_LIVE_BUYS[token] = now_ts()
+                DISCOVERY_BLACKLIST[token] = now_ts()
             send(
                 f"⚠️ LIVE BUY SKIPPED\n\n"
                 f"{symbol}\n"
@@ -1268,6 +1534,12 @@ def get_signal_for_token(symbol: str, token: str, market: dict) -> Tuple[bool, s
     price = safe_float(market.get("price_usd"))
     liquidity = safe_float(market.get("liquidity_usd"))
     vol24 = safe_float(market.get("volume_h24_usd"))
+    vol_m5 = safe_float(market.get("volume_m5_usd"))
+    buys_m5 = safe_int(market.get("buys_m5"))
+    buys_h1 = safe_int(market.get("buys_h1"))
+    sells_m5 = safe_int(market.get("sells_m5"))
+    market_cap = safe_float(market.get("market_cap"))
+    fdv = safe_float(market.get("fdv"))
 
     if price <= 0:
         return False, "bad price"
@@ -1275,8 +1547,22 @@ def get_signal_for_token(symbol: str, token: str, market: dict) -> Tuple[bool, s
         return False, f"price outside band {price:.8f}"
     if liquidity < MIN_LIQUIDITY_USD:
         return False, f"liquidity too low {liquidity:.0f}"
+    if liquidity > MAX_LIQUIDITY_USD:
+        return False, f"liquidity too high {liquidity:.0f}"
     if vol24 < MIN_24H_VOLUME_USD:
         return False, f"24h vol too low {vol24:.0f}"
+    if vol_m5 < MIN_M5_VOLUME_USD:
+        return False, f"m5 vol too low {vol_m5:.0f}"
+    if buys_m5 < MIN_M5_BUYS:
+        return False, f"m5 buys too low {buys_m5}"
+    if buys_h1 < MIN_H1_BUYS:
+        return False, f"h1 buys too low {buys_h1}"
+    if sells_m5 > MAX_M5_SELLS:
+        return False, f"m5 sells too high {sells_m5}"
+    if market_cap > 0 and market_cap > MAX_MARKET_CAP_USD:
+        return False, f"market cap too high {market_cap:.0f}"
+    if fdv > 0 and fdv > MAX_FDV_USD:
+        return False, f"fdv too high {fdv:.0f}"
 
     with LOCK:
         hist = list(PRICE_HISTORY.get(token, []))
@@ -1296,7 +1582,12 @@ def get_signal_for_token(symbol: str, token: str, market: dict) -> Tuple[bool, s
     if move_pct < ENTRY_PUMP_PCT:
         return False, f"momentum too low: {move_pct:.2f}% < {ENTRY_PUMP_PCT:.2f}%"
 
-    return True, f"momentum breakout {move_pct:.2f}% over {len(hist)} points"
+    buy_sell_ratio = (buys_m5 + 1) / max(sells_m5 + 1, 1)
+
+    return True, (
+        f"momentum breakout {move_pct:.2f}% over {len(hist)} points | "
+        f"m5 buys {buys_m5} sells {sells_m5} ratio {buy_sell_ratio:.2f}"
+    )
 
 
 def process_signal(symbol: str, token: str, market: dict):
@@ -1333,23 +1624,41 @@ def process_signal(symbol: str, token: str, market: dict):
         f"Price ${price:.8f}\n"
         f"Liquidity ${safe_float(market.get('liquidity_usd')):,.0f}\n"
         f"24h Volume ${safe_float(market.get('volume_h24_usd')):,.0f}\n"
+        f"m5 Volume ${safe_float(market.get('volume_m5_usd')):,.0f}\n"
+        f"m5 Buys {safe_int(market.get('buys_m5'))}\n"
+        f"m5 Sells {safe_int(market.get('sells_m5'))}\n"
+        f"MC ${safe_float(market.get('market_cap')):,.0f}\n"
+        f"FDV ${safe_float(market.get('fdv')):,.0f}\n"
         f"Reason: {signal_reason}"
     )
 
 
 def scanner_loop():
-    send("Trusted-coin DexScreener scanner ON")
+    send("Dynamic small-cap DexScreener scanner ON")
 
     while True:
         try:
-            for symbol, meta in TRUSTED_TOKENS.items():
-                token = Web3.to_checksum_address(meta["token"])
-                snap = get_best_pair_snapshot(token)
+            refresh_discoveries()
+
+            with LOCK:
+                candidates = list(DISCOVERED_TOKENS.values())
+
+            for meta in candidates:
+                token = meta["token"]
+                snap = get_best_pair_snapshot_for_token(
+                    token=token,
+                    symbol_hint=meta.get("symbol", "UNK"),
+                    name_hint=meta.get("name", "Unknown"),
+                )
                 if not snap:
                     continue
 
-                update_price_history(symbol, token, snap)
-                process_signal(symbol, token, snap)
+                with LOCK:
+                    if token in DISCOVERED_TOKENS:
+                        DISCOVERED_TOKENS[token]["last_seen"] = now_ts()
+
+                update_price_history(snap["symbol"], token, snap)
+                process_signal(snap["symbol"], token, snap)
 
         except Exception as e:
             print(f"scanner_loop error: {e}")
@@ -1415,6 +1724,11 @@ def live_account_loop():
 def heartbeat_loop():
     while True:
         try:
+            cleanup_discovery_state()
+
+            with LOCK:
+                candidate_count = len(DISCOVERED_TOKENS)
+
             extra = ""
             if RUN_AUTO_BUY == "on":
                 live = get_live_account_snapshot()
@@ -1432,7 +1746,8 @@ def heartbeat_loop():
                 f"Connected YES\n"
                 f"Block {safe_block_number()}\n"
                 f"Mode {'LIVE' if RUN_AUTO_BUY == 'on' else 'PAPER'}\n"
-                f"Trusted Coins {len(TRUSTED_TOKENS)}\n"
+                f"Discovery Chain {DEX_PREFERRED_CHAIN}\n"
+                f"Tracked Candidates {candidate_count}/{MAX_CANDIDATES_TRACKED}\n"
                 f"Tracked Histories {len(PRICE_HISTORY)}\n"
                 f"Paper Trades {len(PAPER_POSITIONS)}/{MAX_OPEN_TRADES}\n"
                 f"Live Positions {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}\n"
@@ -1444,8 +1759,14 @@ def heartbeat_loop():
                 f"Stop Loss {STOP_LOSS_PCT:.2f}%\n"
                 f"Min Price ${MIN_PRICE_USD:.8f}\n"
                 f"Max Price ${MAX_PRICE_USD:.8f}\n"
-                f"Min Liquidity ${MIN_LIQUIDITY_USD:,.0f}\n"
-                f"Min 24h Volume ${MIN_24H_VOLUME_USD:,.0f}"
+                f"Min Liq ${MIN_LIQUIDITY_USD:,.0f}\n"
+                f"Max Liq ${MAX_LIQUIDITY_USD:,.0f}\n"
+                f"Min 24h Vol ${MIN_24H_VOLUME_USD:,.0f}\n"
+                f"Min m5 Vol ${MIN_M5_VOLUME_USD:,.0f}\n"
+                f"Min m5 Buys {MIN_M5_BUYS}\n"
+                f"Min h1 Buys {MIN_H1_BUYS}\n"
+                f"Max MC ${MAX_MARKET_CAP_USD:,.0f}\n"
+                f"Max FDV ${MAX_FDV_USD:,.0f}"
                 f"{extra}"
             )
         except Exception as e:
@@ -1458,11 +1779,10 @@ def heartbeat_loop():
 # MAIN
 # -------------------------
 def main():
-    watched_symbols = ",".join(sorted(TRUSTED_TOKENS.keys()))
-
     send(
-        f"Trusted Coin Momentum Bot Started\n\n"
+        f"Dynamic Small-Cap Momentum Bot Started\n\n"
         f"Mode {'LIVE' if RUN_AUTO_BUY == 'on' else 'PAPER'}\n"
+        f"Chain {DEX_PREFERRED_CHAIN}\n"
         f"Buy Size ${BUY_SIZE_USD:.2f}\n"
         f"Max Open Trades {MAX_OPEN_TRADES}\n"
         f"Check Interval {CHECK_INTERVAL_SECONDS}s\n"
@@ -1473,10 +1793,18 @@ def main():
         f"Stop Loss {STOP_LOSS_PCT:.2f}%\n"
         f"Min Price ${MIN_PRICE_USD:.8f}\n"
         f"Max Price ${MAX_PRICE_USD:.8f}\n"
-        f"Min Liquidity ${MIN_LIQUIDITY_USD:,.0f}\n"
-        f"Min 24h Volume ${MIN_24H_VOLUME_USD:,.0f}\n"
-        f"Slippage {SLIPPAGE_BPS} bps\n"
-        f"Trusted Symbols {watched_symbols}"
+        f"Min Liq ${MIN_LIQUIDITY_USD:,.0f}\n"
+        f"Max Liq ${MAX_LIQUIDITY_USD:,.0f}\n"
+        f"Min 24h Vol ${MIN_24H_VOLUME_USD:,.0f}\n"
+        f"Min m5 Vol ${MIN_M5_VOLUME_USD:,.0f}\n"
+        f"Min m5 Buys {MIN_M5_BUYS}\n"
+        f"Min h1 Buys {MIN_H1_BUYS}\n"
+        f"Max MC ${MAX_MARKET_CAP_USD:,.0f}\n"
+        f"Max FDV ${MAX_FDV_USD:,.0f}\n"
+        f"Max Pair Age {MAX_PAIR_AGE_MINUTES} min\n"
+        f"Require Boosted Only {'YES' if REQUIRE_BOOSTED_CANDIDATE else 'NO'}\n"
+        f"Require ETH Quote Only {'YES' if REQUIRE_ETH_QUOTE_ONLY else 'NO'}\n"
+        f"Slippage {SLIPPAGE_BPS} bps"
     )
 
     threading.Thread(target=scanner_loop, daemon=True).start()
