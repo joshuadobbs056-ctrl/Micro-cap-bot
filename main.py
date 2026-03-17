@@ -292,8 +292,8 @@ CHAINLINK_ETH_USD_ABI = [
             {"internalType": "uint80", "name": "roundId", "type": "uint80"},
             {"internalType": "int256", "name": "answer", "type": "int256"},
             {"internalType": "uint256", "name": "startedAt", "type": "uint256"},
-            {"internalType": "uint256", "name": "updatedAt", "type": "uint256"},
             {"internalType": "uint80", "name": "answeredInRound", "type": "uint80"},
+            {"internalType": "uint256", "name": "updatedAt", "type": "uint256"},
         ],
         "stateMutability": "view",
         "type": "function",
@@ -310,6 +310,8 @@ eth_usd_feed = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=CHAINLINK_ETH_USD_
 # GLOBAL STATE
 # -------------------------
 LOCK = threading.Lock()
+SEND_LOCK = threading.Lock()
+
 LAST_TELEGRAM_SEND_TS = 0.0
 LAST_DISCOVERY_TS = 0.0
 
@@ -334,44 +336,48 @@ DISCOVERY_BLACKLIST: Dict[str, float] = {}
 def send(msg: str):
     global LAST_TELEGRAM_SEND_TS
 
-    MAX_TELEGRAM_LEN = 3900
-    text = str(msg)
+    with SEND_LOCK:
+        MAX_TELEGRAM_LEN = 3900
+        text = str(msg)
 
-    if len(text) > MAX_TELEGRAM_LEN:
-        text = text[:MAX_TELEGRAM_LEN] + "\n\n...[truncated]"
+        if len(text) > MAX_TELEGRAM_LEN:
+            text = text[:MAX_TELEGRAM_LEN] + "\n\n...[truncated]"
 
-    now = time.time()
-    if now - LAST_TELEGRAM_SEND_TS < TELEGRAM_COOLDOWN_SECONDS:
-        print("Telegram throttled (local cooldown)")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        text = f"[{ts}]\n{text}"
+
+        now = time.time()
+        if now - LAST_TELEGRAM_SEND_TS < TELEGRAM_COOLDOWN_SECONDS:
+            print("Telegram throttled (local cooldown)")
+            print(text)
+            return
+
+        LAST_TELEGRAM_SEND_TS = now
+
+        delivered = False
+        if TELEGRAM_TOKEN and CHAT_ID:
+            try:
+                r = SESSION.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    data={
+                        "chat_id": CHAT_ID,
+                        "text": text,
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    delivered = True
+                else:
+                    print(f"Telegram send failed: status={r.status_code} body={r.text}")
+            except Exception as e:
+                print(f"Telegram send exception: {e}")
+        else:
+            print("Telegram not configured: TELEGRAM_TOKEN or CHAT_ID missing")
+
+        if delivered:
+            print("Telegram delivered")
         print(text)
-        return
-
-    LAST_TELEGRAM_SEND_TS = now
-
-    delivered = False
-    if TELEGRAM_TOKEN and CHAT_ID:
-        try:
-            r = SESSION.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                data={
-                    "chat_id": CHAT_ID,
-                    "text": text,
-                    "disable_web_page_preview": True,
-                },
-                timeout=10,
-            )
-            if r.status_code == 200:
-                delivered = True
-            else:
-                print(f"Telegram send failed: status={r.status_code} body={r.text}")
-        except Exception as e:
-            print(f"Telegram send exception: {e}")
-    else:
-        print("Telegram not configured: TELEGRAM_TOKEN or CHAT_ID missing")
-
-    if delivered:
-        print("Telegram delivered")
-    print(text)
 
 
 # -------------------------
@@ -992,7 +998,21 @@ def execute_live_buy(token: str, symbol: str, entry_price_usd: float) -> Optiona
     token = Web3.to_checksum_address(token)
 
     with LOCK:
+        if token in LIVE_POSITIONS:
+            return None
+        current_open_positions = len(LIVE_POSITIONS)
         last_fail = FAILED_LIVE_BUYS.get(token, 0.0)
+
+    if current_open_positions >= MAX_OPEN_TRADES:
+        send(
+            f"⚠️ LIVE BUY SKIPPED\n\n"
+            f"{symbol}\n"
+            f"Token\n{token}\n\n"
+            f"Reason: max open trades reached\n"
+            f"Open Positions {current_open_positions}/{MAX_OPEN_TRADES}"
+        )
+        return None
+
     if now_ts() - last_fail < FAILED_BUY_COOLDOWN_SECONDS:
         remaining = int(FAILED_BUY_COOLDOWN_SECONDS - (now_ts() - last_fail))
         send(
@@ -1342,7 +1362,10 @@ def get_live_account_snapshot() -> Dict[str, float]:
     unrealized_pnl_usd = 0.0
     invested_value_usd = 0.0
 
-    for pos in list(LIVE_POSITIONS.values()):
+    with LOCK:
+        live_positions_copy = list(LIVE_POSITIONS.values())
+
+    for pos in live_positions_copy:
         m = get_live_position_metrics(pos)
         open_position_value_usd += m["current_value_usd"]
         unrealized_pnl_usd += m["pnl_usd"]
@@ -1369,25 +1392,30 @@ def get_live_account_snapshot() -> Dict[str, float]:
 def open_paper_position(symbol: str, token: str, price: float) -> bool:
     global ACCOUNT_CASH
 
-    if len(PAPER_POSITIONS) >= MAX_OPEN_TRADES:
-        return False
-    if ACCOUNT_CASH < BUY_SIZE_USD:
-        return False
-    if not price_in_band(price):
-        return False
+    with LOCK:
+        if len(PAPER_POSITIONS) >= MAX_OPEN_TRADES:
+            return False
+        if ACCOUNT_CASH < BUY_SIZE_USD:
+            return False
+        if token in PAPER_POSITIONS:
+            return False
+        if not price_in_band(price):
+            return False
 
-    qty = BUY_SIZE_USD / price
-    PAPER_POSITIONS[token] = {
-        "token": token,
-        "symbol": symbol,
-        "entry_price": price,
-        "qty": qty,
-        "opened": now_ts(),
-        "peak_price": price,
-        "current_price_usd": price,
-        "entry_value_usd": BUY_SIZE_USD,
-    }
-    ACCOUNT_CASH -= BUY_SIZE_USD
+        qty = BUY_SIZE_USD / price
+        PAPER_POSITIONS[token] = {
+            "token": token,
+            "symbol": symbol,
+            "entry_price": price,
+            "qty": qty,
+            "opened": now_ts(),
+            "peak_price": price,
+            "current_price_usd": price,
+            "entry_value_usd": BUY_SIZE_USD,
+        }
+        ACCOUNT_CASH -= BUY_SIZE_USD
+
+        open_count = len(PAPER_POSITIONS)
 
     send(
         f"🧪 PAPER BUY OPENED\n\n"
@@ -1396,7 +1424,7 @@ def open_paper_position(symbol: str, token: str, price: float) -> bool:
         f"Entry Price ${price:.8f}\n"
         f"Buy Size ${BUY_SIZE_USD:.2f}\n"
         f"Qty {qty:,.6f}\n"
-        f"Open Trades {len(PAPER_POSITIONS)}/{MAX_OPEN_TRADES}"
+        f"Open Trades {open_count}/{MAX_OPEN_TRADES}"
     )
     return True
 
@@ -1407,8 +1435,9 @@ def monitor_paper_positions():
         try:
             with LOCK:
                 cache_copy = dict(MARKET_CACHE)
+                paper_positions_copy = list(PAPER_POSITIONS.items())
 
-            for token, pos in list(PAPER_POSITIONS.items()):
+            for token, pos in paper_positions_copy:
                 market = cache_copy.get(token)
                 if not market:
                     continue
@@ -1417,13 +1446,18 @@ def monitor_paper_positions():
                 if current_price <= 0:
                     continue
 
-                pos["current_price_usd"] = current_price
-                if current_price > safe_float(pos.get("peak_price"), 0.0):
-                    pos["peak_price"] = current_price
+                with LOCK:
+                    live_pos = PAPER_POSITIONS.get(token)
+                    if not live_pos:
+                        continue
 
-                qty = safe_float(pos.get("qty"))
-                entry_price = safe_float(pos.get("entry_price"))
-                peak_price = safe_float(pos.get("peak_price"))
+                    live_pos["current_price_usd"] = current_price
+                    if current_price > safe_float(live_pos.get("peak_price"), 0.0):
+                        live_pos["peak_price"] = current_price
+
+                    qty = safe_float(live_pos.get("qty"))
+                    entry_price = safe_float(live_pos.get("entry_price"))
+                    peak_price = safe_float(live_pos.get("peak_price"))
 
                 current_value = qty * current_price
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
@@ -1432,7 +1466,11 @@ def monitor_paper_positions():
                 if peak_pnl_pct >= TRAIL_ARM_PCT:
                     trail_floor_price = peak_price * (1.0 - TRAIL_DROP_PCT / 100.0)
                     if current_price <= trail_floor_price:
-                        ACCOUNT_CASH += current_value
+                        with LOCK:
+                            if token in PAPER_POSITIONS:
+                                ACCOUNT_CASH += current_value
+                                PAPER_POSITIONS.pop(token, None)
+
                         send(
                             f"💰 PAPER TRAILING EXIT\n\n"
                             f"{pos['symbol']}\n"
@@ -1443,11 +1481,14 @@ def monitor_paper_positions():
                             f"Final Value ${current_value:.2f}\n"
                             f"Reason: trailed {TRAIL_DROP_PCT:.2f}% from peak after arming at {TRAIL_ARM_PCT:.2f}%"
                         )
-                        PAPER_POSITIONS.pop(token, None)
                         continue
 
                 if pnl_pct <= -abs(STOP_LOSS_PCT):
-                    ACCOUNT_CASH += current_value
+                    with LOCK:
+                        if token in PAPER_POSITIONS:
+                            ACCOUNT_CASH += current_value
+                            PAPER_POSITIONS.pop(token, None)
+
                     send(
                         f"🛑 PAPER STOP LOSS EXIT\n\n"
                         f"{pos['symbol']}\n"
@@ -1456,7 +1497,6 @@ def monitor_paper_positions():
                         f"PnL {pnl_pct:.2f}%\n"
                         f"Final Value ${current_value:.2f}"
                     )
-                    PAPER_POSITIONS.pop(token, None)
 
         except Exception as e:
             print(f"monitor_paper_positions error: {e}")
@@ -1472,8 +1512,9 @@ def monitor_live_positions():
         try:
             with LOCK:
                 cache_copy = dict(MARKET_CACHE)
+                live_positions_copy = list(LIVE_POSITIONS.items())
 
-            for token, pos in list(LIVE_POSITIONS.items()):
+            for token, pos in live_positions_copy:
                 market = cache_copy.get(token)
                 if not market:
                     continue
@@ -1482,13 +1523,19 @@ def monitor_live_positions():
                 if current_price <= 0:
                     continue
 
-                entry_price = safe_float(pos.get("entry_price"))
-                pos["current_price_usd"] = current_price
+                with LOCK:
+                    live_pos = LIVE_POSITIONS.get(token)
+                    if not live_pos:
+                        continue
 
-                if current_price > safe_float(pos.get("peak_price"), 0.0):
-                    pos["peak_price"] = current_price
+                    entry_price = safe_float(live_pos.get("entry_price"))
+                    live_pos["current_price_usd"] = current_price
 
-                peak_price = safe_float(pos.get("peak_price"))
+                    if current_price > safe_float(live_pos.get("peak_price"), 0.0):
+                        live_pos["peak_price"] = current_price
+
+                    peak_price = safe_float(live_pos.get("peak_price"))
+
                 peak_pnl = ((peak_price - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
 
@@ -1496,18 +1543,20 @@ def monitor_live_positions():
                     trail_floor_price = peak_price * (1.0 - TRAIL_DROP_PCT / 100.0)
                     if current_price <= trail_floor_price:
                         sold = execute_live_sell(
-                            pos,
+                            live_pos,
                             current_price,
                             f"trailed {TRAIL_DROP_PCT:.2f}% from peak after arming at {TRAIL_ARM_PCT:.2f}%"
                         )
                         if sold:
-                            LIVE_POSITIONS.pop(token, None)
+                            with LOCK:
+                                LIVE_POSITIONS.pop(token, None)
                             continue
 
                 if pnl_pct <= -abs(STOP_LOSS_PCT):
-                    sold = execute_live_sell(pos, current_price, f"stop loss {STOP_LOSS_PCT:.2f}%")
+                    sold = execute_live_sell(live_pos, current_price, f"stop loss {STOP_LOSS_PCT:.2f}%")
                     if sold:
-                        LIVE_POSITIONS.pop(token, None)
+                        with LOCK:
+                            LIVE_POSITIONS.pop(token, None)
 
         except Exception as e:
             print(f"monitor_live_positions error: {e}")
@@ -1605,16 +1654,24 @@ def process_signal(symbol: str, token: str, market: dict):
         LAST_SIGNAL_TS[token] = now_ts()
 
     if RUN_AUTO_BUY == "on":
-        if len(LIVE_POSITIONS) >= MAX_OPEN_TRADES:
+        with LOCK:
+            already_live = token in LIVE_POSITIONS
+            live_count = len(LIVE_POSITIONS)
+
+        if live_count >= MAX_OPEN_TRADES:
             return
-        if token in LIVE_POSITIONS:
+        if already_live:
             return
 
         pos = execute_live_buy(token, symbol, price)
         if pos:
-            LIVE_POSITIONS[token] = pos
+            with LOCK:
+                if token not in LIVE_POSITIONS and len(LIVE_POSITIONS) < MAX_OPEN_TRADES:
+                    LIVE_POSITIONS[token] = pos
     else:
-        if token not in PAPER_POSITIONS:
+        with LOCK:
+            already_paper = token in PAPER_POSITIONS
+        if not already_paper:
             open_paper_position(symbol, token, price)
 
     send(
@@ -1672,9 +1729,13 @@ def scanner_loop():
 def portfolio_loop():
     while True:
         try:
-            total = ACCOUNT_CASH
+            with LOCK:
+                cash_copy = ACCOUNT_CASH
+                paper_positions_copy = list(PAPER_POSITIONS.values())
 
-            for pos in list(PAPER_POSITIONS.values()):
+            total = cash_copy
+
+            for pos in paper_positions_copy:
                 qty = safe_float(pos.get("qty"))
                 current_price = safe_float(pos.get("current_price_usd"))
                 total += qty * current_price
@@ -1689,8 +1750,8 @@ def portfolio_loop():
                     f"Current Value ${total:.2f}\n\n"
                     f"Total Profit ${pnl:.2f}\n"
                     f"PnL {pnl_pct:.2f}%\n\n"
-                    f"Cash ${ACCOUNT_CASH:.2f}\n"
-                    f"Open Trades {len(PAPER_POSITIONS)}/{MAX_OPEN_TRADES}"
+                    f"Cash ${cash_copy:.2f}\n"
+                    f"Open Trades {len(paper_positions_copy)}/{MAX_OPEN_TRADES}"
                 )
         except Exception as e:
             print(f"portfolio_loop error: {e}")
@@ -1703,6 +1764,8 @@ def live_account_loop():
         try:
             if RUN_AUTO_BUY == "on":
                 live = get_live_account_snapshot()
+                with LOCK:
+                    live_count = len(LIVE_POSITIONS)
 
                 send(
                     f"📈 LIVE ACCOUNT STATUS\n\n"
@@ -1713,7 +1776,7 @@ def live_account_loop():
                     f"Total Equity ${live['total_equity_usd']:.2f}\n\n"
                     f"Unrealized PnL ${live['unrealized_pnl_usd']:.2f}\n"
                     f"Unrealized PnL {live['unrealized_pnl_pct']:.2f}%\n\n"
-                    f"Open Orders {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}"
+                    f"Open Orders {live_count}/{MAX_OPEN_TRADES}"
                 )
         except Exception as e:
             print(f"live_account_loop error: {e}")
@@ -1728,6 +1791,9 @@ def heartbeat_loop():
 
             with LOCK:
                 candidate_count = len(DISCOVERED_TOKENS)
+                history_count = len(PRICE_HISTORY)
+                paper_count = len(PAPER_POSITIONS)
+                live_count = len(LIVE_POSITIONS)
 
             extra = ""
             if RUN_AUTO_BUY == "on":
@@ -1748,9 +1814,9 @@ def heartbeat_loop():
                 f"Mode {'LIVE' if RUN_AUTO_BUY == 'on' else 'PAPER'}\n"
                 f"Discovery Chain {DEX_PREFERRED_CHAIN}\n"
                 f"Tracked Candidates {candidate_count}/{MAX_CANDIDATES_TRACKED}\n"
-                f"Tracked Histories {len(PRICE_HISTORY)}\n"
-                f"Paper Trades {len(PAPER_POSITIONS)}/{MAX_OPEN_TRADES}\n"
-                f"Live Positions {len(LIVE_POSITIONS)}/{MAX_OPEN_TRADES}\n"
+                f"Tracked Histories {history_count}\n"
+                f"Paper Trades {paper_count}/{MAX_OPEN_TRADES}\n"
+                f"Live Positions {live_count}/{MAX_OPEN_TRADES}\n"
                 f"Check Every {CHECK_INTERVAL_SECONDS}s\n"
                 f"Buy Size ${BUY_SIZE_USD:.2f}\n"
                 f"Entry Pump {ENTRY_PUMP_PCT:.2f}%\n"
