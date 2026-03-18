@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import requests
 import threading
 from datetime import datetime, timezone
@@ -9,18 +8,13 @@ from typing import List, Dict, Optional, Tuple
 # ============================================================
 # COINBASE FUTURES SWING MODE PAPER TRADER
 # ============================================================
-# Swing mode design:
-# - Uses HIGHER timeframe trend filter
-# - Uses LOWER timeframe entry trigger
-# - Opens PAPER long / short trades only on Coinbase futures products
-# - Manages stop loss, optional take profit, and trailing stop
-# - Holds through smaller counter-moves instead of flipping constantly
+# PAPER TRADING ONLY
 #
-# IMPORTANT:
-# - PAPER TRADING ONLY
-# - Candle-based simulation, not tick-perfect fills
+# Uses Coinbase Advanced Trade PUBLIC market endpoints:
+# - /api/v3/brokerage/market/products/{product_id}
+# - /api/v3/brokerage/market/products/{product_id}/candles
 #
-# ENV EXAMPLES:
+# Example ENV:
 #
 # TELEGRAM_TOKEN=123456:ABCDEF
 # CHAT_ID=123456789
@@ -70,7 +64,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
 FUTURES_PRODUCTS = [
-    x.strip() for x in os.getenv("FUTURES_PRODUCTS", "BTC-PERP-INTX,ETH-PERP-INTX,SOL-PERP-INTX").split(",") if x.strip()
+    x.strip()
+    for x in os.getenv(
+        "FUTURES_PRODUCTS", "BTC-PERP-INTX,ETH-PERP-INTX,SOL-PERP-INTX"
+    ).split(",")
+    if x.strip()
 ]
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
@@ -105,15 +103,29 @@ MIN_TREND_STRENGTH_PCT = float(os.getenv("MIN_TREND_STRENGTH_PCT", "0.002"))
 ENTRY_CONFIRM_BARS = int(os.getenv("ENTRY_CONFIRM_BARS", "2"))
 TELEGRAM_VERBOSE = os.getenv("TELEGRAM_VERBOSE", "on").strip().lower() == "on"
 
-COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/{product_id}/candles"
+COINBASE_PUBLIC_PRODUCT_URL = "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}"
+COINBASE_PUBLIC_CANDLES_URL = "https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}/candles"
 
 GRANULARITY_MAP = {
     "ONE_MINUTE": 60,
     "FIVE_MINUTE": 300,
     "FIFTEEN_MINUTE": 900,
+    "THIRTY_MINUTE": 1800,
     "ONE_HOUR": 3600,
+    "TWO_HOUR": 7200,
     "SIX_HOUR": 21600,
     "ONE_DAY": 86400,
+}
+
+ADV_GRANULARITY_MAP = {
+    60: "ONE_MINUTE",
+    300: "FIVE_MINUTE",
+    900: "FIFTEEN_MINUTE",
+    1800: "THIRTY_MINUTE",
+    3600: "ONE_HOUR",
+    7200: "TWO_HOUR",
+    21600: "SIX_HOUR",
+    86400: "ONE_DAY",
 }
 
 
@@ -123,13 +135,6 @@ def now_utc() -> datetime:
 
 def utc_ts() -> str:
     return now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def as_float(value, default=0.0) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
 
 
 def send_telegram(message: str) -> None:
@@ -142,6 +147,7 @@ def send_telegram(message: str) -> None:
         "chat_id": CHAT_ID,
         "text": message[:4000],
     }
+
     try:
         SESSION.post(url, json=payload, timeout=15)
     except Exception as e:
@@ -149,8 +155,7 @@ def send_telegram(message: str) -> None:
 
 
 def log(message: str, telegram: bool = False) -> None:
-    stamp = utc_ts()
-    line = f"[{stamp}] {message}"
+    line = f"[{utc_ts()}] {message}"
     print(line)
     if telegram:
         send_telegram(line)
@@ -178,50 +183,71 @@ def pct_change(a: float, b: float) -> float:
 
 
 def fetch_candles(product_id: str, granularity_name: str, limit: int) -> List[Dict]:
-    granularity = GRANULARITY_MAP.get(granularity_name)
-    if not granularity:
+    granularity_seconds = GRANULARITY_MAP.get(granularity_name)
+    if granularity_seconds is None:
         raise ValueError(f"Unsupported granularity: {granularity_name}")
 
-    params = {"granularity": granularity}
-    url = COINBASE_CANDLES_URL.format(product_id=product_id)
+    adv_granularity = ADV_GRANULARITY_MAP.get(granularity_seconds)
+    if adv_granularity is None:
+        raise ValueError(f"Unsupported Advanced Trade granularity: {granularity_seconds}")
+
+    url = COINBASE_PUBLIC_CANDLES_URL.format(product_id=product_id)
+
+    end_ts = int(time.time())
+    # Ask for a bit more history than needed to avoid sparse edge cases
+    requested_bars = max(limit, 50)
+    start_ts = end_ts - (granularity_seconds * requested_bars)
+
+    params = {
+        "start": str(start_ts),
+        "end": str(end_ts),
+        "granularity": adv_granularity,
+    }
 
     try:
         r = SESSION.get(url, params=params, timeout=20)
         r.raise_for_status()
-        raw = r.json()
+        data = r.json()
     except Exception as e:
         log(f"{product_id} fetch_candles error: {e}")
         return []
 
-    candles = []
-    for row in raw:
-        # Coinbase candles format:
-        # [time, low, high, open, close, volume]
+    raw_candles = data.get("candles", [])
+    candles: List[Dict] = []
+
+    for row in raw_candles:
         try:
             candles.append(
                 {
-                    "time": int(row[0]),
-                    "low": float(row[1]),
-                    "high": float(row[2]),
-                    "open": float(row[3]),
-                    "close": float(row[4]),
-                    "volume": float(row[5]),
+                    "time": int(row["start"]),
+                    "low": float(row["low"]),
+                    "high": float(row["high"]),
+                    "open": float(row["open"]),
+                    "close": float(row["close"]),
+                    "volume": float(row["volume"]),
                 }
             )
         except Exception:
             continue
 
     candles.sort(key=lambda x: x["time"])
-    if limit > 0:
-        candles = candles[-limit:]
-    return candles
+    return candles[-limit:] if limit > 0 else candles
 
 
-def get_latest_price(product_id: str, fallback_granularity: str = "ONE_MINUTE") -> Optional[float]:
-    candles = fetch_candles(product_id, fallback_granularity, 3)
-    if not candles:
+def get_latest_price(product_id: str) -> Optional[float]:
+    url = COINBASE_PUBLIC_PRODUCT_URL.format(product_id=product_id)
+    try:
+        r = SESSION.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        price = data.get("price")
+        if price is None:
+            return None
+        return float(price)
+    except Exception as e:
+        log(f"{product_id} get_latest_price error: {e}")
         return None
-    return candles[-1]["close"]
 
 
 def calculate_trend_signal(candles: List[Dict]) -> Dict:
@@ -237,10 +263,20 @@ def calculate_trend_signal(candles: List[Dict]) -> Dict:
     last_slow = slow[-1]
     slope_strength = pct_change(slow[-5], last_slow) if len(slow) >= 5 else 0.0
 
-    if last_fast > last_slow and last_close > last_slow and abs(slope_strength) >= MIN_TREND_STRENGTH_PCT:
+    if (
+        last_fast > last_slow
+        and last_close > last_slow
+        and abs(slope_strength) >= MIN_TREND_STRENGTH_PCT
+    ):
         return {"trend": "bullish", "strength": slope_strength}
-    if last_fast < last_slow and last_close < last_slow and abs(slope_strength) >= MIN_TREND_STRENGTH_PCT:
+
+    if (
+        last_fast < last_slow
+        and last_close < last_slow
+        and abs(slope_strength) >= MIN_TREND_STRENGTH_PCT
+    ):
         return {"trend": "bearish", "strength": slope_strength}
+
     return {"trend": "neutral", "strength": slope_strength}
 
 
@@ -256,15 +292,12 @@ def calculate_entry_signal(candles: List[Dict], higher_trend: str) -> Dict:
     last_entry = entry_line[-1]
     prev_entry = entry_line[-2]
 
-    confirms_above = True
-    confirms_below = True
-    bars = candles[-ENTRY_CONFIRM_BARS:]
+    confirm_count = min(ENTRY_CONFIRM_BARS, len(candles))
+    recent_closes = closes[-confirm_count:]
+    recent_entry = entry_line[-confirm_count:]
 
-    for c in bars:
-        if c["close"] <= entry_line[closes.index(c["close"])]:
-            confirms_above = False
-        if c["close"] >= entry_line[closes.index(c["close"])]:
-            confirms_below = False
+    confirms_above = all(c > e for c, e in zip(recent_closes, recent_entry))
+    confirms_below = all(c < e for c, e in zip(recent_closes, recent_entry))
 
     if higher_trend == "bullish":
         if prev_close <= prev_entry and last_close > last_entry:
@@ -297,12 +330,16 @@ def calculate_position_size(portfolio: Dict, entry_price: float) -> float:
     risk_dollars = cash * RISK_PER_TRADE_PCT
     if risk_dollars <= 0 or entry_price <= 0:
         return 0.0
-
-    qty = risk_dollars / entry_price
-    return max(qty, 0.0)
+    return max(risk_dollars / entry_price, 0.0)
 
 
-def open_trade(portfolio: Dict, product_id: str, side: str, price: float, trend_strength: float) -> Optional[Dict]:
+def open_trade(
+    portfolio: Dict,
+    product_id: str,
+    side: str,
+    price: float,
+    trend_strength: float,
+) -> Optional[Dict]:
     if not can_open_new_trade(portfolio):
         return None
     if trade_exists(portfolio, product_id):
@@ -315,6 +352,7 @@ def open_trade(portfolio: Dict, product_id: str, side: str, price: float, trend_
 
     if qty <= 0 or entry_value <= 0:
         return None
+
     if entry_value > portfolio["cash"]:
         qty = portfolio["cash"] / price
         entry_value = qty * price
@@ -367,14 +405,12 @@ def close_trade(portfolio: Dict, trade: Dict, exit_price: float, reason: str) ->
         return
 
     qty = trade["qty"]
-    final_value = qty * exit_price
 
     if trade["side"] == "long":
+        final_value = qty * exit_price
         pnl = final_value - trade["entry_value"]
     else:
         pnl = (trade["entry_price"] - exit_price) * qty
-
-    if trade["side"] == "short":
         final_value = trade["entry_value"] + pnl
 
     portfolio["cash"] += final_value
@@ -418,9 +454,9 @@ def update_trade_marks(trade: Dict, current_price: float) -> None:
 
     pnl_pct = (pnl / trade["entry_value"] * 100.0) if trade["entry_value"] > 0 else 0.0
 
-    if pnl > trade.get("peak_pnl", -999999999):
+    if pnl > trade.get("peak_pnl", float("-inf")):
         trade["peak_pnl"] = pnl
-    if pnl_pct > trade.get("peak_pnl_pct", -999999999):
+    if pnl_pct > trade.get("peak_pnl_pct", float("-inf")):
         trade["peak_pnl_pct"] = pnl_pct
 
     if current_price > trade["highest_price"]:
@@ -481,13 +517,9 @@ def manage_trade(portfolio: Dict, trade: Dict, current_price: float) -> None:
 def send_account_update(portfolio: Dict) -> None:
     try:
         open_value = 0.0
-        open_pnl = 0.0
 
         for trade in portfolio.get("trades", []):
-            current_value = float(trade.get("current_value", 0.0))
-            entry_value = float(trade.get("entry_value", 0.0))
-            open_value += current_value
-            open_pnl += (current_value - entry_value)
+            open_value += float(trade.get("current_value", 0.0))
 
         total_value = float(portfolio.get("cash", 0.0)) + open_value
         start_balance = float(portfolio.get("start_balance", 0.0))
@@ -515,12 +547,13 @@ def send_account_update(portfolio: Dict) -> None:
                 symbol = trade.get("symbol") or trade.get("product_id") or "UNKNOWN"
                 entry_value = float(trade.get("entry_value", 0.0))
                 current_value = float(trade.get("current_value", 0.0))
-                pnl = current_value - entry_value
-                pnl_pct = (pnl / entry_value * 100.0) if entry_value > 0 else 0.0
 
                 if trade.get("side") == "short":
-                    pnl = float(trade.get("peak_pnl", 0.0)) if False else (trade["entry_price"] - trade["current_price"]) * trade["qty"]
-                    pnl_pct = (pnl / entry_value * 100.0) if entry_value > 0 else 0.0
+                    pnl = (trade["entry_price"] - trade["current_price"]) * trade["qty"]
+                else:
+                    pnl = current_value - entry_value
+
+                pnl_pct = (pnl / entry_value * 100.0) if entry_value > 0 else 0.0
 
                 lines.append(
                     f"• {symbol} {trade.get('side', '').upper()} | "
@@ -534,7 +567,7 @@ def send_account_update(portfolio: Dict) -> None:
         print(f"send_account_update error: {e}")
 
 
-def account_update_loop(portfolio: Dict):
+def account_update_loop(portfolio: Dict) -> None:
     while True:
         try:
             send_account_update(portfolio)
@@ -606,26 +639,24 @@ def send_startup_message(portfolio: Dict) -> None:
     send_telegram(msg)
 
 
-def main():
+def main() -> None:
     portfolio = build_portfolio()
     send_startup_message(portfolio)
 
     threading.Thread(
         target=account_update_loop,
         args=(portfolio,),
-        daemon=True
+        daemon=True,
     ).start()
 
     while True:
         try:
-            # Update existing trades first
             for trade in list(portfolio["trades"]):
-                price = get_latest_price(trade["product_id"], ENTRY_GRANULARITY)
+                price = get_latest_price(trade["product_id"])
                 if price is None:
                     continue
                 manage_trade(portfolio, trade, price)
 
-            # Scan for new trades
             for product_id in FUTURES_PRODUCTS:
                 if not can_open_new_trade(portfolio):
                     break
