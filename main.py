@@ -1,7 +1,6 @@
 import os
 import time
 import requests
-import threading
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
@@ -21,7 +20,8 @@ FUTURES_PRODUCTS = [
 ]
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
-ACCOUNT_UPDATE_INTERVAL = int(os.getenv("ACCOUNT_UPDATE_INTERVAL", "60"))
+ACCOUNT_UPDATE_INTERVAL = int(os.getenv("ACCOUNT_UPDATE_INTERVAL", "300"))
+SCAN_STATUS_INTERVAL = int(os.getenv("SCAN_STATUS_INTERVAL", "300"))
 
 START_BALANCE = float(os.getenv("START_BALANCE", "500"))
 PURCHASE_AMOUNT_USD = float(os.getenv("PURCHASE_AMOUNT_USD", "200"))
@@ -58,7 +58,7 @@ def send_telegram(msg: str) -> None:
         r = SESSION.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": msg[:4000]},
-            timeout=10
+            timeout=15
         )
         if r.status_code != 200:
             print("Telegram error:", r.text)
@@ -77,7 +77,7 @@ def log(msg: str, tg: bool = False) -> None:
 
 def get_price(product: str) -> Optional[float]:
     try:
-        r = SESSION.get(PRODUCT_URL.format(product_id=product), timeout=10)
+        r = SESSION.get(PRODUCT_URL.format(product_id=product), timeout=15)
         r.raise_for_status()
         data = r.json()
         price = data.get("price")
@@ -93,7 +93,6 @@ def get_candles(product: str, granularity: str = "ONE_HOUR", limit: int = 200) -
     try:
         now = int(time.time())
 
-        # Rough window sizing by granularity
         seconds_map = {
             "ONE_MINUTE": 60,
             "FIVE_MINUTE": 300,
@@ -111,14 +110,12 @@ def get_candles(product: str, granularity: str = "ONE_HOUR", limit: int = 200) -
         r = SESSION.get(
             CANDLE_URL.format(product_id=product),
             params={"start": start, "end": now, "granularity": granularity},
-            timeout=10
+            timeout=15
         )
         r.raise_for_status()
 
         data = r.json()
         candles = data.get("candles", [])
-
-        # Coinbase may return newest-first; sort oldest -> newest
         candles = sorted(candles, key=lambda x: int(x["start"]))
         return candles
     except Exception as e:
@@ -173,7 +170,6 @@ def entry_signal(candles: List[Dict], trend: Optional[str]) -> Optional[str]:
     if len(closes) < 2 or len(line) < 2:
         return None
 
-    # Cross of close vs EMA in direction of trend
     if trend == "long":
         if closes[-1] > line[-1] and closes[-2] <= line[-2]:
             return "long"
@@ -214,7 +210,6 @@ def open_trade(p: Dict, product: str, side: str, price: float) -> None:
         return
 
     value = min(PURCHASE_AMOUNT_USD, p["cash"])
-
     if value <= 0:
         return
 
@@ -223,15 +218,16 @@ def open_trade(p: Dict, product: str, side: str, price: float) -> None:
 
     trade = {
         "product": product,
-        "side": side,                      # "long" or "short"
+        "side": side,
         "entry": price,
         "price": price,
         "qty": qty,
         "entry_value": value,
         "current_value": value,
-        "peak": 0.0,                       # best pnl in dollars
-        "trail": None,                     # trail price
-        "active": False
+        "peak": 0.0,
+        "trail": None,
+        "active": False,
+        "opened_at": utc(),
     }
 
     p["trades"].append(trade)
@@ -240,7 +236,8 @@ def open_trade(p: Dict, product: str, side: str, price: float) -> None:
         f"🟢 OPEN {side.upper()} {product}\n"
         f"Entry: ${price:.2f}\n"
         f"Size: ${value:.2f}\n"
-        f"Qty: {qty:.8f}"
+        f"Qty: {qty:.8f}\n"
+        f"Opened: {trade['opened_at']} UTC"
     )
 
 
@@ -268,7 +265,8 @@ def close_trade(p: Dict, t: Dict, price: float, reason: str) -> None:
         f"Entry: ${t['entry']:.2f}\n"
         f"Exit: ${price:.2f}\n"
         f"PnL: ${pnl:.2f} ({pnl_pct:.2f}%)\n"
-        f"Reason: {reason}"
+        f"Reason: {reason}\n"
+        f"Closed: {t['closed_at']} UTC"
     )
 
 
@@ -287,21 +285,17 @@ def manage_trades(p: Dict) -> None:
             if pnl > t["peak"]:
                 t["peak"] = pnl
 
-            # Stop loss
             if price <= t["entry"] * (1 - STOP_LOSS_PCT):
                 close_trade(p, t, price, "SL")
                 continue
 
-            # Take profit
             if price >= t["entry"] * (1 + TAKE_PROFIT_PCT):
                 close_trade(p, t, price, "TP")
                 continue
 
-            # Trailing logic
             if price >= t["entry"] * (1 + TRAILING_ACTIVATE):
                 t["active"] = True
                 new_trail = price * (1 - TRAILING_STOP_PCT)
-
                 if t["trail"] is None or new_trail > t["trail"]:
                     t["trail"] = new_trail
 
@@ -309,28 +303,24 @@ def manage_trades(p: Dict) -> None:
                 close_trade(p, t, price, "TRAIL")
                 continue
 
-        else:  # short
+        else:
             pnl = (t["entry"] - price) * t["qty"]
             t["current_value"] = t["entry_value"] + pnl
 
             if pnl > t["peak"]:
                 t["peak"] = pnl
 
-            # Stop loss
             if price >= t["entry"] * (1 + STOP_LOSS_PCT):
                 close_trade(p, t, price, "SL")
                 continue
 
-            # Take profit
             if price <= t["entry"] * (1 - TAKE_PROFIT_PCT):
                 close_trade(p, t, price, "TP")
                 continue
 
-            # Trailing logic for short
             if price <= t["entry"] * (1 - TRAILING_ACTIVATE):
                 t["active"] = True
                 new_trail = price * (1 + TRAILING_STOP_PCT)
-
                 if t["trail"] is None or new_trail < t["trail"]:
                     t["trail"] = new_trail
 
@@ -339,9 +329,9 @@ def manage_trades(p: Dict) -> None:
                 continue
 
 
-# ================= ACCOUNT =================
+# ================= STATUS =================
 
-def account_update(p: Dict) -> None:
+def build_account_update(p: Dict) -> str:
     total = portfolio_value(p)
     pnl = total - p["start"]
     pct = (pnl / p["start"]) * 100 if p["start"] else 0.0
@@ -353,6 +343,7 @@ def account_update(p: Dict) -> None:
         f"Cash: ${p['cash']:.2f}",
         f"PnL: ${pnl:.2f} ({pct:.2f}%)",
         f"Open Trades: {len(p['trades'])}",
+        f"Closed Trades: {len(p['closed'])}",
     ]
 
     if p["trades"]:
@@ -361,12 +352,17 @@ def account_update(p: Dict) -> None:
         for t in p["trades"]:
             trade_pnl = t["current_value"] - t["entry_value"]
             trade_pct = (trade_pnl / t["entry_value"]) * 100 if t["entry_value"] else 0.0
+
+            if t["side"] == "short":
+                trade_pnl = (t["entry"] - t["price"]) * t["qty"]
+                trade_pct = (trade_pnl / t["entry_value"]) * 100 if t["entry_value"] else 0.0
+
             lines.extend([
                 "",
                 f"{t['product']} | {t['side'].upper()}",
                 f"Entry: ${t['entry']:.2f}",
                 f"Current: ${t['price']:.2f}",
-                f"Size: ${t['entry_value']:.2f}",
+                f"Entry Value: ${t['entry_value']:.2f}",
                 f"Current Value: ${t['current_value']:.2f}",
                 f"PnL: ${trade_pnl:.2f} ({trade_pct:.2f}%)",
                 f"Peak PnL: ${t['peak']:.2f}",
@@ -374,16 +370,19 @@ def account_update(p: Dict) -> None:
             if t["trail"] is not None:
                 lines.append(f"Trail: ${t['trail']:.2f}")
 
-    send_telegram("\n".join(lines))
+    return "\n".join(lines)
 
 
-def account_loop(p: Dict) -> None:
-    while True:
-        try:
-            account_update(p)
-        except Exception as e:
-            print("account_loop error:", e)
-        time.sleep(ACCOUNT_UPDATE_INTERVAL)
+def build_scan_status(p: Dict) -> str:
+    total = portfolio_value(p)
+    return (
+        "🛰️ SCAN STATUS\n\n"
+        f"Value: ${total:.2f}\n"
+        f"Cash: ${p['cash']:.2f}\n"
+        f"Open Trades: {len(p['trades'])}\n"
+        f"Watching: {', '.join(FUTURES_PRODUCTS)}\n"
+        f"Next scan in: {SCAN_INTERVAL}s"
+    )
 
 
 # ================= MAIN =================
@@ -396,12 +395,18 @@ def main() -> None:
         f"Start Balance: ${START_BALANCE:.2f}\n"
         f"Position Size: ${PURCHASE_AMOUNT_USD:.2f}\n"
         f"Max Open Trades: {MAX_OPEN_TRADES}\n"
+        f"Scan Interval: {SCAN_INTERVAL}s\n"
+        f"Account Update Interval: {ACCOUNT_UPDATE_INTERVAL}s\n"
+        f"Scan Status Interval: {SCAN_STATUS_INTERVAL}s\n"
         f"Products: {', '.join(FUTURES_PRODUCTS)}"
     )
 
-    threading.Thread(target=account_loop, args=(p,), daemon=True).start()
+    next_account_update = time.time() + 15
+    next_scan_status = time.time() + 15
 
     while True:
+        loop_started = time.time()
+
         try:
             manage_trades(p)
 
@@ -428,15 +433,26 @@ def main() -> None:
                     if price:
                         open_trade(p, product, entry, price)
 
+            now = time.time()
+
+            if now >= next_account_update:
+                send_telegram(build_account_update(p))
+                next_account_update = now + ACCOUNT_UPDATE_INTERVAL
+
+            if now >= next_scan_status:
+                send_telegram(build_scan_status(p))
+                next_scan_status = now + SCAN_STATUS_INTERVAL
+
             log(
-                f"Scan complete | Value ${portfolio_value(p):.2f} | Cash ${p['cash']:.2f} | Trades {len(p['trades'])}",
-                tg=True
+                f"Scan complete | Value ${portfolio_value(p):.2f} | Cash ${p['cash']:.2f} | Trades {len(p['trades'])}"
             )
 
         except Exception as e:
             send_telegram(f"ERROR: {e}")
 
-        time.sleep(SCAN_INTERVAL)
+        elapsed = time.time() - loop_started
+        sleep_for = max(1, SCAN_INTERVAL - elapsed)
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
