@@ -32,7 +32,7 @@ SLOW_EMA = int(os.getenv("SLOW_EMA", "50"))
 ENTRY_EMA = int(os.getenv("ENTRY_EMA", "9"))
 
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.02"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.06"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.05"))
 
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "0.015"))
 TRAILING_ACTIVATE = float(os.getenv("TRAILING_ACTIVATE", "0.01"))
