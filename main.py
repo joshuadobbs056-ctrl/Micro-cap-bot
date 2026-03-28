@@ -11,7 +11,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
-UPDATE_INTERVAL = 180  # FORCE 3 MINUTES
+UPDATE_INTERVAL = 180  # 3 minutes
 
 START_BALANCE = float(os.getenv("START_BALANCE", "500"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "50"))
@@ -66,7 +66,6 @@ def ml_score(features):
         for k in features:
             similarity += 1 - abs(features[k] - trade["features"][k])
         similarity /= len(features)
-
         scores.append(similarity * trade["result"])
 
     return sum(scores) / len(scores) if scores else 0.5
@@ -80,18 +79,15 @@ def log_trade(features, result):
 
 # ================= UTIL =================
 
-def now():
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
-
 def send(msg):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print(msg)
         return
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
-            "chat_id": CHAT_ID,
-            "text": msg
-        })
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg}
+        )
     except:
         pass
 
@@ -163,7 +159,7 @@ def open_trade(product, price, features):
     score = ml_score(features)
 
     if score < 0.55:
-        return  # ML FILTER
+        return
 
     if len(positions) >= MAX_OPEN_TRADES:
         return
@@ -180,17 +176,18 @@ def open_trade(product, price, features):
         "features": features
     }
 
-    send(f"🟡 ENTRY {product}\nPrice: {price:.4f}\nML Score: {score:.2f}")
+    send(f"🤖 ML ON | 🟡 ENTRY {product}\nPrice: {price:.4f}\nML Score: {score:.2f}")
 
 def add_trade(product, price):
     global balance
+
     if product not in positions or balance < TRADE_SIZE:
         return
 
     balance -= TRADE_SIZE
     positions[product]["size"] += TRADE_SIZE
 
-    send(f"🚀 ADD {product} @ {price:.4f}")
+    send(f"🤖 ML ON | 🚀 ADD {product} @ {price:.4f}")
 
 def close_trade(product, price, reason):
     global balance
@@ -207,22 +204,24 @@ def close_trade(product, price, reason):
     result = 1 if pnl_pct > 0 else -1
     log_trade(pos["features"], result)
 
-    send(f"🔴 EXIT {product} ({reason})\nPnL: {profit:.2f} ({pnl_pct*100:.2f}%)")
+    send(f"🤖 ML ON | 🔴 EXIT {product} ({reason})\nPnL: {profit:.2f} ({pnl_pct*100:.2f}%)")
 
 # ================= STATUS =================
 
 def send_update():
-    msg = f"📊 UPDATE\nBalance: ${balance:.2f}\nOpen Trades: {len(positions)}\n\n"
+    msg = f"🤖 ML ON\n📊 UPDATE\nBalance: ${balance:.2f}\nOpen Trades: {len(positions)}\n\n"
     for p, pos in positions.items():
         msg += f"{p} | Entry {pos['entry']:.2f} | Size ${pos['size']}\n"
     send(msg)
 
 # ================= MAIN =================
 
-send("🚀 ML ACCUMULATION SCANNER STARTED")
+send("🤖 MACHINE LEARNING ON\n🚀 SCANNER STARTED")
 
 while True:
     try:
+        global last_update
+
         for product in PRODUCTS:
             data = get_candle(product)
             if not data:
@@ -243,9 +242,7 @@ while True:
                 add_trade(product, price)
 
             if product in positions:
-                pos = positions[product]
-                entry = pos["entry"]
-
+                entry = positions[product]["entry"]
                 change = (price - entry) / entry
 
                 if change >= TAKE_PROFIT:
@@ -256,7 +253,7 @@ while True:
                     close_trade(product, price, "SL")
                     continue
 
-        # --- FORCED 3 MINUTE UPDATE ---
+        # 3-minute updates
         if time.time() - last_update >= UPDATE_INTERVAL:
             send_update()
             last_update = time.time()
