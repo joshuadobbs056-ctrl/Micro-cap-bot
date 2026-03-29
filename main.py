@@ -72,7 +72,7 @@ RUN_LIVE_TRADING = os.getenv("RUN_LIVE_TRADING", "false").strip().lower() == "tr
 
 # Coinbase CDP / Advanced Trade auth
 COINBASE_API_KEY = os.getenv("COINBASE_API_KEY", "").strip()
-COINBASE_API_PRIVATE_KEY = os.getenv("COINBASE_API_PRIVATE_KEY", "").strip()
+COINBASE_API_PRIVATE_KEY = os.getenv("COINBASE_API_PRIVATE_KEY", "").replace("\\n", "\n").strip()
 
 # Safety
 LIVE_TRADING_REQUIRE_CONFIRM = os.getenv("LIVE_TRADING_REQUIRE_CONFIRM", "true").strip().lower() == "true"
