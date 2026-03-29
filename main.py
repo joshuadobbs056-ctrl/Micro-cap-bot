@@ -856,7 +856,7 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
         f"USD Size: ${usd_size:.2f}\n"
         f"Coin Size: {base_size:.8f}\n"
         f"{'Paper Balance' if mode == 'paper' else 'Live USD Check Complete'}: "
-        f"${balance:.2f if mode == 'paper' else 0:.2f}".replace("$0.00", f"${balance:.2f}" if mode == "paper" else "OK")
+       f"{f'${balance:.2f}' if mode == 'paper' else 'OK'}"
     )
 
 def add_trade(product: str, price: float) -> None:
