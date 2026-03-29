@@ -7,7 +7,7 @@ from typing import Dict, Optional, Tuple, Any
 
 # ============================================================
 # COINBASE SPOT ACCUMULATION SCANNER + PAPER TRADER + SIMPLE ML
-# UPGRADED VERSION
+# REWRITTEN: ENTRY FILTERS NOW CONFIGURABLE VIA ENV VARS
 # ============================================================
 # - Coinbase spot products only
 # - Paper trading only
@@ -21,6 +21,7 @@ from typing import Dict, Optional, Tuple, Any
 # - Simple self-learning trade memory
 # - Balance persistence
 # - Re-entry cooldown after exits
+# - Entry filters controlled by env vars
 # ============================================================
 
 # ================= CONFIG =================
@@ -35,18 +36,32 @@ START_BALANCE = float(os.getenv("START_BALANCE", "500"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "50"))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "5"))
 
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))          # 5%
-STOP_LOSS = float(os.getenv("STOP_LOSS", "0.03"))              # 3%
-TRAILING_ARM = float(os.getenv("TRAILING_ARM", "0.025"))       # 2.5%
-TRAILING_STOP = float(os.getenv("TRAILING_STOP", "0.015"))     # 1.5%
-BREAKOUT_ADD_ON_PCT = float(os.getenv("BREAKOUT_ADD_ON_PCT", "0.01"))  # 1%
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))
+STOP_LOSS = float(os.getenv("STOP_LOSS", "0.03"))
+
+TRAILING_ARM = float(os.getenv("TRAILING_ARM", "0.02"))
+TRAILING_STOP = float(os.getenv("TRAILING_STOP", "0.02"))
+
+BREAKOUT_ADD_ON_PCT = float(os.getenv("BREAKOUT_ADD_ON_PCT", "0.005"))
 ENABLE_ADD_ON_BREAKOUT = os.getenv("ENABLE_ADD_ON_BREAKOUT", "true").strip().lower() == "true"
 
-ML_MIN_SCORE = float(os.getenv("ML_MIN_SCORE", "0.65"))
-ML_MIN_SAMPLES = int(os.getenv("ML_MIN_SAMPLES", "10"))
+ML_MIN_SCORE = float(os.getenv("ML_MIN_SCORE", "0.58"))
+ML_MIN_SAMPLES = int(os.getenv("ML_MIN_SAMPLES", "6"))
 
-REENTRY_COOLDOWN_SECONDS = int(os.getenv("REENTRY_COOLDOWN_SECONDS", "1800"))  # 30 min
+REENTRY_COOLDOWN_SECONDS = int(os.getenv("REENTRY_COOLDOWN_SECONDS", "900"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
+
+# New configurable entry filters
+MIN_FEATURE_HISTORY = int(os.getenv("MIN_FEATURE_HISTORY", "8"))
+NEAR_HIGH_BLOCK_PCT = float(os.getenv("NEAR_HIGH_BLOCK_PCT", "0.995"))
+MAX_ACCUM_RANGE = float(os.getenv("MAX_ACCUM_RANGE", "0.03"))
+MAX_ACCUM_DRIFT = float(os.getenv("MAX_ACCUM_DRIFT", "0.02"))
+MIN_VOLUME_IMPROVEMENT = float(os.getenv("MIN_VOLUME_IMPROVEMENT", "1.00"))
+MIN_PULLBACK_PCT = float(os.getenv("MIN_PULLBACK_PCT", "0.0"))
+MAX_PULLBACK_PCT = float(os.getenv("MAX_PULLBACK_PCT", "0.03"))
+MIN_BOUNCE_FROM_LOW = float(os.getenv("MIN_BOUNCE_FROM_LOW", "0.0"))
+BREAKOUT_VOLUME_MULT = float(os.getenv("BREAKOUT_VOLUME_MULT", "1.30"))
+MIN_ADD_ON_GAIN = float(os.getenv("MIN_ADD_ON_GAIN", "0.005"))
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 ML_FILE = os.getenv("ML_FILE", "ml_data.json")
@@ -62,7 +77,7 @@ PRODUCTS = [
 ]
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/2.0"})
+SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/3.0"})
 
 # ================= STATE =================
 
@@ -103,9 +118,7 @@ def load_state() -> None:
         balance = float(state.get("balance", START_BALANCE))
         last_exit_times_loaded = state.get("last_exit_times", {})
         if isinstance(last_exit_times_loaded, dict):
-            last_exit_times = {
-                str(k): int(v) for k, v in last_exit_times_loaded.items()
-            }
+            last_exit_times = {str(k): int(v) for k, v in last_exit_times_loaded.items()}
 
     positions_loaded = load_json_file(POSITIONS_FILE, {})
     if isinstance(positions_loaded, dict):
@@ -119,7 +132,6 @@ def load_state() -> None:
     if isinstance(ml_loaded, list):
         ml_data.extend(ml_loaded)
 
-    # Normalize positions
     for product, pos in list(positions.items()):
         if not isinstance(pos, dict):
             positions.pop(product, None)
@@ -151,14 +163,12 @@ def send(msg: str) -> None:
         print(msg)
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": msg
-    }
-
     try:
-        r = SESSION.post(url, json=payload, timeout=15)
+        r = SESSION.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg},
+            timeout=15
+        )
         if r.status_code != 200:
             print(f"Telegram error {r.status_code}: {r.text}")
     except Exception as e:
@@ -167,14 +177,10 @@ def send(msg: str) -> None:
 # ================= COINBASE DATA =================
 
 def get_candle(product: str) -> Optional[Tuple[float, float]]:
-    """
-    Returns (close_price, volume) from the latest candle.
-    Uses Coinbase Advanced Trade market candles endpoint.
-    """
     url = f"https://api.coinbase.com/api/v3/brokerage/market/products/{product}/candles"
     params = {
         "granularity": "FIVE_MINUTE",
-        "limit": 20
+        "limit": MAX_HISTORY
     }
 
     try:
@@ -188,13 +194,11 @@ def get_candle(product: str) -> Optional[Tuple[float, float]]:
         if not candles:
             return None
 
-        # Coinbase sometimes returns candles not guaranteed sorted
         candles_sorted = sorted(candles, key=lambda x: int(x.get("start", 0)))
         latest = candles_sorted[-1]
 
         close_price = float(latest["close"])
         volume = float(latest["volume"])
-
         return close_price, volume
 
     except Exception as e:
@@ -204,10 +208,6 @@ def get_candle(product: str) -> Optional[Tuple[float, float]]:
 # ================= SIMPLE ML =================
 
 def ml_score(features: Dict[str, float]) -> float:
-    """
-    Returns score from 0 to 1.
-    0.5 = neutral when there is not enough data.
-    """
     if len(ml_data) < ML_MIN_SAMPLES:
         return 0.60
 
@@ -282,7 +282,6 @@ def log_trade(
         "ts": ts
     })
 
-    # Keep files from growing forever
     if len(ml_data) > 2000:
         del ml_data[:-2000]
     if len(trade_history) > 2000:
@@ -296,7 +295,7 @@ def extract_features(product: str) -> Optional[Dict[str, float]]:
     prices = list(price_history[product])
     vols = list(volume_history[product])
 
-    if len(prices) < 10 or len(vols) < 10:
+    if len(prices) < MIN_FEATURE_HISTORY or len(vols) < MIN_FEATURE_HISTORY:
         return None
 
     avg_price = sum(prices) / len(prices)
@@ -323,38 +322,33 @@ def extract_features(product: str) -> Optional[Dict[str, float]]:
 
 def near_high_filter(product: str) -> bool:
     prices = list(price_history[product])
-    if len(prices) < 10:
+    if len(prices) < MIN_FEATURE_HISTORY:
         return False
 
     recent_high = max(prices)
     current = prices[-1]
-    return current >= recent_high * 0.985
+    return current >= recent_high * NEAR_HIGH_BLOCK_PCT
 
 def pullback_entry_ok(product: str) -> bool:
     prices = list(price_history[product])
-    vols = list(volume_history[product])
-
-    if len(prices) < 10 or len(vols) < 10:
-        return False
+    if len(prices) < MIN_FEATURE_HISTORY:
+        return True
 
     current = prices[-1]
     recent_high = max(prices[:-1])
-    recent_low = min(prices[-5:])
+    recent_low = min(prices[-5:]) if len(prices) >= 5 else min(prices)
 
-    if recent_high <= 0:
+    if recent_high <= 0 or recent_low <= 0:
         return False
 
     pullback_pct = (recent_high - current) / recent_high
-    bounce_from_low = (current - recent_low) / recent_low if recent_low > 0 else 0.0
+    bounce_from_low = (current - recent_low) / recent_low
 
-    # Want a pullback, but not a full dump
-    if pullback_pct < 0.003:
+    if pullback_pct < MIN_PULLBACK_PCT:
         return False
-    if pullback_pct > 0.02:
+    if pullback_pct > MAX_PULLBACK_PCT:
         return False
-
-    # Some sign price is lifting off local low
-    if bounce_from_low < 0.001:
+    if bounce_from_low < MIN_BOUNCE_FROM_LOW:
         return False
 
     return True
@@ -363,7 +357,7 @@ def is_accumulation(product: str) -> bool:
     prices = list(price_history[product])
     vols = list(volume_history[product])
 
-    if len(prices) < 10 or len(vols) < 10:
+    if len(prices) < MIN_FEATURE_HISTORY or len(vols) < MIN_FEATURE_HISTORY:
         return False
 
     avg_price = sum(prices) / len(prices)
@@ -376,16 +370,13 @@ def is_accumulation(product: str) -> bool:
     avg_old_vol = sum(vols[:-3]) / max(1, len(vols[:-3])) if len(vols) > 3 else 0.0
     recent_avg_vol = sum(vols[-3:]) / 3 if len(vols) >= 3 else 0.0
 
-    # Tight range
-    if price_range_pct > 0.018:
+    if price_range_pct > MAX_ACCUM_RANGE:
         return False
 
-    # Not already extended
-    if abs(drift_pct) > 0.012:
+    if abs(drift_pct) > MAX_ACCUM_DRIFT:
         return False
 
-    # Some volume improvement
-    if avg_old_vol > 0 and recent_avg_vol < avg_old_vol * 1.10:
+    if avg_old_vol > 0 and recent_avg_vol < avg_old_vol * MIN_VOLUME_IMPROVEMENT:
         return False
 
     return True
@@ -394,7 +385,7 @@ def is_breakout(product: str) -> bool:
     prices = list(price_history[product])
     vols = list(volume_history[product])
 
-    if len(prices) < 10 or len(vols) < 10:
+    if len(prices) < MIN_FEATURE_HISTORY or len(vols) < MIN_FEATURE_HISTORY:
         return False
 
     last_price = prices[-1]
@@ -407,7 +398,7 @@ def is_breakout(product: str) -> bool:
     if avg_prior_vol <= 0:
         return False
 
-    if vols[-1] < avg_prior_vol * 1.75:
+    if vols[-1] < avg_prior_vol * BREAKOUT_VOLUME_MULT:
         return False
 
     return True
@@ -442,7 +433,6 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
         return
 
     score = ml_score(features)
-
     if len(ml_data) >= ML_MIN_SAMPLES and score < ML_MIN_SCORE:
         return
 
@@ -477,7 +467,6 @@ def add_trade(product: str, price: float) -> None:
         return
 
     pos = positions[product]
-
     if pos.get("added_on_breakout"):
         return
 
@@ -486,9 +475,7 @@ def add_trade(product: str, price: float) -> None:
 
     entry = float(pos["entry"])
     current_gain = (price - entry) / entry if entry > 0 else 0.0
-
-    # Don't add unless trade is already working
-    if current_gain < 0.01:
+    if current_gain < MIN_ADD_ON_GAIN:
         return
 
     balance -= TRADE_SIZE
@@ -545,19 +532,15 @@ def manage_position(product: str, price: float) -> None:
     pos["peak"] = peak
 
     change = (price - entry) / entry if entry > 0 else 0.0
-    drawdown_from_peak = (peak - price) / peak if peak > 0 else 0.0
 
-    # Fixed TP first
     if change >= TAKE_PROFIT:
         close_trade(product, price, "TP")
         return
 
-    # Fixed SL
     if change <= -STOP_LOSS:
         close_trade(product, price, "SL")
         return
 
-    # Arm trailing stop after enough profit
     if not pos.get("trail_armed", False) and change >= TRAILING_ARM:
         pos["trail_armed"] = True
         pos["trail_stop_price"] = peak * (1.0 - TRAILING_STOP)
@@ -571,7 +554,6 @@ def manage_position(product: str, price: float) -> None:
             f"Trail Stop: {float(pos['trail_stop_price']):.6f}"
         )
 
-    # Update trailing stop if armed
     if pos.get("trail_armed", False):
         new_trail = peak * (1.0 - TRAILING_STOP)
         if new_trail > float(pos.get("trail_stop_price", 0.0)):
@@ -582,7 +564,6 @@ def manage_position(product: str, price: float) -> None:
             close_trade(product, price, "TRAIL")
             return
 
-    # Save peak updates periodically
     save_state()
 
 # ================= STATUS =================
@@ -646,7 +627,6 @@ while True:
                 continue
 
             price, volume = candle
-
             price_history[product].append(price)
             volume_history[product].append(volume)
 
