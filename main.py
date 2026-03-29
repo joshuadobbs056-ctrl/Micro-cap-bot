@@ -1,16 +1,20 @@
 import os
 import time
 import json
+import math
+import secrets
 import requests
+import jwt
 from collections import deque
 from typing import Dict, Optional, Tuple, Any
 
 # ============================================================
 # COINBASE SPOT ACCUMULATION SCANNER + PAPER TRADER + SIMPLE ML
-# REWRITTEN: ENTRY FILTERS NOW CONFIGURABLE VIA ENV VARS
+# LIVE-READY VERSION (DEFAULTS TO PAPER MODE)
 # ============================================================
 # - Coinbase spot products only
-# - Paper trading only
+# - Paper trading by default
+# - Live trading ready via RUN_LIVE_TRADING=true
 # - Early accumulation detection
 # - Pullback entry logic
 # - Near-high trap filter
@@ -51,7 +55,7 @@ ML_MIN_SAMPLES = int(os.getenv("ML_MIN_SAMPLES", "6"))
 REENTRY_COOLDOWN_SECONDS = int(os.getenv("REENTRY_COOLDOWN_SECONDS", "900"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 
-# New configurable entry filters
+# Entry filters
 MIN_FEATURE_HISTORY = int(os.getenv("MIN_FEATURE_HISTORY", "8"))
 NEAR_HIGH_BLOCK_PCT = float(os.getenv("NEAR_HIGH_BLOCK_PCT", "0.995"))
 MAX_ACCUM_RANGE = float(os.getenv("MAX_ACCUM_RANGE", "0.03"))
@@ -62,6 +66,20 @@ MAX_PULLBACK_PCT = float(os.getenv("MAX_PULLBACK_PCT", "0.03"))
 MIN_BOUNCE_FROM_LOW = float(os.getenv("MIN_BOUNCE_FROM_LOW", "0.0"))
 BREAKOUT_VOLUME_MULT = float(os.getenv("BREAKOUT_VOLUME_MULT", "1.30"))
 MIN_ADD_ON_GAIN = float(os.getenv("MIN_ADD_ON_GAIN", "0.005"))
+
+# Mode
+RUN_LIVE_TRADING = os.getenv("RUN_LIVE_TRADING", "false").strip().lower() == "true"
+
+# Coinbase CDP / Advanced Trade auth
+COINBASE_API_KEY = os.getenv("COINBASE_API_KEY", "").strip()
+COINBASE_API_PRIVATE_KEY = os.getenv("COINBASE_API_PRIVATE_KEY", "").strip()
+
+# Safety
+LIVE_TRADING_REQUIRE_CONFIRM = os.getenv("LIVE_TRADING_REQUIRE_CONFIRM", "true").strip().lower() == "true"
+MIN_CASH_BUFFER = float(os.getenv("MIN_CASH_BUFFER", "25"))
+ORDER_TIMEOUT_SECONDS = int(os.getenv("ORDER_TIMEOUT_SECONDS", "20"))
+ORDER_STATUS_POLL_SECONDS = float(os.getenv("ORDER_STATUS_POLL_SECONDS", "1.0"))
+ORDER_STATUS_MAX_POLLS = int(os.getenv("ORDER_STATUS_MAX_POLLS", "12"))
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 ML_FILE = os.getenv("ML_FILE", "ml_data.json")
@@ -77,7 +95,7 @@ PRODUCTS = [
 ]
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/3.0"})
+SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/4.0"})
 
 # ================= STATE =================
 
@@ -138,7 +156,7 @@ def load_state() -> None:
             continue
 
         pos["entry"] = float(pos.get("entry", 0.0))
-        pos["size"] = float(pos.get("size", TRADE_SIZE))
+        pos["size"] = float(pos.get("size", TRADE_SIZE))  # USD exposure for reporting
         pos["peak"] = float(pos.get("peak", pos["entry"]))
         pos["features"] = pos.get("features", {})
         pos["added_on_breakout"] = bool(pos.get("added_on_breakout", False))
@@ -146,6 +164,12 @@ def load_state() -> None:
         pos["ml_score"] = float(pos.get("ml_score", 0.5))
         pos["trail_armed"] = bool(pos.get("trail_armed", False))
         pos["trail_stop_price"] = float(pos.get("trail_stop_price", 0.0))
+
+        # Live-trading fields
+        pos["base_size"] = float(pos.get("base_size", 0.0))
+        pos["live_order_id"] = str(pos.get("live_order_id", ""))
+        pos["last_buy_fill_price"] = float(pos.get("last_buy_fill_price", pos["entry"]))
+        pos["mode"] = str(pos.get("mode", "paper"))
 
 def save_state() -> None:
     save_json_file(STATE_FILE, {
@@ -174,7 +198,211 @@ def send(msg: str) -> None:
     except Exception as e:
         print(f"Telegram send failed: {e}")
 
-# ================= COINBASE DATA =================
+# ================= BASIC HELPERS =================
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+def get_product_base_currency(product_id: str) -> str:
+    if "-" in product_id:
+        return product_id.split("-")[0]
+    return product_id
+
+def round_down(value: float, decimals: int = 8) -> float:
+    if decimals < 0:
+        return value
+    factor = 10 ** decimals
+    return math.floor(value * factor) / factor
+
+# ================= COINBASE AUTH =================
+
+def build_jwt(method: str, path: str) -> str:
+    if not COINBASE_API_KEY or not COINBASE_API_PRIVATE_KEY:
+        raise ValueError("Missing COINBASE_API_KEY or COINBASE_API_PRIVATE_KEY")
+
+    now = int(time.time())
+    payload = {
+        "sub": COINBASE_API_KEY,
+        "iss": "cdp",
+        "nbf": now,
+        "exp": now + 120,
+        "uri": f"{method.upper()} api.coinbase.com{path}",
+    }
+    headers = {
+        "kid": COINBASE_API_KEY,
+        "nonce": secrets.token_hex(),
+    }
+
+    token = jwt.encode(
+        payload,
+        COINBASE_API_PRIVATE_KEY,
+        algorithm="ES256",
+        headers=headers
+    )
+    return token
+
+def cb_request(method: str, path: str, params: Optional[dict] = None, body: Optional[dict] = None) -> dict:
+    jwt_token = build_jwt(method, path)
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/json",
+    }
+    url = f"https://api.coinbase.com{path}"
+
+    response = SESSION.request(
+        method=method.upper(),
+        url=url,
+        headers=headers,
+        params=params,
+        json=body,
+        timeout=ORDER_TIMEOUT_SECONDS
+    )
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw_text": response.text}
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Coinbase API error {response.status_code}: {payload}")
+
+    return payload
+
+# ================= COINBASE LIVE ORDER HELPERS =================
+
+def get_live_accounts() -> dict:
+    return cb_request("GET", "/api/v3/brokerage/accounts")
+
+def get_live_available_cash_usd() -> float:
+    try:
+        payload = get_live_accounts()
+        accounts = payload.get("accounts", [])
+        for account in accounts:
+            currency = str(account.get("currency", "")).upper()
+            if currency == "USD":
+                available_balance = account.get("available_balance", {})
+                return safe_float(available_balance.get("value", 0.0))
+    except Exception as e:
+        print(f"Failed to get live USD balance: {e}")
+    return 0.0
+
+def get_live_available_base(product: str) -> float:
+    base_currency = get_product_base_currency(product).upper()
+    try:
+        payload = get_live_accounts()
+        accounts = payload.get("accounts", [])
+        for account in accounts:
+            currency = str(account.get("currency", "")).upper()
+            if currency == base_currency:
+                available_balance = account.get("available_balance", {})
+                return safe_float(available_balance.get("value", 0.0))
+    except Exception as e:
+        print(f"Failed to get live {base_currency} balance: {e}")
+    return 0.0
+
+def create_market_buy_order(product: str, quote_size_usd: float) -> dict:
+    client_order_id = f"buy-{product}-{int(time.time()*1000)}"
+    body = {
+        "client_order_id": client_order_id,
+        "product_id": product,
+        "side": "BUY",
+        "order_configuration": {
+            "market_market_ioc": {
+                "quote_size": f"{quote_size_usd:.2f}"
+            }
+        }
+    }
+    return cb_request("POST", "/api/v3/brokerage/orders", body=body)
+
+def create_market_sell_order(product: str, base_size: float) -> dict:
+    client_order_id = f"sell-{product}-{int(time.time()*1000)}"
+    sell_size = round_down(base_size, 8)
+
+    body = {
+        "client_order_id": client_order_id,
+        "product_id": product,
+        "side": "SELL",
+        "order_configuration": {
+            "market_market_ioc": {
+                "base_size": f"{sell_size:.8f}"
+            }
+        }
+    }
+    return cb_request("POST", "/api/v3/brokerage/orders", body=body)
+
+def get_order(order_id: str) -> dict:
+    return cb_request("GET", f"/api/v3/brokerage/orders/historical/{order_id}")
+
+def extract_order_id(order_response: dict) -> str:
+    success_response = order_response.get("success_response", {})
+    return str(success_response.get("order_id", "")).strip()
+
+def wait_for_order_fill(order_id: str) -> dict:
+    last_payload = {}
+    for _ in range(ORDER_STATUS_MAX_POLLS):
+        payload = get_order(order_id)
+        last_payload = payload
+
+        order = payload.get("order", {})
+        status = str(order.get("status", "")).upper()
+
+        if status in {"FILLED", "COMPLETED"}:
+            return payload
+
+        if status in {"FAILED", "CANCELLED", "EXPIRED"}:
+            return payload
+
+        time.sleep(ORDER_STATUS_POLL_SECONDS)
+
+    return last_payload
+
+def parse_filled_buy(order_payload: dict, fallback_price: float, quote_size: float) -> Tuple[float, float]:
+    order = order_payload.get("order", {})
+
+    avg_filled_price = safe_float(order.get("average_filled_price"), 0.0)
+    filled_size = safe_float(order.get("filled_size"), 0.0)
+    filled_value = safe_float(order.get("filled_value"), 0.0)
+
+    if avg_filled_price <= 0 and filled_size > 0 and filled_value > 0:
+        avg_filled_price = filled_value / filled_size
+
+    if avg_filled_price <= 0:
+        avg_filled_price = fallback_price
+
+    if filled_size <= 0 and avg_filled_price > 0:
+        filled_size = quote_size / avg_filled_price
+
+    return avg_filled_price, filled_size
+
+def parse_filled_sell(order_payload: dict, fallback_price: float, base_size: float) -> Tuple[float, float]:
+    order = order_payload.get("order", {})
+
+    avg_filled_price = safe_float(order.get("average_filled_price"), 0.0)
+    filled_size = safe_float(order.get("filled_size"), 0.0)
+    filled_value = safe_float(order.get("filled_value"), 0.0)
+
+    if avg_filled_price <= 0 and filled_size > 0 and filled_value > 0:
+        avg_filled_price = filled_value / filled_size
+
+    if avg_filled_price <= 0:
+        avg_filled_price = fallback_price
+
+    if filled_size <= 0:
+        filled_size = base_size
+
+    return avg_filled_price, filled_size
+
+def live_mode_ready() -> bool:
+    if not RUN_LIVE_TRADING:
+        return False
+    return bool(COINBASE_API_KEY and COINBASE_API_PRIVATE_KEY)
+
+# ================= COINBASE PUBLIC DATA =================
 
 def get_candle(product: str) -> Optional[Tuple[float, float]]:
     url = f"https://api.coinbase.com/api/v3/brokerage/market/products/{product}/candles"
@@ -409,6 +637,149 @@ def cooldown_active(product: str) -> bool:
         return False
     return (time.time() - ts) < REENTRY_COOLDOWN_SECONDS
 
+# ================= PAPER / LIVE EXECUTION =================
+
+def paper_cash_available() -> float:
+    return balance
+
+def execution_cash_available() -> float:
+    if live_mode_ready():
+        return get_live_available_cash_usd()
+    return paper_cash_available()
+
+def execute_buy(product: str, intended_price: float, usd_size: float) -> Tuple[bool, dict]:
+    """
+    Returns:
+      success, result dict
+    Result dict keys:
+      mode, entry_price, usd_size, base_size, order_id, raw
+    """
+    if live_mode_ready():
+        if LIVE_TRADING_REQUIRE_CONFIRM:
+            available_cash = get_live_available_cash_usd()
+            if available_cash < (usd_size + MIN_CASH_BUFFER):
+                return False, {
+                    "mode": "live",
+                    "error": f"Insufficient live USD. Available=${available_cash:.2f}, needed>${usd_size + MIN_CASH_BUFFER:.2f}"
+                }
+
+        try:
+            order_response = create_market_buy_order(product, usd_size)
+            order_id = extract_order_id(order_response)
+            if not order_id:
+                return False, {
+                    "mode": "live",
+                    "error": "No order_id returned from buy order",
+                    "raw": order_response
+                }
+
+            filled_payload = wait_for_order_fill(order_id)
+            order = filled_payload.get("order", {})
+            status = str(order.get("status", "")).upper()
+
+            if status not in {"FILLED", "COMPLETED"}:
+                return False, {
+                    "mode": "live",
+                    "error": f"Buy order not filled. Status={status}",
+                    "order_id": order_id,
+                    "raw": filled_payload
+                }
+
+            fill_price, base_size = parse_filled_buy(filled_payload, intended_price, usd_size)
+
+            return True, {
+                "mode": "live",
+                "entry_price": fill_price,
+                "usd_size": usd_size,
+                "base_size": base_size,
+                "order_id": order_id,
+                "raw": filled_payload
+            }
+
+        except Exception as e:
+            return False, {
+                "mode": "live",
+                "error": f"Live buy failed: {e}"
+            }
+
+    estimated_base = usd_size / intended_price if intended_price > 0 else 0.0
+    return True, {
+        "mode": "paper",
+        "entry_price": intended_price,
+        "usd_size": usd_size,
+        "base_size": estimated_base,
+        "order_id": "",
+        "raw": {}
+    }
+
+def execute_sell(product: str, intended_price: float, base_size: float, usd_size: float) -> Tuple[bool, dict]:
+    """
+    Returns:
+      success, result dict
+    Result dict keys:
+      mode, exit_price, sold_base_size, usd_value, order_id, raw
+    """
+    if live_mode_ready():
+        try:
+            available_base = get_live_available_base(product)
+            sell_base = min(base_size, available_base)
+            sell_base = round_down(sell_base, 8)
+
+            if sell_base <= 0:
+                return False, {
+                    "mode": "live",
+                    "error": f"No available {get_product_base_currency(product)} balance to sell"
+                }
+
+            order_response = create_market_sell_order(product, sell_base)
+            order_id = extract_order_id(order_response)
+            if not order_id:
+                return False, {
+                    "mode": "live",
+                    "error": "No order_id returned from sell order",
+                    "raw": order_response
+                }
+
+            filled_payload = wait_for_order_fill(order_id)
+            order = filled_payload.get("order", {})
+            status = str(order.get("status", "")).upper()
+
+            if status not in {"FILLED", "COMPLETED"}:
+                return False, {
+                    "mode": "live",
+                    "error": f"Sell order not filled. Status={status}",
+                    "order_id": order_id,
+                    "raw": filled_payload
+                }
+
+            exit_price, sold_base_size = parse_filled_sell(filled_payload, intended_price, sell_base)
+            usd_value = sold_base_size * exit_price
+
+            return True, {
+                "mode": "live",
+                "exit_price": exit_price,
+                "sold_base_size": sold_base_size,
+                "usd_value": usd_value,
+                "order_id": order_id,
+                "raw": filled_payload
+            }
+
+        except Exception as e:
+            return False, {
+                "mode": "live",
+                "error": f"Live sell failed: {e}"
+            }
+
+    usd_value = usd_size * (intended_price / positions.get(product, {}).get("entry", intended_price)) if intended_price > 0 else usd_size
+    return True, {
+        "mode": "paper",
+        "exit_price": intended_price,
+        "sold_base_size": base_size,
+        "usd_value": usd_value,
+        "order_id": "",
+        "raw": {}
+    }
+
 # ================= TRADING =================
 
 def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
@@ -420,8 +791,13 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
     if len(positions) >= MAX_OPEN_TRADES:
         return
 
-    if balance < TRADE_SIZE:
+    if not live_mode_ready() and balance < TRADE_SIZE:
         return
+
+    if live_mode_ready():
+        available_cash = execution_cash_available()
+        if available_cash < (TRADE_SIZE + MIN_CASH_BUFFER):
+            return
 
     if cooldown_active(product):
         return
@@ -436,28 +812,51 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
     if len(ml_data) >= ML_MIN_SAMPLES and score < ML_MIN_SCORE:
         return
 
-    balance -= TRADE_SIZE
+    success, result = execute_buy(product, price, TRADE_SIZE)
+    if not success:
+        send(
+            f"⚠️ BUY FAILED {product}\n"
+            f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}\n"
+            f"Reason: {result.get('error', 'Unknown error')}"
+        )
+        return
+
+    entry_price = float(result["entry_price"])
+    usd_size = float(result["usd_size"])
+    base_size = float(result["base_size"])
+    order_id = str(result.get("order_id", ""))
+    mode = str(result.get("mode", "paper"))
+
+    if mode == "paper":
+        balance -= usd_size
 
     positions[product] = {
-        "entry": price,
-        "size": TRADE_SIZE,
-        "peak": price,
+        "entry": entry_price,
+        "size": usd_size,
+        "base_size": base_size,
+        "peak": entry_price,
         "features": features,
         "added_on_breakout": False,
         "opened_at": int(time.time()),
         "ml_score": round(score, 4),
         "trail_armed": False,
-        "trail_stop_price": 0.0
+        "trail_stop_price": 0.0,
+        "live_order_id": order_id,
+        "last_buy_fill_price": entry_price,
+        "mode": mode
     }
     save_state()
 
+    prefix = "🟢 LIVE ENTRY" if mode == "live" else "🟡 PAPER ENTRY"
     send(
         f"🤖 MACHINE LEARNING ON\n"
-        f"🟡 ENTRY {product}\n"
-        f"Price: {price:.6f}\n"
+        f"{prefix} {product}\n"
+        f"Price: {entry_price:.6f}\n"
         f"ML Score: {score:.2f}\n"
-        f"Paper Size: ${TRADE_SIZE:.2f}\n"
-        f"Balance: ${balance:.2f}"
+        f"USD Size: ${usd_size:.2f}\n"
+        f"Coin Size: {base_size:.8f}\n"
+        f"{'Paper Balance' if mode == 'paper' else 'Live USD Check Complete'}: "
+        f"${balance:.2f if mode == 'paper' else 0:.2f}".replace("$0.00", f"${balance:.2f}" if mode == "paper" else "OK")
     )
 
 def add_trade(product: str, price: float) -> None:
@@ -470,54 +869,115 @@ def add_trade(product: str, price: float) -> None:
     if pos.get("added_on_breakout"):
         return
 
-    if balance < TRADE_SIZE:
+    if not live_mode_ready() and balance < TRADE_SIZE:
         return
+
+    if live_mode_ready():
+        available_cash = execution_cash_available()
+        if available_cash < (TRADE_SIZE + MIN_CASH_BUFFER):
+            return
 
     entry = float(pos["entry"])
     current_gain = (price - entry) / entry if entry > 0 else 0.0
     if current_gain < MIN_ADD_ON_GAIN:
         return
 
-    balance -= TRADE_SIZE
-    pos["size"] = float(pos["size"]) + TRADE_SIZE
-    pos["peak"] = max(float(pos.get("peak", price)), price)
+    success, result = execute_buy(product, price, TRADE_SIZE)
+    if not success:
+        send(
+            f"⚠️ ADD-ON BUY FAILED {product}\n"
+            f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}\n"
+            f"Reason: {result.get('error', 'Unknown error')}"
+        )
+        return
+
+    add_price = float(result["entry_price"])
+    add_usd = float(result["usd_size"])
+    add_base = float(result["base_size"])
+    mode = str(result.get("mode", "paper"))
+
+    old_usd = float(pos["size"])
+    old_base = float(pos.get("base_size", 0.0))
+
+    total_usd = old_usd + add_usd
+    total_base = old_base + add_base
+
+    if mode == "paper":
+        balance -= add_usd
+
+    weighted_entry = entry
+    if total_base > 0:
+        weighted_entry = ((entry * old_base) + (add_price * add_base)) / total_base
+
+    pos["entry"] = weighted_entry
+    pos["size"] = total_usd
+    pos["base_size"] = total_base
+    pos["peak"] = max(float(pos.get("peak", add_price)), add_price)
     pos["added_on_breakout"] = True
+    pos["last_buy_fill_price"] = add_price
+    pos["mode"] = mode
     save_state()
 
+    prefix = "🚀 LIVE ADD ON BREAKOUT" if mode == "live" else "🚀 PAPER ADD ON BREAKOUT"
     send(
         f"🤖 MACHINE LEARNING ON\n"
-        f"🚀 ADD ON BREAKOUT {product}\n"
-        f"Price: {price:.6f}\n"
-        f"New Position Size: ${float(pos['size']):.2f}\n"
+        f"{prefix} {product}\n"
+        f"Add Price: {add_price:.6f}\n"
+        f"New Avg Entry: {weighted_entry:.6f}\n"
+        f"New USD Size: ${total_usd:.2f}\n"
+        f"New Coin Size: {total_base:.8f}\n"
         f"Balance: ${balance:.2f}"
     )
 
 def close_trade(product: str, price: float, reason: str) -> None:
     global balance
 
-    pos = positions.pop(product, None)
+    pos = positions.get(product)
     if not pos:
         return
 
     entry = float(pos["entry"])
-    size = float(pos["size"])
+    usd_size = float(pos["size"])
+    base_size = float(pos.get("base_size", 0.0))
     features = pos.get("features", {})
     score = float(pos.get("ml_score", 0.5))
+    mode = str(pos.get("mode", "paper"))
 
-    pnl_pct = (price - entry) / entry if entry > 0 else 0.0
-    profit = size * pnl_pct
+    success, result = execute_sell(product, price, base_size, usd_size)
+    if not success:
+        send(
+            f"⚠️ EXIT FAILED {product} ({reason})\n"
+            f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}\n"
+            f"Reason: {result.get('error', 'Unknown error')}"
+        )
+        return
 
-    balance += size + profit
+    positions.pop(product, None)
+
+    exit_price = float(result["exit_price"])
+    sold_base_size = float(result["sold_base_size"])
+    usd_value = float(result["usd_value"])
+
+    if mode == "paper":
+        pnl_pct = (exit_price - entry) / entry if entry > 0 else 0.0
+        profit = usd_size * pnl_pct
+        balance += usd_size + profit
+    else:
+        profit = usd_value - usd_size
+        pnl_pct = (profit / usd_size) if usd_size > 0 else 0.0
+
     last_exit_times[product] = int(time.time())
     save_state()
 
-    log_trade(features, pnl_pct, product, entry, price, reason, size, profit, score)
+    log_trade(features, pnl_pct, product, entry, exit_price, reason, usd_size, profit, score)
 
+    prefix = "🔴 LIVE EXIT" if mode == "live" else "🔴 PAPER EXIT"
     send(
         f"🤖 MACHINE LEARNING ON\n"
-        f"🔴 EXIT {product} ({reason})\n"
+        f"{prefix} {product} ({reason})\n"
         f"Entry: {entry:.6f}\n"
-        f"Exit: {price:.6f}\n"
+        f"Exit: {exit_price:.6f}\n"
+        f"Coin Size Sold: {sold_base_size:.8f}\n"
         f"PnL: ${profit:.2f} ({pnl_pct * 100:.2f}%)\n"
         f"Balance: ${balance:.2f}"
     )
@@ -572,10 +1032,13 @@ def send_update() -> None:
     total_open_value = 0.0
     total_open_pnl = 0.0
 
+    mode_label = "LIVE READY / PAPER ACTIVE" if not RUN_LIVE_TRADING else "LIVE TRADING ACTIVE"
+
     lines = [
         "🤖 MACHINE LEARNING ON",
         "📊 3-MIN UPDATE",
-        f"Balance: ${balance:.2f}",
+        f"Mode: {mode_label}",
+        f"Paper Balance: ${balance:.2f}",
         f"Open Trades: {len(positions)}",
         f"ML Samples: {len(ml_data)}",
         ""
@@ -587,7 +1050,8 @@ def send_update() -> None:
             current_price = prices[-1] if prices else float(pos["entry"])
             entry = float(pos["entry"])
             size = float(pos["size"])
-            value = size * (current_price / entry) if entry > 0 else size
+            base_size = float(pos.get("base_size", 0.0))
+            value = base_size * current_price if base_size > 0 else size * (current_price / entry if entry > 0 else 1.0)
             pnl = value - size
             pnl_pct = ((current_price - entry) / entry * 100) if entry > 0 else 0.0
 
@@ -601,7 +1065,8 @@ def send_update() -> None:
             lines.append(
                 f"{product} | Entry {entry:.6f} | Now {current_price:.6f} | "
                 f"PnL ${pnl:.2f} ({pnl_pct:.2f}%) | "
-                f"Size ${size:.2f} | ML {float(pos.get('ml_score', 0.5)):.2f}{trail_text}"
+                f"USD ${size:.2f} | Coins {base_size:.8f} | "
+                f"ML {float(pos.get('ml_score', 0.5)):.2f}{trail_text}"
             )
 
         lines.extend([
@@ -612,12 +1077,38 @@ def send_update() -> None:
     else:
         lines.append("No open positions.")
 
+    if RUN_LIVE_TRADING:
+        try:
+            live_cash = get_live_available_cash_usd()
+            lines.append(f"Live USD Available: ${live_cash:.2f}")
+        except Exception:
+            lines.append("Live USD Available: unavailable")
+
     send("\n".join(lines))
+
+# ================= STARTUP CHECKS =================
+
+def startup_checks() -> None:
+    send(
+        "🤖 MACHINE LEARNING ON\n"
+        "🚀 SCANNER STARTED\n"
+        f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}"
+    )
+
+    if RUN_LIVE_TRADING:
+        if not COINBASE_API_KEY or not COINBASE_API_PRIVATE_KEY:
+            send("⚠️ RUN_LIVE_TRADING=true but Coinbase credentials are missing.")
+        else:
+            try:
+                live_cash = get_live_available_cash_usd()
+                send(f"✅ Coinbase auth check passed\nLive USD Available: ${live_cash:.2f}")
+            except Exception as e:
+                send(f"⚠️ Coinbase auth check failed\n{e}")
 
 # ================= MAIN =================
 
 load_state()
-send("🤖 MACHINE LEARNING ON\n🚀 SCANNER STARTED")
+startup_checks()
 
 while True:
     try:
