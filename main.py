@@ -26,6 +26,7 @@ from typing import Dict, Optional, Tuple, Any
 # - Balance persistence
 # - Re-entry cooldown after exits
 # - Entry filters controlled by env vars
+# - Full running performance stats
 # ============================================================
 
 # ================= CONFIG =================
@@ -156,7 +157,7 @@ def load_state() -> None:
             continue
 
         pos["entry"] = float(pos.get("entry", 0.0))
-        pos["size"] = float(pos.get("size", TRADE_SIZE))  # USD exposure for reporting
+        pos["size"] = float(pos.get("size", TRADE_SIZE))
         pos["peak"] = float(pos.get("peak", pos["entry"]))
         pos["features"] = pos.get("features", {})
         pos["added_on_breakout"] = bool(pos.get("added_on_breakout", False))
@@ -165,7 +166,6 @@ def load_state() -> None:
         pos["trail_armed"] = bool(pos.get("trail_armed", False))
         pos["trail_stop_price"] = float(pos.get("trail_stop_price", 0.0))
 
-        # Live-trading fields
         pos["base_size"] = float(pos.get("base_size", 0.0))
         pos["live_order_id"] = str(pos.get("live_order_id", ""))
         pos["last_buy_fill_price"] = float(pos.get("last_buy_fill_price", pos["entry"]))
@@ -218,6 +218,99 @@ def round_down(value: float, decimals: int = 8) -> float:
         return value
     factor = 10 ** decimals
     return math.floor(value * factor) / factor
+
+# ================= PERFORMANCE HELPERS =================
+
+def get_open_position_stats() -> Dict[str, float]:
+    total_open_value = 0.0
+    total_open_cost = 0.0
+    total_open_pnl = 0.0
+
+    for product, pos in positions.items():
+        prices = list(price_history[product])
+        current_price = prices[-1] if prices else float(pos.get("entry", 0.0))
+        entry = float(pos.get("entry", 0.0))
+        usd_size = float(pos.get("size", 0.0))
+        base_size = float(pos.get("base_size", 0.0))
+
+        if base_size > 0 and current_price > 0:
+            value = base_size * current_price
+        elif entry > 0 and current_price > 0:
+            value = usd_size * (current_price / entry)
+        else:
+            value = usd_size
+
+        pnl = value - usd_size
+
+        total_open_value += value
+        total_open_cost += usd_size
+        total_open_pnl += pnl
+
+    return {
+        "open_value": total_open_value,
+        "open_cost": total_open_cost,
+        "open_pnl": total_open_pnl
+    }
+
+def get_closed_trade_stats() -> Dict[str, float]:
+    realized_pnl = 0.0
+    wins = 0
+    losses = 0
+    total_closed = 0
+    gross_win = 0.0
+    gross_loss = 0.0
+    best_trade = None
+    worst_trade = None
+
+    for trade in trade_history:
+        profit = float(trade.get("profit", 0.0))
+        total_closed += 1
+        realized_pnl += profit
+
+        if best_trade is None or profit > best_trade:
+            best_trade = profit
+        if worst_trade is None or profit < worst_trade:
+            worst_trade = profit
+
+        if profit > 0:
+            wins += 1
+            gross_win += profit
+        elif profit < 0:
+            losses += 1
+            gross_loss += profit
+        else:
+            losses += 1
+
+    avg_win = gross_win / wins if wins > 0 else 0.0
+    avg_loss = gross_loss / losses if losses > 0 else 0.0
+    win_rate = (wins / total_closed * 100.0) if total_closed > 0 else 0.0
+
+    return {
+        "realized_pnl": realized_pnl,
+        "wins": wins,
+        "losses": losses,
+        "total_closed": total_closed,
+        "win_rate": win_rate,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "best_trade": best_trade if best_trade is not None else 0.0,
+        "worst_trade": worst_trade if worst_trade is not None else 0.0
+    }
+
+def get_account_stats() -> Dict[str, float]:
+    open_stats = get_open_position_stats()
+    closed_stats = get_closed_trade_stats()
+
+    total_account_value = balance + open_stats["open_value"]
+    total_pnl = total_account_value - START_BALANCE
+
+    return {
+        **open_stats,
+        **closed_stats,
+        "cash_balance": balance,
+        "total_account_value": total_account_value,
+        "total_pnl": total_pnl
+    }
 
 # ================= COINBASE AUTH =================
 
@@ -648,12 +741,6 @@ def execution_cash_available() -> float:
     return paper_cash_available()
 
 def execute_buy(product: str, intended_price: float, usd_size: float) -> Tuple[bool, dict]:
-    """
-    Returns:
-      success, result dict
-    Result dict keys:
-      mode, entry_price, usd_size, base_size, order_id, raw
-    """
     if live_mode_ready():
         if LIVE_TRADING_REQUIRE_CONFIRM:
             available_cash = get_live_available_cash_usd()
@@ -713,12 +800,6 @@ def execute_buy(product: str, intended_price: float, usd_size: float) -> Tuple[b
     }
 
 def execute_sell(product: str, intended_price: float, base_size: float, usd_size: float) -> Tuple[bool, dict]:
-    """
-    Returns:
-      success, result dict
-    Result dict keys:
-      mode, exit_price, sold_base_size, usd_value, order_id, raw
-    """
     if live_mode_ready():
         try:
             available_base = get_live_available_base(product)
@@ -856,7 +937,7 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
         f"USD Size: ${usd_size:.2f}\n"
         f"Coin Size: {base_size:.8f}\n"
         f"{'Paper Balance' if mode == 'paper' else 'Live USD Check Complete'}: "
-       f"{f'${balance:.2f}' if mode == 'paper' else 'OK'}"
+        f"{f'${balance:.2f}' if mode == 'paper' else 'OK'}"
     )
 
 def add_trade(product: str, price: float) -> None:
@@ -971,6 +1052,8 @@ def close_trade(product: str, price: float, reason: str) -> None:
 
     log_trade(features, pnl_pct, product, entry, exit_price, reason, usd_size, profit, score)
 
+    stats = get_account_stats()
+
     prefix = "🔴 LIVE EXIT" if mode == "live" else "🔴 PAPER EXIT"
     send(
         f"🤖 MACHINE LEARNING ON\n"
@@ -979,7 +1062,10 @@ def close_trade(product: str, price: float, reason: str) -> None:
         f"Exit: {exit_price:.6f}\n"
         f"Coin Size Sold: {sold_base_size:.8f}\n"
         f"PnL: ${profit:.2f} ({pnl_pct * 100:.2f}%)\n"
-        f"Balance: ${balance:.2f}"
+        f"Cash Balance: ${balance:.2f}\n"
+        f"Realized PnL: ${stats['realized_pnl']:.2f}\n"
+        f"Wins/Losses: {int(stats['wins'])}/{int(stats['losses'])}\n"
+        f"Win Rate: {stats['win_rate']:.1f}%"
     )
 
 def manage_position(product: str, price: float) -> None:
@@ -1029,18 +1115,32 @@ def manage_position(product: str, price: float) -> None:
 # ================= STATUS =================
 
 def send_update() -> None:
-    total_open_value = 0.0
-    total_open_pnl = 0.0
-
-    mode_label = "LIVE READY / PAPER ACTIVE" if not RUN_LIVE_TRADING else "LIVE TRADING ACTIVE"
+    stats = get_account_stats()
+    mode_label = "LIVE TRADING ACTIVE" if RUN_LIVE_TRADING else "LIVE READY / PAPER ACTIVE"
 
     lines = [
         "🤖 MACHINE LEARNING ON",
         "📊 3-MIN UPDATE",
         f"Mode: {mode_label}",
-        f"Paper Balance: ${balance:.2f}",
+        f"Starting Balance: ${START_BALANCE:.2f}",
+        f"Cash Balance: ${stats['cash_balance']:.2f}",
         f"Open Trades: {len(positions)}",
         f"ML Samples: {len(ml_data)}",
+        "",
+        f"Realized PnL: ${stats['realized_pnl']:.2f}",
+        f"Unrealized PnL: ${stats['open_pnl']:.2f}",
+        f"Total PnL: ${stats['total_pnl']:.2f}",
+        f"Open Position Value: ${stats['open_value']:.2f}",
+        f"Total Account Value: ${stats['total_account_value']:.2f}",
+        "",
+        f"Closed Trades: {int(stats['total_closed'])}",
+        f"Wins: {int(stats['wins'])}",
+        f"Losses: {int(stats['losses'])}",
+        f"Win Rate: {stats['win_rate']:.1f}%",
+        f"Avg Win: ${stats['avg_win']:.2f}",
+        f"Avg Loss: ${stats['avg_loss']:.2f}",
+        f"Best Trade: ${stats['best_trade']:.2f}",
+        f"Worst Trade: ${stats['worst_trade']:.2f}",
         ""
     ]
 
@@ -1055,9 +1155,6 @@ def send_update() -> None:
             pnl = value - size
             pnl_pct = ((current_price - entry) / entry * 100) if entry > 0 else 0.0
 
-            total_open_value += value
-            total_open_pnl += pnl
-
             trail_text = ""
             if pos.get("trail_armed", False):
                 trail_text = f" | Trail {float(pos.get('trail_stop_price', 0.0)):.6f}"
@@ -1068,21 +1165,21 @@ def send_update() -> None:
                 f"USD ${size:.2f} | Coins {base_size:.8f} | "
                 f"ML {float(pos.get('ml_score', 0.5)):.2f}{trail_text}"
             )
-
-        lines.extend([
-            "",
-            f"Open Position Value: ${total_open_value:.2f}",
-            f"Open Position PnL: ${total_open_pnl:.2f}"
-        ])
     else:
         lines.append("No open positions.")
 
     if RUN_LIVE_TRADING:
         try:
             live_cash = get_live_available_cash_usd()
-            lines.append(f"Live USD Available: ${live_cash:.2f}")
+            lines.extend([
+                "",
+                f"Live USD Available: ${live_cash:.2f}"
+            ])
         except Exception:
-            lines.append("Live USD Available: unavailable")
+            lines.extend([
+                "",
+                "Live USD Available: unavailable"
+            ])
 
     send("\n".join(lines))
 
