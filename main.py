@@ -28,6 +28,7 @@ from typing import Dict, Optional, Tuple, Any
 # - Entry filters controlled by env vars
 # - Full running performance stats
 # - ML stays OFF until enough closed trades exist
+# - ML learns from pnl quality, not just binary win/loss
 # ============================================================
 
 # ================= CONFIG =================
@@ -54,6 +55,7 @@ ENABLE_ADD_ON_BREAKOUT = os.getenv("ENABLE_ADD_ON_BREAKOUT", "true").strip().low
 ML_MIN_SCORE = float(os.getenv("ML_MIN_SCORE", "0.58"))
 ML_MIN_SAMPLES = int(os.getenv("ML_MIN_SAMPLES", "6"))
 ML_MIN_TRADES = int(os.getenv("ML_MIN_TRADES", "200"))
+ML_TARGET_PCT = float(os.getenv("ML_TARGET_PCT", "0.05"))
 
 REENTRY_COOLDOWN_SECONDS = int(os.getenv("REENTRY_COOLDOWN_SECONDS", "900"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
@@ -98,7 +100,7 @@ PRODUCTS = [
 ]
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/4.1"})
+SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/4.2"})
 
 # ================= STATE =================
 
@@ -546,6 +548,14 @@ def get_candle(product: str) -> Optional[Tuple[float, float]]:
 
 # ================= SIMPLE ML =================
 
+def pnl_to_target_score(pnl_pct: float) -> float:
+    target = ML_TARGET_PCT if ML_TARGET_PCT > 0 else 0.05
+    normalized = pnl_pct / target
+    return max(-1.0, min(1.0, normalized))
+
+def target_score_to_probability(target_score: float) -> float:
+    return (max(-1.0, min(1.0, target_score)) + 1.0) / 2.0
+
 def ml_score(features: Dict[str, float]) -> float:
     if len(ml_data) < ML_MIN_SAMPLES:
         return 0.60
@@ -555,7 +565,9 @@ def ml_score(features: Dict[str, float]) -> float:
 
     for row in ml_data:
         past_features = row.get("features", {})
-        result = row.get("result", 0)
+        stored_target_score = row.get("target_score", None)
+        stored_pnl_pct = safe_float(row.get("pnl_pct", 0.0), 0.0)
+        stored_result = safe_float(row.get("result", 0.0), 0.0)
 
         if not past_features:
             continue
@@ -571,15 +583,23 @@ def ml_score(features: Dict[str, float]) -> float:
             continue
 
         similarity = sum(similarity_parts) / len(similarity_parts)
-        outcome_score = 1.0 if result > 0 else 0.0
 
-        weighted_sum += similarity * outcome_score
+        if stored_target_score is None:
+            if stored_result in (-1.0, 1.0):
+                target_score = stored_result
+            else:
+                target_score = pnl_to_target_score(stored_pnl_pct)
+        else:
+            target_score = safe_float(stored_target_score, 0.0)
+
+        weighted_sum += similarity * target_score
         weight_total += similarity
 
     if weight_total == 0:
         return 0.5
 
-    return weighted_sum / weight_total
+    avg_target_score = weighted_sum / weight_total
+    return target_score_to_probability(avg_target_score)
 
 def log_trade(
     features: Dict[str, float],
@@ -593,12 +613,13 @@ def log_trade(
     ml_score_value: float,
     ml_was_active: bool
 ) -> None:
-    result = 1 if pnl_pct > 0 else -1
+    target_score = pnl_to_target_score(pnl_pct)
     ts = int(time.time())
 
     ml_data.append({
         "features": features,
-        "result": result,
+        "result": target_score,
+        "target_score": target_score,
         "pnl_pct": pnl_pct,
         "product": product,
         "entry": entry,
@@ -621,6 +642,7 @@ def log_trade(
         "profit": profit,
         "ml_score": ml_score_value,
         "ml_active": ml_was_active,
+        "target_score": target_score,
         "ts": ts
     })
 
@@ -1277,5 +1299,5 @@ while True:
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
-        print in(f"Main loop error: {e}")
+        print(f"Main loop error: {e}")
         time.sleep(5)
