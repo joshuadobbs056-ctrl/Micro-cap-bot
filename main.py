@@ -27,6 +27,7 @@ from typing import Dict, Optional, Tuple, Any
 # - Re-entry cooldown after exits
 # - Entry filters controlled by env vars
 # - Full running performance stats
+# - ML stays OFF until enough closed trades exist
 # ============================================================
 
 # ================= CONFIG =================
@@ -52,6 +53,7 @@ ENABLE_ADD_ON_BREAKOUT = os.getenv("ENABLE_ADD_ON_BREAKOUT", "true").strip().low
 
 ML_MIN_SCORE = float(os.getenv("ML_MIN_SCORE", "0.58"))
 ML_MIN_SAMPLES = int(os.getenv("ML_MIN_SAMPLES", "6"))
+ML_MIN_TRADES = int(os.getenv("ML_MIN_TRADES", "200"))
 
 REENTRY_COOLDOWN_SECONDS = int(os.getenv("REENTRY_COOLDOWN_SECONDS", "900"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
@@ -96,7 +98,7 @@ PRODUCTS = [
 ]
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/4.0"})
+SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/4.1"})
 
 # ================= STATE =================
 
@@ -162,7 +164,8 @@ def load_state() -> None:
         pos["features"] = pos.get("features", {})
         pos["added_on_breakout"] = bool(pos.get("added_on_breakout", False))
         pos["opened_at"] = int(pos.get("opened_at", int(time.time())))
-        pos["ml_score"] = float(pos.get("ml_score", 0.5))
+        pos["ml_score"] = float(pos.get("ml_score", 0.0))
+        pos["ml_active_at_entry"] = bool(pos.get("ml_active_at_entry", False))
         pos["trail_armed"] = bool(pos.get("trail_armed", False))
         pos["trail_stop_price"] = float(pos.get("trail_stop_price", 0.0))
 
@@ -218,6 +221,21 @@ def round_down(value: float, decimals: int = 8) -> float:
         return value
     factor = 10 ** decimals
     return math.floor(value * factor) / factor
+
+def get_closed_trade_count() -> int:
+    return len(trade_history)
+
+def ml_is_active() -> bool:
+    return get_closed_trade_count() >= ML_MIN_TRADES
+
+def get_ml_status_text() -> str:
+    closed = get_closed_trade_count()
+    if ml_is_active():
+        return f"ON ({closed}/{ML_MIN_TRADES}+)"
+    return f"OFF ({closed}/{ML_MIN_TRADES})"
+
+def format_ml_display(score: float, active: bool) -> str:
+    return f"{score:.2f}" if active else "OFF"
 
 # ================= PERFORMANCE HELPERS =================
 
@@ -572,7 +590,8 @@ def log_trade(
     reason: str,
     size: float,
     profit: float,
-    ml_score_value: float
+    ml_score_value: float,
+    ml_was_active: bool
 ) -> None:
     result = 1 if pnl_pct > 0 else -1
     ts = int(time.time())
@@ -588,6 +607,7 @@ def log_trade(
         "size": size,
         "profit": profit,
         "ml_score": ml_score_value,
+        "ml_active": ml_was_active,
         "ts": ts
     })
 
@@ -600,6 +620,7 @@ def log_trade(
         "size": size,
         "profit": profit,
         "ml_score": ml_score_value,
+        "ml_active": ml_was_active,
         "ts": ts
     })
 
@@ -889,8 +910,10 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
     if not pullback_entry_ok(product):
         return
 
+    current_ml_active = ml_is_active()
     score = ml_score(features)
-    if len(ml_data) >= ML_MIN_SAMPLES and score < ML_MIN_SCORE:
+
+    if current_ml_active and len(ml_data) >= ML_MIN_SAMPLES and score < ML_MIN_SCORE:
         return
 
     success, result = execute_buy(product, price, TRADE_SIZE)
@@ -920,6 +943,7 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
         "added_on_breakout": False,
         "opened_at": int(time.time()),
         "ml_score": round(score, 4),
+        "ml_active_at_entry": current_ml_active,
         "trail_armed": False,
         "trail_stop_price": 0.0,
         "live_order_id": order_id,
@@ -929,11 +953,13 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
     save_state()
 
     prefix = "🟢 LIVE ENTRY" if mode == "live" else "🟡 PAPER ENTRY"
+    ml_text = format_ml_display(score, current_ml_active)
+
     send(
-        f"🤖 MACHINE LEARNING ON\n"
+        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
         f"{prefix} {product}\n"
         f"Price: {entry_price:.6f}\n"
-        f"ML Score: {score:.2f}\n"
+        f"ML Score: {ml_text}\n"
         f"USD Size: ${usd_size:.2f}\n"
         f"Coin Size: {base_size:.8f}\n"
         f"{'Paper Balance' if mode == 'paper' else 'Live USD Check Complete'}: "
@@ -999,10 +1025,9 @@ def add_trade(product: str, price: float) -> None:
     pos["mode"] = mode
     save_state()
 
-    prefix = "🚀 LIVE ADD ON BREAKOUT" if mode == "live" else "🚀 PAPER ADD ON BREAKOUT"
     send(
-        f"🤖 MACHINE LEARNING ON\n"
-        f"{prefix} {product}\n"
+        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
+        f"{'🚀 LIVE ADD ON BREAKOUT' if mode == 'live' else '🚀 PAPER ADD ON BREAKOUT'} {product}\n"
         f"Add Price: {add_price:.6f}\n"
         f"New Avg Entry: {weighted_entry:.6f}\n"
         f"New USD Size: ${total_usd:.2f}\n"
@@ -1021,7 +1046,8 @@ def close_trade(product: str, price: float, reason: str) -> None:
     usd_size = float(pos["size"])
     base_size = float(pos.get("base_size", 0.0))
     features = pos.get("features", {})
-    score = float(pos.get("ml_score", 0.5))
+    score = float(pos.get("ml_score", 0.0))
+    ml_was_active = bool(pos.get("ml_active_at_entry", False))
     mode = str(pos.get("mode", "paper"))
 
     success, result = execute_sell(product, price, base_size, usd_size)
@@ -1050,17 +1076,19 @@ def close_trade(product: str, price: float, reason: str) -> None:
     last_exit_times[product] = int(time.time())
     save_state()
 
-    log_trade(features, pnl_pct, product, entry, exit_price, reason, usd_size, profit, score)
+    log_trade(features, pnl_pct, product, entry, exit_price, reason, usd_size, profit, score, ml_was_active)
 
     stats = get_account_stats()
+    ml_text = format_ml_display(score, ml_was_active)
 
     prefix = "🔴 LIVE EXIT" if mode == "live" else "🔴 PAPER EXIT"
     send(
-        f"🤖 MACHINE LEARNING ON\n"
+        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
         f"{prefix} {product} ({reason})\n"
         f"Entry: {entry:.6f}\n"
         f"Exit: {exit_price:.6f}\n"
         f"Coin Size Sold: {sold_base_size:.8f}\n"
+        f"ML Score: {ml_text}\n"
         f"PnL: ${profit:.2f} ({pnl_pct * 100:.2f}%)\n"
         f"Cash Balance: ${balance:.2f}\n"
         f"Realized PnL: ${stats['realized_pnl']:.2f}\n"
@@ -1093,7 +1121,7 @@ def manage_position(product: str, price: float) -> None:
         save_state()
 
         send(
-            f"🤖 MACHINE LEARNING ON\n"
+            f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
             f"🟦 TRAILING ARMED {product}\n"
             f"Entry: {entry:.6f}\n"
             f"Peak: {peak:.6f}\n"
@@ -1119,7 +1147,7 @@ def send_update() -> None:
     mode_label = "LIVE TRADING ACTIVE" if RUN_LIVE_TRADING else "LIVE READY / PAPER ACTIVE"
 
     lines = [
-        "🤖 MACHINE LEARNING ON",
+        f"🤖 MACHINE LEARNING {get_ml_status_text()}",
         "📊 3-MIN UPDATE",
         f"Mode: {mode_label}",
         f"Starting Balance: ${START_BALANCE:.2f}",
@@ -1159,11 +1187,16 @@ def send_update() -> None:
             if pos.get("trail_armed", False):
                 trail_text = f" | Trail {float(pos.get('trail_stop_price', 0.0)):.6f}"
 
+            ml_text = format_ml_display(
+                float(pos.get("ml_score", 0.0)),
+                bool(pos.get("ml_active_at_entry", False))
+            )
+
             lines.append(
                 f"{product} | Entry {entry:.6f} | Now {current_price:.6f} | "
                 f"PnL ${pnl:.2f} ({pnl_pct:.2f}%) | "
                 f"USD ${size:.2f} | Coins {base_size:.8f} | "
-                f"ML {float(pos.get('ml_score', 0.5)):.2f}{trail_text}"
+                f"ML {ml_text}{trail_text}"
             )
     else:
         lines.append("No open positions.")
@@ -1187,7 +1220,7 @@ def send_update() -> None:
 
 def startup_checks() -> None:
     send(
-        "🤖 MACHINE LEARNING ON\n"
+        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
         "🚀 SCANNER STARTED\n"
         f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}"
     )
@@ -1244,5 +1277,5 @@ while True:
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
-        print(f"Main loop error: {e}")
+        print in(f"Main loop error: {e}")
         time.sleep(5)
