@@ -22,6 +22,7 @@ from typing import Dict, Optional, Tuple, Any
 # - FAST position monitoring for TP / SL / trailing stop
 # - Telegram alerts
 # - Forced Telegram status update
+# - Telegram command handling: /stop /start /status
 # - Simple self-learning trade memory
 # - Balance persistence
 # - Re-entry cooldown after exits
@@ -45,7 +46,7 @@ POSITION_CHECK_INTERVAL = float(os.getenv("POSITION_CHECK_INTERVAL", "2"))
 
 START_BALANCE = float(os.getenv("START_BALANCE", "500"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "50"))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "5"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "8"))
 
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.05"))
 STOP_LOSS = float(os.getenv("STOP_LOSS", "0.03"))
@@ -61,20 +62,20 @@ ML_MIN_SAMPLES = int(os.getenv("ML_MIN_SAMPLES", "6"))
 ML_MIN_TRADES = int(os.getenv("ML_MIN_TRADES", "200"))
 ML_TARGET_PCT = float(os.getenv("ML_TARGET_PCT", "0.05"))
 
-REENTRY_COOLDOWN_SECONDS = int(os.getenv("REENTRY_COOLDOWN_SECONDS", "900"))
+REENTRY_COOLDOWN_SECONDS = int(os.getenv("REENTRY_COOLDOWN_SECONDS", "300"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 
 # Entry filters
-MIN_FEATURE_HISTORY = int(os.getenv("MIN_FEATURE_HISTORY", "8"))
-NEAR_HIGH_BLOCK_PCT = float(os.getenv("NEAR_HIGH_BLOCK_PCT", "0.995"))
-MAX_ACCUM_RANGE = float(os.getenv("MAX_ACCUM_RANGE", "0.03"))
-MAX_ACCUM_DRIFT = float(os.getenv("MAX_ACCUM_DRIFT", "0.02"))
-MIN_VOLUME_IMPROVEMENT = float(os.getenv("MIN_VOLUME_IMPROVEMENT", "1.00"))
+MIN_FEATURE_HISTORY = int(os.getenv("MIN_FEATURE_HISTORY", "6"))
+NEAR_HIGH_BLOCK_PCT = float(os.getenv("NEAR_HIGH_BLOCK_PCT", "1.0"))
+MAX_ACCUM_RANGE = float(os.getenv("MAX_ACCUM_RANGE", "0.10"))
+MAX_ACCUM_DRIFT = float(os.getenv("MAX_ACCUM_DRIFT", "0.06"))
+MIN_VOLUME_IMPROVEMENT = float(os.getenv("MIN_VOLUME_IMPROVEMENT", "0.50"))
 MIN_PULLBACK_PCT = float(os.getenv("MIN_PULLBACK_PCT", "0.0"))
-MAX_PULLBACK_PCT = float(os.getenv("MAX_PULLBACK_PCT", "0.03"))
+MAX_PULLBACK_PCT = float(os.getenv("MAX_PULLBACK_PCT", "0.08"))
 MIN_BOUNCE_FROM_LOW = float(os.getenv("MIN_BOUNCE_FROM_LOW", "0.0"))
-BREAKOUT_VOLUME_MULT = float(os.getenv("BREAKOUT_VOLUME_MULT", "1.30"))
-MIN_ADD_ON_GAIN = float(os.getenv("MIN_ADD_ON_GAIN", "0.005"))
+BREAKOUT_VOLUME_MULT = float(os.getenv("BREAKOUT_VOLUME_MULT", "1.05"))
+MIN_ADD_ON_GAIN = float(os.getenv("MIN_ADD_ON_GAIN", "0.003"))
 
 # Mode
 RUN_LIVE_TRADING = os.getenv("RUN_LIVE_TRADING", "false").strip().lower() == "true"
@@ -95,6 +96,12 @@ HTTP_RETRY_SLEEP_SECONDS = float(os.getenv("HTTP_RETRY_SLEEP_SECONDS", "1.5"))
 HTTP_FAST_TIMEOUT_SECONDS = float(os.getenv("HTTP_FAST_TIMEOUT_SECONDS", "5"))
 HTTP_SLOW_TIMEOUT_SECONDS = float(os.getenv("HTTP_SLOW_TIMEOUT_SECONDS", "20"))
 
+# Telegram command handling
+ENABLE_TELEGRAM_REMOTE_STOP = os.getenv("ENABLE_TELEGRAM_REMOTE_STOP", "true").strip().lower() == "true"
+TELEGRAM_COMMANDS_ENABLED = os.getenv("TELEGRAM_COMMANDS_ENABLED", "true").strip().lower() == "true"
+TELEGRAM_COMMAND_POLL_SECONDS = float(os.getenv("TELEGRAM_COMMAND_POLL_SECONDS", "5"))
+TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "telegram_offset.json")
+
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 ML_FILE = os.getenv("ML_FILE", "ml_data.json")
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
@@ -109,7 +116,7 @@ PRODUCTS = [
 ]
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/5.1"})
+SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/5.4"})
 
 # ================= STATE =================
 
@@ -126,6 +133,11 @@ live_price_cache = {p: 0.0 for p in PRODUCTS}
 
 last_update = time.time()
 last_scan = 0.0
+
+# Trading control state
+trading_enabled = True
+last_telegram_command_check = 0.0
+telegram_update_offset = 0
 
 # ================= FILE HELPERS =================
 
@@ -146,11 +158,12 @@ def save_json_file(path: str, data: Any) -> None:
         print(f"Failed saving {path}: {e}")
 
 def load_state() -> None:
-    global balance, positions, trade_history, ml_data, last_exit_times
+    global balance, positions, trade_history, ml_data, last_exit_times, trading_enabled
 
     state = load_json_file(STATE_FILE, {})
     if isinstance(state, dict):
         balance = float(state.get("balance", START_BALANCE))
+        trading_enabled = bool(state.get("trading_enabled", True))
         last_exit_times_loaded = state.get("last_exit_times", {})
         if isinstance(last_exit_times_loaded, dict):
             last_exit_times = {str(k): int(v) for k, v in last_exit_times_loaded.items()}
@@ -190,11 +203,21 @@ def load_state() -> None:
 def save_state() -> None:
     save_json_file(STATE_FILE, {
         "balance": balance,
-        "last_exit_times": last_exit_times
+        "last_exit_times": last_exit_times,
+        "trading_enabled": trading_enabled
     })
     save_json_file(POSITIONS_FILE, positions)
     save_json_file(TRADE_HISTORY_FILE, trade_history)
     save_json_file(ML_FILE, ml_data)
+
+def load_telegram_offset() -> int:
+    data = load_json_file(TELEGRAM_OFFSET_FILE, {})
+    if isinstance(data, dict):
+        return int(data.get("update_offset", 0))
+    return 0
+
+def save_telegram_offset(offset: int) -> None:
+    save_json_file(TELEGRAM_OFFSET_FILE, {"update_offset": int(offset)})
 
 # ================= TELEGRAM =================
 
@@ -213,6 +236,89 @@ def send(msg: str) -> None:
             print(f"Telegram error {r.status_code}: {r.text}")
     except Exception as e:
         print(f"Telegram send failed: {e}")
+
+def get_latest_telegram_updates() -> list:
+    global telegram_update_offset
+
+    if not TELEGRAM_TOKEN or not CHAT_ID or not TELEGRAM_COMMANDS_ENABLED or not ENABLE_TELEGRAM_REMOTE_STOP:
+        return []
+
+    params = {
+        "timeout": 0,
+        "allowed_updates": json.dumps(["message"])
+    }
+    if telegram_update_offset > 0:
+        params["offset"] = telegram_update_offset
+
+    try:
+        r = SESSION.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params=params,
+            timeout=15
+        )
+        if r.status_code != 200:
+            print(f"Telegram getUpdates error {r.status_code}: {r.text}")
+            return []
+
+        payload = r.json()
+        if not payload.get("ok", False):
+            print(f"Telegram getUpdates failed: {payload}")
+            return []
+
+        updates = payload.get("result", [])
+        if updates:
+            max_update_id = max(int(u.get("update_id", 0)) for u in updates)
+            telegram_update_offset = max_update_id + 1
+            save_telegram_offset(telegram_update_offset)
+
+        return updates
+
+    except Exception as e:
+        print(f"Telegram command fetch failed: {e}")
+        return []
+
+def process_telegram_commands() -> None:
+    global last_telegram_command_check, trading_enabled
+
+    if not ENABLE_TELEGRAM_REMOTE_STOP or not TELEGRAM_COMMANDS_ENABLED:
+        return
+
+    now = time.time()
+    if now - last_telegram_command_check < TELEGRAM_COMMAND_POLL_SECONDS:
+        return
+
+    last_telegram_command_check = now
+    updates = get_latest_telegram_updates()
+
+    for update in updates:
+        message = update.get("message", {})
+        chat = message.get("chat", {})
+        chat_id = str(chat.get("id", "")).strip()
+        if chat_id != CHAT_ID:
+            continue
+
+        text = str(message.get("text", "")).strip().lower()
+
+        if text in {"/stop", "stop"}:
+            if trading_enabled:
+                trading_enabled = False
+                save_state()
+                send(
+                    "🛑 TRADING PAUSED\n"
+                    "New entries and add-ons are disabled.\n"
+                    "Open positions are still being monitored for TP / SL / trailing."
+                )
+            else:
+                send("🛑 TRADING IS ALREADY PAUSED")
+        elif text in {"/start", "start"}:
+            if not trading_enabled:
+                trading_enabled = True
+                save_state()
+                send("▶️ TRADING RESUMED")
+            else:
+                send("▶️ TRADING IS ALREADY RUNNING")
+        elif text in {"/status", "status"}:
+            send_update()
 
 # ================= BASIC HELPERS =================
 
@@ -976,7 +1082,7 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
     success, result = execute_buy(product, price, TRADE_SIZE)
     if not success:
         send(
-            f"â ï¸ BUY FAILED {product}\n"
+            f"⚠️ BUY FAILED {product}\n"
             f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}\n"
             f"Reason: {result.get('error', 'Unknown error')}"
         )
@@ -1009,11 +1115,11 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
     }
     save_state()
 
-    prefix = "ð¢ LIVE ENTRY" if mode == "live" else "ð¡ PAPER ENTRY"
+    prefix = "🟢 LIVE ENTRY" if mode == "live" else "🟡 PAPER ENTRY"
     ml_text = format_ml_display(score, current_ml_active)
 
     send(
-        f"ð¤ MACHINE LEARNING {get_ml_status_text()}\n"
+        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
         f"{prefix} {product}\n"
         f"Price: {entry_price:.6f}\n"
         f"ML Score: {ml_text}\n"
@@ -1049,7 +1155,7 @@ def add_trade(product: str, price: float) -> None:
     success, result = execute_buy(product, price, TRADE_SIZE)
     if not success:
         send(
-            f"â ï¸ ADD-ON BUY FAILED {product}\n"
+            f"⚠️ ADD-ON BUY FAILED {product}\n"
             f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}\n"
             f"Reason: {result.get('error', 'Unknown error')}"
         )
@@ -1083,8 +1189,8 @@ def add_trade(product: str, price: float) -> None:
     save_state()
 
     send(
-        f"ð¤ MACHINE LEARNING {get_ml_status_text()}\n"
-        f"{'ð LIVE ADD ON BREAKOUT' if mode == 'live' else 'ð PAPER ADD ON BREAKOUT'} {product}\n"
+        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
+        f"{'🚀 LIVE ADD ON BREAKOUT' if mode == 'live' else '🚀 PAPER ADD ON BREAKOUT'} {product}\n"
         f"Add Price: {add_price:.6f}\n"
         f"New Avg Entry: {weighted_entry:.6f}\n"
         f"New USD Size: ${total_usd:.2f}\n"
@@ -1110,7 +1216,7 @@ def close_trade(product: str, price: float, reason: str) -> None:
     success, result = execute_sell(product, price, base_size, usd_size)
     if not success:
         send(
-            f"â ï¸ EXIT FAILED {product} ({reason})\n"
+            f"⚠️ EXIT FAILED {product} ({reason})\n"
             f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}\n"
             f"Reason: {result.get('error', 'Unknown error')}"
         )
@@ -1138,9 +1244,9 @@ def close_trade(product: str, price: float, reason: str) -> None:
     stats = get_account_stats()
     ml_text = format_ml_display(score, ml_was_active)
 
-    prefix = "ð´ LIVE EXIT" if mode == "live" else "ð´ PAPER EXIT"
+    prefix = "🔴 LIVE EXIT" if mode == "live" else "🔴 PAPER EXIT"
     send(
-        f"ð¤ MACHINE LEARNING {get_ml_status_text()}\n"
+        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
         f"{prefix} {product} ({reason})\n"
         f"Entry: {entry:.6f}\n"
         f"Exit: {exit_price:.6f}\n"
@@ -1178,8 +1284,8 @@ def manage_position(product: str, price: float) -> None:
         save_state()
 
         send(
-            f"ð¤ MACHINE LEARNING {get_ml_status_text()}\n"
-            f"ð¦ TRAILING ARMED {product}\n"
+            f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
+            f"🟦 TRAILING ARMED {product}\n"
             f"Entry: {entry:.6f}\n"
             f"Peak: {peak:.6f}\n"
             f"Trail Stop: {float(pos['trail_stop_price']):.6f}"
@@ -1200,11 +1306,13 @@ def manage_position(product: str, price: float) -> None:
 def send_update() -> None:
     stats = get_account_stats()
     mode_label = "LIVE TRADING ACTIVE" if RUN_LIVE_TRADING else "LIVE READY / PAPER ACTIVE"
+    trading_label = "ENABLED" if trading_enabled else "PAUSED"
 
     lines = [
-        f"ð¤ MACHINE LEARNING {get_ml_status_text()}",
-        "ð 3-MIN UPDATE",
+        f"🤖 MACHINE LEARNING {get_ml_status_text()}",
+        "📊 3-MIN UPDATE",
         f"Mode: {mode_label}",
+        f"Trading: {trading_label}",
         f"Starting Balance: ${START_BALANCE:.2f}",
         f"Cash Balance: ${stats['cash_balance']:.2f}",
         f"Open Trades: {len(positions)}",
@@ -1276,22 +1384,23 @@ def send_update() -> None:
 
 def startup_checks() -> None:
     send(
-        f"ð¤ MACHINE LEARNING {get_ml_status_text()}\n"
-        "ð SCANNER STARTED\n"
+        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
+        "🚀 SCANNER STARTED\n"
         f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}\n"
+        f"Trading: {'ENABLED' if trading_enabled else 'PAUSED'}\n"
         f"Entry Scan: {SCAN_INTERVAL:.1f}s\n"
         f"Fast Position Monitor: {POSITION_CHECK_INTERVAL:.1f}s"
     )
 
     if RUN_LIVE_TRADING:
         if not COINBASE_API_KEY or not COINBASE_API_PRIVATE_KEY:
-            send("â ï¸ RUN_LIVE_TRADING=true but Coinbase credentials are missing.")
+            send("⚠️ RUN_LIVE_TRADING=true but Coinbase credentials are missing.")
         else:
             try:
                 live_cash = get_live_available_cash_usd()
-                send(f"â Coinbase auth check passed\nLive USD Available: ${live_cash:.2f}")
+                send(f"✅ Coinbase auth check passed\nLive USD Available: ${live_cash:.2f}")
             except Exception as e:
-                send(f"â ï¸ Coinbase auth check failed\n{e}")
+                send(f"⚠️ Coinbase auth check failed\n{e}")
 
 # ================= LOOPS =================
 
@@ -1315,10 +1424,10 @@ def run_entry_scan() -> None:
         if not features:
             continue
 
-        if product not in positions and is_accumulation(product):
+        if trading_enabled and product not in positions and is_accumulation(product):
             open_trade(product, candle_price, features)
 
-        if ENABLE_ADD_ON_BREAKOUT and product in positions and is_breakout(product):
+        if trading_enabled and ENABLE_ADD_ON_BREAKOUT and product in positions and is_breakout(product):
             add_trade(product, candle_price)
 
 def run_fast_position_monitor() -> None:
@@ -1335,18 +1444,20 @@ def run_fast_position_monitor() -> None:
         any_success = True
         manage_position(product, price)
 
-    # if every fast lookup fails, don't crash the bot; just keep going
     if not any_success:
         print("Fast position monitor: no fresh prices this cycle.")
 
 # ================= MAIN =================
 
 load_state()
+telegram_update_offset = load_telegram_offset()
 startup_checks()
 
 while True:
     try:
         now = time.time()
+
+        process_telegram_commands()
 
         # FAST loop for exits / trailing
         run_fast_position_monitor()
@@ -1363,7 +1474,7 @@ while True:
         time.sleep(POSITION_CHECK_INTERVAL)
 
     except KeyboardInterrupt:
-        send("ð BOT STOPPED MANUALLY")
+        send("🛑 BOT STOPPED MANUALLY")
         break
     except requests.exceptions.RequestException as e:
         print(f"Network error: {e}")
