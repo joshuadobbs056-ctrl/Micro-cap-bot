@@ -10,7 +10,7 @@ from typing import Dict, Optional, Tuple, Any
 
 # ============================================================
 # COINBASE SPOT ACCUMULATION SCANNER + PAPER TRADER + SIMPLE ML
-# LIVE-READY VERSION (DEFAULTS TO PAPER MODE)
+# FAST POSITION MONITOR VERSION
 # ============================================================
 # - Coinbase spot products only
 # - Paper trading by default
@@ -19,7 +19,7 @@ from typing import Dict, Optional, Tuple, Any
 # - Pullback entry logic
 # - Near-high trap filter
 # - Optional add-on-breakout
-# - Trailing stop
+# - FAST position monitoring for TP / SL / trailing stop
 # - Telegram alerts
 # - Forced Telegram status update
 # - Simple self-learning trade memory
@@ -36,8 +36,12 @@ from typing import Dict, Optional, Tuple, Any
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
+# Slow strategy scan loop (entries / features / candle history)
+SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "30"))
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "180"))
+
+# Fast position monitoring loop (TP / SL / trailing)
+POSITION_CHECK_INTERVAL = float(os.getenv("POSITION_CHECK_INTERVAL", "2"))
 
 START_BALANCE = float(os.getenv("START_BALANCE", "500"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "50"))
@@ -86,6 +90,11 @@ ORDER_TIMEOUT_SECONDS = int(os.getenv("ORDER_TIMEOUT_SECONDS", "20"))
 ORDER_STATUS_POLL_SECONDS = float(os.getenv("ORDER_STATUS_POLL_SECONDS", "1.0"))
 ORDER_STATUS_MAX_POLLS = int(os.getenv("ORDER_STATUS_MAX_POLLS", "12"))
 
+# These help reduce noisy restarts from brief network issues
+HTTP_RETRY_SLEEP_SECONDS = float(os.getenv("HTTP_RETRY_SLEEP_SECONDS", "1.5"))
+HTTP_FAST_TIMEOUT_SECONDS = float(os.getenv("HTTP_FAST_TIMEOUT_SECONDS", "5"))
+HTTP_SLOW_TIMEOUT_SECONDS = float(os.getenv("HTTP_SLOW_TIMEOUT_SECONDS", "20"))
+
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 ML_FILE = os.getenv("ML_FILE", "ml_data.json")
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
@@ -100,7 +109,7 @@ PRODUCTS = [
 ]
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/4.2"})
+SESSION.headers.update({"User-Agent": "Coinbase-ML-Scanner/5.1"})
 
 # ================= STATE =================
 
@@ -112,8 +121,11 @@ last_exit_times: Dict[str, int] = {}
 
 price_history = {p: deque(maxlen=MAX_HISTORY) for p in PRODUCTS}
 volume_history = {p: deque(maxlen=MAX_HISTORY) for p in PRODUCTS}
+last_candle_start = {p: 0 for p in PRODUCTS}
+live_price_cache = {p: 0.0 for p in PRODUCTS}
 
 last_update = time.time()
+last_scan = 0.0
 
 # ================= FILE HELPERS =================
 
@@ -170,7 +182,6 @@ def load_state() -> None:
         pos["ml_active_at_entry"] = bool(pos.get("ml_active_at_entry", False))
         pos["trail_armed"] = bool(pos.get("trail_armed", False))
         pos["trail_stop_price"] = float(pos.get("trail_stop_price", 0.0))
-
         pos["base_size"] = float(pos.get("base_size", 0.0))
         pos["live_order_id"] = str(pos.get("live_order_id", ""))
         pos["last_buy_fill_price"] = float(pos.get("last_buy_fill_price", pos["entry"]))
@@ -241,17 +252,20 @@ def format_ml_display(score: float, active: bool) -> str:
 
 # ================= PERFORMANCE HELPERS =================
 
+def get_cached_or_entry_price(product: str, entry: float) -> float:
+    cached = float(live_price_cache.get(product, 0.0))
+    return cached if cached > 0 else entry
+
 def get_open_position_stats() -> Dict[str, float]:
     total_open_value = 0.0
     total_open_cost = 0.0
     total_open_pnl = 0.0
 
     for product, pos in positions.items():
-        prices = list(price_history[product])
-        current_price = prices[-1] if prices else float(pos.get("entry", 0.0))
         entry = float(pos.get("entry", 0.0))
         usd_size = float(pos.get("size", 0.0))
         base_size = float(pos.get("base_size", 0.0))
+        current_price = get_cached_or_entry_price(product, entry)
 
         if base_size > 0 and current_price > 0:
             value = base_size * current_price
@@ -517,7 +531,27 @@ def live_mode_ready() -> bool:
 
 # ================= COINBASE PUBLIC DATA =================
 
-def get_candle(product: str) -> Optional[Tuple[float, float]]:
+def get_product_price(product: str) -> Optional[float]:
+    url = f"https://api.coinbase.com/api/v3/brokerage/market/products/{product}"
+    try:
+        r = SESSION.get(url, timeout=HTTP_FAST_TIMEOUT_SECONDS)
+        if r.status_code != 200:
+            print(f"Coinbase product price error {product}: {r.status_code} {r.text}")
+            return None
+
+        payload = r.json()
+        price = safe_float(payload.get("price"), 0.0)
+        if price <= 0:
+            return None
+
+        live_price_cache[product] = price
+        return price
+
+    except Exception as e:
+        print(f"Failed to fetch product price for {product}: {e}")
+        return None
+
+def get_latest_candle(product: str) -> Optional[Tuple[int, float, float]]:
     url = f"https://api.coinbase.com/api/v3/brokerage/market/products/{product}/candles"
     params = {
         "granularity": "FIVE_MINUTE",
@@ -525,7 +559,7 @@ def get_candle(product: str) -> Optional[Tuple[float, float]]:
     }
 
     try:
-        r = SESSION.get(url, params=params, timeout=20)
+        r = SESSION.get(url, params=params, timeout=HTTP_SLOW_TIMEOUT_SECONDS)
         if r.status_code != 200:
             print(f"Coinbase candle error {product}: {r.status_code} {r.text}")
             return None
@@ -538,9 +572,10 @@ def get_candle(product: str) -> Optional[Tuple[float, float]]:
         candles_sorted = sorted(candles, key=lambda x: int(x.get("start", 0)))
         latest = candles_sorted[-1]
 
+        start_ts = int(latest["start"])
         close_price = float(latest["close"])
         volume = float(latest["volume"])
-        return close_price, volume
+        return start_ts, close_price, volume
 
     except Exception as e:
         print(f"Failed to fetch candle for {product}: {e}")
@@ -941,7 +976,7 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
     success, result = execute_buy(product, price, TRADE_SIZE)
     if not success:
         send(
-            f"⚠️ BUY FAILED {product}\n"
+            f"â ï¸ BUY FAILED {product}\n"
             f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}\n"
             f"Reason: {result.get('error', 'Unknown error')}"
         )
@@ -974,11 +1009,11 @@ def open_trade(product: str, price: float, features: Dict[str, float]) -> None:
     }
     save_state()
 
-    prefix = "🟢 LIVE ENTRY" if mode == "live" else "🟡 PAPER ENTRY"
+    prefix = "ð¢ LIVE ENTRY" if mode == "live" else "ð¡ PAPER ENTRY"
     ml_text = format_ml_display(score, current_ml_active)
 
     send(
-        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
+        f"ð¤ MACHINE LEARNING {get_ml_status_text()}\n"
         f"{prefix} {product}\n"
         f"Price: {entry_price:.6f}\n"
         f"ML Score: {ml_text}\n"
@@ -1014,7 +1049,7 @@ def add_trade(product: str, price: float) -> None:
     success, result = execute_buy(product, price, TRADE_SIZE)
     if not success:
         send(
-            f"⚠️ ADD-ON BUY FAILED {product}\n"
+            f"â ï¸ ADD-ON BUY FAILED {product}\n"
             f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}\n"
             f"Reason: {result.get('error', 'Unknown error')}"
         )
@@ -1048,8 +1083,8 @@ def add_trade(product: str, price: float) -> None:
     save_state()
 
     send(
-        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
-        f"{'🚀 LIVE ADD ON BREAKOUT' if mode == 'live' else '🚀 PAPER ADD ON BREAKOUT'} {product}\n"
+        f"ð¤ MACHINE LEARNING {get_ml_status_text()}\n"
+        f"{'ð LIVE ADD ON BREAKOUT' if mode == 'live' else 'ð PAPER ADD ON BREAKOUT'} {product}\n"
         f"Add Price: {add_price:.6f}\n"
         f"New Avg Entry: {weighted_entry:.6f}\n"
         f"New USD Size: ${total_usd:.2f}\n"
@@ -1075,7 +1110,7 @@ def close_trade(product: str, price: float, reason: str) -> None:
     success, result = execute_sell(product, price, base_size, usd_size)
     if not success:
         send(
-            f"⚠️ EXIT FAILED {product} ({reason})\n"
+            f"â ï¸ EXIT FAILED {product} ({reason})\n"
             f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}\n"
             f"Reason: {result.get('error', 'Unknown error')}"
         )
@@ -1103,9 +1138,9 @@ def close_trade(product: str, price: float, reason: str) -> None:
     stats = get_account_stats()
     ml_text = format_ml_display(score, ml_was_active)
 
-    prefix = "🔴 LIVE EXIT" if mode == "live" else "🔴 PAPER EXIT"
+    prefix = "ð´ LIVE EXIT" if mode == "live" else "ð´ PAPER EXIT"
     send(
-        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
+        f"ð¤ MACHINE LEARNING {get_ml_status_text()}\n"
         f"{prefix} {product} ({reason})\n"
         f"Entry: {entry:.6f}\n"
         f"Exit: {exit_price:.6f}\n"
@@ -1143,8 +1178,8 @@ def manage_position(product: str, price: float) -> None:
         save_state()
 
         send(
-            f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
-            f"🟦 TRAILING ARMED {product}\n"
+            f"ð¤ MACHINE LEARNING {get_ml_status_text()}\n"
+            f"ð¦ TRAILING ARMED {product}\n"
             f"Entry: {entry:.6f}\n"
             f"Peak: {peak:.6f}\n"
             f"Trail Stop: {float(pos['trail_stop_price']):.6f}"
@@ -1160,8 +1195,6 @@ def manage_position(product: str, price: float) -> None:
             close_trade(product, price, "TRAIL")
             return
 
-    save_state()
-
 # ================= STATUS =================
 
 def send_update() -> None:
@@ -1169,13 +1202,15 @@ def send_update() -> None:
     mode_label = "LIVE TRADING ACTIVE" if RUN_LIVE_TRADING else "LIVE READY / PAPER ACTIVE"
 
     lines = [
-        f"🤖 MACHINE LEARNING {get_ml_status_text()}",
-        "📊 3-MIN UPDATE",
+        f"ð¤ MACHINE LEARNING {get_ml_status_text()}",
+        "ð 3-MIN UPDATE",
         f"Mode: {mode_label}",
         f"Starting Balance: ${START_BALANCE:.2f}",
         f"Cash Balance: ${stats['cash_balance']:.2f}",
         f"Open Trades: {len(positions)}",
         f"ML Samples: {len(ml_data)}",
+        f"Entry Scan Interval: {SCAN_INTERVAL:.1f}s",
+        f"Position Check Interval: {POSITION_CHECK_INTERVAL:.1f}s",
         "",
         f"Realized PnL: ${stats['realized_pnl']:.2f}",
         f"Unrealized PnL: ${stats['open_pnl']:.2f}",
@@ -1196,11 +1231,10 @@ def send_update() -> None:
 
     if positions:
         for product, pos in positions.items():
-            prices = list(price_history[product])
-            current_price = prices[-1] if prices else float(pos["entry"])
             entry = float(pos["entry"])
             size = float(pos["size"])
             base_size = float(pos.get("base_size", 0.0))
+            current_price = get_cached_or_entry_price(product, entry)
             value = base_size * current_price if base_size > 0 else size * (current_price / entry if entry > 0 else 1.0)
             pnl = value - size
             pnl_pct = ((current_price - entry) / entry * 100) if entry > 0 else 0.0
@@ -1242,20 +1276,68 @@ def send_update() -> None:
 
 def startup_checks() -> None:
     send(
-        f"🤖 MACHINE LEARNING {get_ml_status_text()}\n"
-        "🚀 SCANNER STARTED\n"
-        f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}"
+        f"ð¤ MACHINE LEARNING {get_ml_status_text()}\n"
+        "ð SCANNER STARTED\n"
+        f"Mode: {'LIVE' if RUN_LIVE_TRADING else 'PAPER'}\n"
+        f"Entry Scan: {SCAN_INTERVAL:.1f}s\n"
+        f"Fast Position Monitor: {POSITION_CHECK_INTERVAL:.1f}s"
     )
 
     if RUN_LIVE_TRADING:
         if not COINBASE_API_KEY or not COINBASE_API_PRIVATE_KEY:
-            send("⚠️ RUN_LIVE_TRADING=true but Coinbase credentials are missing.")
+            send("â ï¸ RUN_LIVE_TRADING=true but Coinbase credentials are missing.")
         else:
             try:
                 live_cash = get_live_available_cash_usd()
-                send(f"✅ Coinbase auth check passed\nLive USD Available: ${live_cash:.2f}")
+                send(f"â Coinbase auth check passed\nLive USD Available: ${live_cash:.2f}")
             except Exception as e:
-                send(f"⚠️ Coinbase auth check failed\n{e}")
+                send(f"â ï¸ Coinbase auth check failed\n{e}")
+
+# ================= LOOPS =================
+
+def run_entry_scan() -> None:
+    for product in PRODUCTS:
+        candle = get_latest_candle(product)
+        if not candle:
+            continue
+
+        candle_start, candle_price, candle_volume = candle
+
+        # only append when a genuinely new 5-minute candle appears
+        if candle_start > last_candle_start[product]:
+            last_candle_start[product] = candle_start
+            price_history[product].append(candle_price)
+            volume_history[product].append(candle_volume)
+
+        live_price_cache[product] = candle_price
+
+        features = extract_features(product)
+        if not features:
+            continue
+
+        if product not in positions and is_accumulation(product):
+            open_trade(product, candle_price, features)
+
+        if ENABLE_ADD_ON_BREAKOUT and product in positions and is_breakout(product):
+            add_trade(product, candle_price)
+
+def run_fast_position_monitor() -> None:
+    open_products = list(positions.keys())
+    if not open_products:
+        return
+
+    any_success = False
+    for product in open_products:
+        price = get_product_price(product)
+        if price is None or price <= 0:
+            continue
+
+        any_success = True
+        manage_position(product, price)
+
+    # if every fast lookup fails, don't crash the bot; just keep going
+    if not any_success:
+        print("Fast position monitor: no fresh prices this cycle.")
 
 # ================= MAIN =================
 
@@ -1264,40 +1346,28 @@ startup_checks()
 
 while True:
     try:
-        for product in PRODUCTS:
-            candle = get_candle(product)
-            if not candle:
-                continue
+        now = time.time()
 
-            price, volume = candle
-            price_history[product].append(price)
-            volume_history[product].append(volume)
+        # FAST loop for exits / trailing
+        run_fast_position_monitor()
 
-            if product in positions:
-                positions[product]["peak"] = max(
-                    float(positions[product].get("peak", price)),
-                    price
-                )
+        # SLOW loop for entries / 5m strategy data
+        if now - last_scan >= SCAN_INTERVAL:
+            run_entry_scan()
+            last_scan = now
 
-            features = extract_features(product)
-            if not features:
-                continue
-
-            if product not in positions and is_accumulation(product):
-                open_trade(product, price, features)
-
-            if ENABLE_ADD_ON_BREAKOUT and product in positions and is_breakout(product):
-                add_trade(product, price)
-
-            if product in positions:
-                manage_position(product, price)
-
-        if time.time() - last_update >= UPDATE_INTERVAL:
+        if now - last_update >= UPDATE_INTERVAL:
             send_update()
-            last_update = time.time()
+            last_update = now
 
-        time.sleep(SCAN_INTERVAL)
+        time.sleep(POSITION_CHECK_INTERVAL)
 
+    except KeyboardInterrupt:
+        send("ð BOT STOPPED MANUALLY")
+        break
+    except requests.exceptions.RequestException as e:
+        print(f"Network error: {e}")
+        time.sleep(HTTP_RETRY_SLEEP_SECONDS)
     except Exception as e:
         print(f"Main loop error: {e}")
-        time.sleep(5)
+        time.sleep(2)
